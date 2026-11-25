@@ -1005,6 +1005,11 @@ void WebContentClient::did_close_browsing_context(Web::PageId page_id)
     close_server_if_unused();
 }
 
+void WebContentClient::did_change_extension_storage(String extension_id, String area, String changes)
+{
+    Application::the().extension_storage_did_change({}, *this, extension_id, area, changes);
+}
+
 void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)
 {
     if (Application::web_content_options().is_test_mode == IsTestMode::Yes) {

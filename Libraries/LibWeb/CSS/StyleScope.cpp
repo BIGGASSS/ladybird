@@ -25,6 +25,7 @@
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AdoptedStyleSheets.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Namespace.h>
@@ -292,16 +293,21 @@ void StyleScope::build_user_style_sheet_if_needed()
 
     auto user_style_source = document().page().user_style();
     auto const& content_blocker_style_source = document().content_blocker_style_sheet();
-    if (!user_style_source.has_value() && content_blocker_style_source.is_empty())
+    // NB: Chrome adds the CSS of content scripts as author style sheets. Here, they are part of the user style sheet,
+    //     which is close enough for what they are mostly used for: hiding and restyling parts of the page.
+    auto extension_style_source = Extensions::ExtensionRegistry::the().style_sheet_for_document(document());
+    if (!user_style_source.has_value() && content_blocker_style_source.is_empty() && extension_style_source.is_empty())
         return;
 
     Utf16StringBuilder source;
     if (user_style_source.has_value())
         source.append(user_style_source->utf16_view());
-    if (!content_blocker_style_source.is_empty()) {
+    for (Utf16String const& extra_source : { content_blocker_style_source, extension_style_source }) {
+        if (extra_source.is_empty())
+            continue;
         if (!source.is_empty())
             source.append_ascii('\n');
-        source.append(content_blocker_style_source.utf16_view());
+        source.append(extra_source.utf16_view());
     }
 
     m_user_style_sheet = parse_css_stylesheet(CSS::Parser::ParsingParams(document()), source.view());

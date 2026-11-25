@@ -254,6 +254,9 @@ private:
 
     virtual void set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) override;
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
+    virtual void set_extensions(Core::AnonymousBuffer extensions) override;
+    virtual void set_extension_storage(String storage) override;
+    virtual void extension_storage_changed(String extension_id, String area, String changes) override;
 
     virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
     virtual void set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) override;

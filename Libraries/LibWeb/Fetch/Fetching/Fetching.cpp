@@ -26,6 +26,7 @@
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/Fetch/BodyInit.h>
 #include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
 #include <LibWeb/Fetch/Engine/FetchByteChannel.h>
@@ -770,10 +771,12 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
             && request->current_url().scheme() == "file"sv
             && request->destination() == Infrastructure::Request::Destination::Font;
 
+        // AD-HOC: The files an extension makes web accessible can be read by anyone, as in Chrome.
         if (
             (origin && request->current_url().origin().is_same_origin(*origin) && request->response_tainting() == Infrastructure::Request::ResponseTainting::Basic)
             || is_file_to_file_font_load
             || request->current_url().scheme() == "data"sv
+            || request->current_url().scheme() == "chrome-extension"sv
             || (request->mode() == Infrastructure::Request::Mode::Navigate || request->mode() == Infrastructure::Request::Mode::WebSocket)) {
             // 1. Set request’s response tainting to "basic".
             request->set_response_tainting(Infrastructure::Request::ResponseTainting::Basic);
@@ -1806,6 +1809,20 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
             return error;
 
         return nonstandard_resource_loader_file_or_http_network_fetch(realm, fetch_params);
+    }
+    // AD-HOC: "chrome-extension"
+    else if (request->current_url().scheme() == "chrome-extension"sv) {
+        // Only the files an installed extension makes web accessible to the requesting page can be fetched, as in Chrome.
+        auto const* origin = request->origin().get_pointer<URL::Origin>();
+        auto resource = origin ? Extensions::ExtensionRegistry::the().web_accessible_resource(request->current_url(), *origin) : OptionalNone {};
+        if (!resource.has_value())
+            return PendingResponse::create(fetch_params, Infrastructure::Response::network_error("Request for a resource that is not web accessible"_string));
+
+        auto response = Infrastructure::Response::create();
+        response->set_status_message("OK"sv);
+        response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Type"sv, resource->mime_type));
+        response->set_body(Infrastructure::byte_sequence_as_response_body(resource->data));
+        return PendingResponse::create(fetch_params, response);
     }
     // -> HTTP(S) scheme
     else if (Infrastructure::is_http_or_https_scheme(request->current_url().scheme())) {

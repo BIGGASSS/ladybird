@@ -1428,6 +1428,14 @@ void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventL
             if (promise->is_handled())
                 continue;
 
+            // AD-HOC: A promise of an extension's isolated world, or one rejected with an object of it, is not given to the
+            //         page, as it would let the page into the world's realm. What it was rejected with goes to the console.
+            auto reason = promise->result();
+            if (Bindings::is_extension_world_realm(promise->shape().realm()) || (reason.is_object() && Bindings::is_extension_world_realm(reason.as_object().shape().realm()))) {
+                HTML::report_exception_to_console(promise->result(), realm, ErrorInPromise::Yes);
+                continue;
+            }
+
             // 2. Let notHandled be the result of firing an event named unhandledrejection at global, using PromiseRejectionEvent, with the cancelable attribute initialized to true,
             //    the promise attribute initialized to p, and the reason attribute initialized to the value of p's [[PromiseResult]] internal slot.
             PromiseRejectionEventInit event_init {

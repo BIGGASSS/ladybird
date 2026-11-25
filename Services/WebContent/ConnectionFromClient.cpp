@@ -58,6 +58,7 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/Gamepad/GamepadRegistry.h>
@@ -3475,6 +3476,42 @@ void ConnectionFromClient::set_content_blockers(Core::AnonymousBuffer patterns_b
 
     if (had_cosmetic_rules || blocker.has_cosmetic_rules())
         m_page_host->invalidate_user_style();
+}
+
+void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffer)
+{
+    if (auto result = extensions_buffer.validate_backing_size(); result.is_error()) {
+        dbgln("Failed to set extensions: {}", result.error());
+        return;
+    }
+
+    auto& registry = Web::Extensions::ExtensionRegistry::the();
+    if (auto result = registry.set_extensions_from_bytes(extensions_buffer.bytes()); result.is_error()) {
+        dbgln("Failed to set extensions: {}", result.error());
+        return;
+    }
+
+    registry.on_storage_change = [this](String const& extension_id, String const& area, String const& changes) {
+        async_did_change_extension_storage(extension_id, area, changes);
+    };
+
+    // The CSS of content scripts is part of each document's user style sheet.
+    m_page_host->invalidate_user_style();
+}
+
+void ConnectionFromClient::set_extension_storage(String storage)
+{
+    auto json = JsonValue::from_string(storage);
+    if (json.is_error() || !json.value().is_object()) {
+        dbgln("Failed to set extension storage");
+        return;
+    }
+    Web::Extensions::ExtensionRegistry::the().set_storage(json.release_value().as_object());
+}
+
+void ConnectionFromClient::extension_storage_changed(String extension_id, String area, String changes)
+{
+    Web::Extensions::ExtensionRegistry::the().apply_storage_changes(extension_id, area, changes, Web::Extensions::ExtensionRegistry::ChangeSource::OtherProcess);
 }
 
 void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host)

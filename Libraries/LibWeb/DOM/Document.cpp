@@ -130,6 +130,8 @@
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
+#include <LibWeb/Extensions/ExtensionWorld.h>
 #include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -1015,6 +1017,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
         import->visit_edges(visitor);
     visitor.visit(m_page);
     visitor.visit(m_window);
+    visitor.visit(m_extension_worlds);
+    visitor.visit(m_extension_idle_timer);
     visitor.visit(m_relevant_global_event_target);
     visitor.visit(m_style_sheets);
     visitor.visit(m_hovered_node);
@@ -1201,6 +1205,20 @@ void Document::invalidate_content_blocker_style_sheet()
     m_content_blocker_style_sheet.clear();
     m_content_blocker_style_sheet_checked_classes.clear();
     m_content_blocker_style_sheet_checked_ids.clear();
+}
+
+GC::Ptr<Extensions::ExtensionWorld> Document::extension_world(StringView extension_id) const
+{
+    for (auto const& world : m_extension_worlds) {
+        if (world->extension_id() == extension_id)
+            return world;
+    }
+    return nullptr;
+}
+
+void Document::add_extension_world(GC::Ref<Extensions::ExtensionWorld> world)
+{
+    m_extension_worlds.append(world);
 }
 
 bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
@@ -5010,6 +5028,23 @@ void Document::update_readiness(HTML::DocumentReadyState readiness_value)
         }
     }
 
+    // AD-HOC: Content scripts that run at document_end do so once the DOM is complete. Those that run at document_idle
+    //         do so once the document has loaded, or a little after the DOM is complete if loading takes longer, as in
+    //         Chrome.
+    if (readiness_value == HTML::DocumentReadyState::Interactive) {
+        Extensions::ExtensionRegistry::the().run_content_scripts(*this, Extensions::RunAt::DocumentEnd);
+        if (Extensions::ExtensionRegistry::the().has_extensions() && !m_extension_idle_timer) {
+            m_extension_idle_timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(200), GC::create_function(heap(), GC::captures(GC::Ref { *this }), [](auto& document) {
+                HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*document), GC::create_function(document->heap(), GC::captures(document), [](auto& document) {
+                    Extensions::ExtensionRegistry::the().run_content_scripts(*document, Extensions::RunAt::DocumentIdle);
+                }));
+            }));
+            m_extension_idle_timer->start();
+        }
+    } else if (readiness_value == HTML::DocumentReadyState::Complete) {
+        Extensions::ExtensionRegistry::the().run_content_scripts(*this, Extensions::RunAt::DocumentIdle);
+    }
+
     // 4. Fire an event named readystatechange at document.
     dispatch_event(Event::create(
         HTML::EventNames::readystatechange,
@@ -6445,6 +6480,11 @@ void Document::destroy()
     // 4. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
     run_unloading_cleanup_steps();
 
+    // AD-HOC: Extension content scripts can no longer run in this document, so let go of their worlds.
+    for (auto& world : m_extension_worlds)
+        world->detach();
+    m_extension_worlds.clear();
+
     // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable().
     //         Tear the layout tree down now instead of holding it until finalization.
     tear_down_layout_tree();
@@ -7531,6 +7571,23 @@ void Document::make_active()
         notify_each_document_observer([&](auto const& document_observer) {
             return document_observer.document_became_active();
         });
+    }
+
+    // AD-HOC: Content scripts run once the document is active. Those of document_start run as soon as the document
+    //         element exists, but a document that has none, or that got further before it became active, gets those
+    //         of the stages it has reached here.
+    if (Extensions::ExtensionRegistry::the().has_extensions()) {
+        HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*this), GC::create_function(heap(), GC::captures(GC::Ref { *this }), [](auto& document) {
+            // NB: A document that is still loading gets its document element from the parser, which runs them then.
+            if (document->readiness() == HTML::DocumentReadyState::Loading && !document->document_element())
+                return;
+            auto stage = Extensions::RunAt::DocumentStart;
+            if (document->readiness() == HTML::DocumentReadyState::Interactive)
+                stage = Extensions::RunAt::DocumentEnd;
+            else if (document->readiness() == HTML::DocumentReadyState::Complete)
+                stage = Extensions::RunAt::DocumentIdle;
+            Extensions::ExtensionRegistry::the().run_content_scripts(*document, stage);
+        }));
     }
 }
 

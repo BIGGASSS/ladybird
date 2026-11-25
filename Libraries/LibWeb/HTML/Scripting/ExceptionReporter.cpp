@@ -10,6 +10,7 @@
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibJS/Runtime/Value.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/ErrorEvent.h>
 #include <LibWeb/HTML/ErrorInformation.h>
@@ -138,8 +139,11 @@ void report_an_exception(JS::Object& global, JS::Value exception, Optional<Error
     // 6. If global is not in error reporting mode, then:
     // NB: WorkletGlobalScope's IDL interface does not inherit from EventTarget, so nothing can observe its in error
     //     reporting mode and only Window and WorkerGlobalScope keep one.
+    // AD-HOC: An exception of an extension's isolated world is not given to the page, as it would let the page into the
+    //         world's realm.
+    auto is_from_extension_world = exception.is_object() && Bindings::is_extension_world_realm(exception.as_object().shape().realm());
     auto* window_or_worker = window_or_worker_global_scope_from_global_object(global);
-    if (window_or_worker && !window_or_worker->is_in_error_reporting_mode()) {
+    if (window_or_worker && !window_or_worker->is_in_error_reporting_mode() && !is_from_extension_world) {
         // 1. Set global's in error reporting mode to true.
         window_or_worker->set_in_error_reporting_mode(true);
 

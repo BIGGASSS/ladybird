@@ -554,6 +554,12 @@ class PerformanceEventTiming;
 
 }
 
+namespace Web::Extensions {
+
+class ExtensionWorld;
+
+}
+
 namespace Web::Fetch {
 
 class BodyMixin;

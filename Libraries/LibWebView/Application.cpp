@@ -745,6 +745,15 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         warnln("    Configured lists: {}", m_browser_options.content_blocker_list_paths);
     }
 
+    // Chrome extensions are the .crx files in the profile's Extensions directory.
+    if (m_web_content_options.is_test_mode == IsTestMode::No) {
+        m_extension_manager = make<ExtensionManager>(
+            LexicalPath::join(profile().paths().config, "Extensions"sv).string(),
+            LexicalPath::join(profile().paths().data, "ExtensionStorage.json"sv).string());
+        if (auto result = m_extension_manager->load(m_settings->languages()); result.is_error())
+            warnln("\033[31;1mUnable to load extensions from {}:\033[0m {}", m_extension_manager->extensions_directory(), result.error());
+    }
+
     if (!m_event_loop)
         m_event_loop = &create_platform_event_loop();
     if (captures_browser_crashes())
@@ -859,6 +868,41 @@ void Application::create_mach_port_server([[maybe_unused]] ByteString const& pro
             });
     };
 #endif
+}
+
+// Extensions do not run in private browsing, as in Chrome, where they have to be allowed to.
+void Application::send_extensions_to_web_content(WebContentClient& client) const
+{
+    if (!m_extension_manager || client.is_private() == IsPrivate::Yes)
+        return;
+    client.async_set_extensions(m_extension_manager->extensions_buffer());
+    client.async_set_extension_storage(m_extension_manager->storage_json());
+}
+
+ErrorOr<InstalledExtension> Application::install_extension(StringView path)
+{
+    if (!m_extension_manager)
+        return Error::from_string_literal("Extensions are not available");
+
+    auto extension = TRY(m_extension_manager->install(path, m_settings->languages()));
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        send_extensions_to_web_content(client);
+        return IterationDecision::Continue;
+    });
+    return extension;
+}
+
+void Application::extension_storage_did_change(Badge<WebContentClient>, WebContentClient const& source, String const& extension_id, String const& area, String const& changes)
+{
+    if (!m_extension_manager || source.is_private() == IsPrivate::Yes)
+        return;
+
+    m_extension_manager->apply_storage_changes(extension_id, area, changes);
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        if (&client != &source && client.is_private() == IsPrivate::No)
+            client.async_extension_storage_changed(extension_id, area, changes);
+        return IterationDecision::Continue;
+    });
 }
 
 ByteString Application::content_blocker_list_path(StringView identifier) const
@@ -1200,6 +1244,7 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     if (m_content_blocker_list_buffer.has_value())
         client->async_set_content_blockers(*m_content_blocker_list_buffer);
+    send_extensions_to_web_content(*client);
 
     m_web_content_clients.set(client);
     return client;

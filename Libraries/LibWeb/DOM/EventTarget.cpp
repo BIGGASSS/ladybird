@@ -665,7 +665,16 @@ WebIDL::CallbackType* EventTarget::event_handler_attribute(Utf16FlyString const&
         return nullptr;
 
     // 3. Return the result of getting the current value of the event handler given eventTarget and name.
-    return target->get_current_value_of_event_handler(name);
+    auto* handler = target->get_current_value_of_event_handler(name);
+
+    // AD-HOC: The handler that the page or an extension's isolated world set is not given to the other, as its function
+    //         would let the other into its realm.
+    if (handler) {
+        auto& vm = JS::VM::the();
+        if (vm.has_running_execution_context() && vm.current_realm() && !Bindings::realms_can_share_objects(*vm.current_realm(), handler->callback->shape().realm()))
+            return nullptr;
+    }
+    return handler;
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler

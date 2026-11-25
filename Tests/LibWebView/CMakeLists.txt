@@ -76,6 +76,7 @@ set(TEST_SOURCES
     TestCrashReportDiagnostics.cpp
     TestDownloadSegmentation.cpp
     TestDownloadStore.cpp
+    TestExtensionPackage.cpp
     TestExternalURLHandler.cpp
     TestFaviconStore.cpp
     TestForceDarkSettings.cpp
