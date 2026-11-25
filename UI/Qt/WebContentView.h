@@ -468,6 +468,9 @@ private:
     void fall_back_from_vulkan_window();
     void vulkan_window_exposure_changed();
     QRect rect_covered_by_page_window() const;
+    QRect rect_shown_by_page_window() const;
+    QRegion corners_of_page_window() const;
+    void update_corners_of_page_window();
     bool vulkan_window_update_would_only_resize() const;
     void remap_unexposed_vulkan_window();
 
@@ -498,6 +501,8 @@ private:
     bool m_page_surface_failed { false };
     // Where the page surface shows a frame, in device pixels of the view.
     QRect m_page_surface_rect;
+    // The part of its frame that the page surface shows, which the compositor may round the corners of.
+    QRect m_page_surface_shown_rect;
     // Where the page surface last showed a frame, in the logical coordinates of the browser window's surface.
     QPoint m_page_surface_position;
     // The backing stores the view is done with that the compositor of the desktop may still read. The page they belong
