@@ -20,6 +20,7 @@
 #include <UI/Qt/DownloadPresentation.h>
 #include <UI/Qt/ElidedLabel.h>
 #include <UI/Qt/FeedbackPopover.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/LadybirdButton.h>
 #include <UI/Qt/LocationEdit.h>
@@ -44,6 +45,7 @@
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGraphicsOpacityEffect>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QMenu>
 #include <QMouseEvent>
@@ -51,6 +53,7 @@
 #include <QPixmap>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScreen>
 #include <QScrollArea>
 #include <QStyleOptionToolButton>
 #include <QStylePainter>
@@ -1223,6 +1226,13 @@ WindowToolbar::WindowToolbar(WebView::IsPrivate is_private, QWidget* parent)
     toolbar_container_layout->setSpacing(0);
     toolbar_container_layout->setContentsMargins(0, 0, 0, TOOLBAR_BOTTOM_LINE_HEIGHT);
 
+    m_extension_actions = new QWidget(m_toolbar);
+    m_extension_actions->setObjectName("LadybirdExtensionActions");
+    auto* extension_actions_layout = new QHBoxLayout(m_extension_actions);
+    extension_actions_layout->setSpacing(TOOLBAR_SPACING);
+    extension_actions_layout->setContentsMargins(0, 0, 0, 0);
+    update_extension_actions();
+
     m_downloads_button = new DownloadsButton(m_toolbar);
     QObject::connect(m_downloads_button, &QToolButton::clicked, this, [this] {
         // NB: The button only stays checked while the list is open, which showing it sees to.
@@ -1436,6 +1446,7 @@ void WindowToolbar::lay_out_as_row()
     toolbar_layout->addWidget(m_navigation_buttons, 0, Qt::AlignVCenter);
     m_navigation_buttons->show();
     toolbar_layout->addWidget(&field_slot(), 1);
+    toolbar_layout->addWidget(m_extension_actions, 0, Qt::AlignVCenter);
     toolbar_layout->addWidget(m_downloads_button, 0, Qt::AlignVCenter);
     if (m_feedback_button)
         toolbar_layout->addWidget(m_feedback_button, 0, Qt::AlignVCenter);
@@ -1474,6 +1485,7 @@ void WindowToolbar::lay_out_in_sidebar()
     m_window_controls_separator->hide();
 
     auto* footer_layout = static_cast<QBoxLayout*>(m_sidebar_footer->layout());
+    footer_layout->addWidget(m_extension_actions, 0, Qt::AlignVCenter);
     footer_layout->addWidget(m_downloads_button, 0, Qt::AlignVCenter);
     if (m_feedback_button)
         footer_layout->addWidget(m_feedback_button, 0, Qt::AlignVCenter);
@@ -2041,6 +2053,149 @@ void WindowToolbar::recreate_icons()
     if (m_feedback_button)
         m_feedback_button->setIcon(create_chrome_icon(ChromeIcon::Feedback, Theme::chrome_palette(*this), activity, TOOLBAR_ICON_SIZE));
     update_window_control_icons();
+}
+
+// The popup of an extension's toolbar button, which shows a page of the extension for the tab it was opened from. It
+// closes when the user clicks elsewhere, or when the page closes itself.
+class ExtensionPopup final : public QWidget {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    ExtensionPopup(BrowserWindow& window, URL::URL const& url, u64 tab_view_id, QRect anchor)
+        : QWidget(&window, Qt::Popup)
+        , m_anchor(anchor)
+    {
+        setAttribute(Qt::WA_DeleteOnClose);
+        resize(EXTENSION_POPUP_SIZE);
+
+        auto* layout = new QVBoxLayout(this);
+        layout->setContentsMargins(0, 0, 0, 0);
+
+        auto view_initial_state = WebContentViewInitialState {
+            .is_private = WebView::IsPrivate::No,
+            .maximum_frames_per_second = window.refresh_rate(),
+            .display_id = window.display_id(),
+            .screen_shows_high_dynamic_range = window.screen_shows_high_dynamic_range(),
+            .owner_view_id = {},
+            .is_tab = false,
+        };
+        m_view = new WebContentView(this, {}, view_initial_state);
+        layout->addWidget(m_view);
+
+        HubConnection::the().async_set_tab_of_extension_popup(m_view->view_id(), tab_view_id);
+        m_view->on_close = [this] { close(); };
+        // A link the popup opens in a new tab, or a window it opens, becomes a tab of the window it was opened from.
+        m_view->on_open_new_view = [window = QPointer<BrowserWindow>(&window)](auto activate_tab, auto, u64 hub_view_id) {
+            if (window)
+                window->create_new_tab(activate_tab, hub_view_id);
+        };
+        m_view->load(url);
+
+        popups().append(this);
+    }
+
+    virtual ~ExtensionPopup() override
+    {
+        popups().remove_first_matching([this](auto const& popup) { return popup.data() == this; });
+    }
+
+    static Vector<QPointer<ExtensionPopup>>& popups()
+    {
+        static Vector<QPointer<ExtensionPopup>> popups;
+        return popups;
+    }
+
+    u64 view_id() const { return m_view->view_id(); }
+
+    // https://developer.chrome.com/docs/extensions/reference/api/action#popup
+    void set_preferred_size(Gfx::IntSize size)
+    {
+        resize(clamp(size.width(), MINIMUM_SIZE.width(), MAXIMUM_SIZE.width()), clamp(size.height(), MINIMUM_SIZE.height(), MAXIMUM_SIZE.height()));
+        place();
+    }
+
+    // The popup hangs below its button, with their right edges lined up, and stays on the button's screen: above the
+    // button if there is no room below it.
+    void place()
+    {
+        QRect rect { QPoint(m_anchor.right() - width() + 1, m_anchor.bottom() + ANCHOR_GAP), size() };
+        if (auto* screen = QGuiApplication::screenAt(m_anchor.center())) {
+            auto available = screen->availableGeometry();
+            rect.setSize(rect.size().boundedTo(available.size()));
+            if (rect.bottom() > available.bottom())
+                rect.moveBottom(m_anchor.top() - ANCHOR_GAP);
+            rect.moveLeft(clamp(rect.left(), available.left(), max(available.left(), available.right() - rect.width() + 1)));
+            rect.moveTop(clamp(rect.top(), available.top(), max(available.top(), available.bottom() - rect.height() + 1)));
+        }
+        setGeometry(rect);
+    }
+
+private:
+    static constexpr QSize EXTENSION_POPUP_SIZE { 380, 520 };
+    static constexpr QSize MINIMUM_SIZE { 25, 25 };
+    static constexpr QSize MAXIMUM_SIZE { 800, 600 };
+    static constexpr int ANCHOR_GAP = 4;
+
+    QRect m_anchor;
+    WebContentView* m_view { nullptr };
+};
+
+void WindowToolbar::resize_extension_popup(u64 popup_view_id, Gfx::IntSize size)
+{
+    for (auto const& popup : ExtensionPopup::popups()) {
+        if (popup && popup->view_id() == popup_view_id)
+            popup->set_preferred_size(size);
+    }
+}
+
+void WindowToolbar::update_extension_actions()
+{
+    for (auto* button : m_extension_actions->findChildren<QToolButton*>(Qt::FindDirectChildrenOnly))
+        button->deleteLater();
+
+    // Extensions do not run in private browsing.
+    if (m_is_private == WebView::IsPrivate::Yes) {
+        m_extension_actions->hide();
+        return;
+    }
+
+    auto actions = HubConnection::the().extension_actions();
+    for (auto const& action : actions) {
+        auto* button = new ToolbarButton(m_extension_actions);
+        button->setAutoRaise(true);
+        button->setFocusPolicy(Qt::NoFocus);
+        button->setIconSize({ TOOLBAR_ICON_SIZE, TOOLBAR_ICON_SIZE });
+        button->setFixedSize(TOOLBAR_BUTTON_SIZE);
+        button->setToolTip(qstring_from_ak_string(action.title));
+        button->setAccessibleName(qstring_from_ak_string(action.title));
+
+        QPixmap icon;
+        if (action.icon.has_value() && icon.loadFromData(action.icon->data(), action.icon->size()))
+            button->setIcon(QIcon(icon));
+        else
+            button->setText(qstring_from_ak_string(action.title).left(1));
+
+        QObject::connect(button, &QToolButton::clicked, this, [this, button, extension_id = action.extension_id, popup_url = action.popup_url] {
+            auto* tab = browser_window().current_tab();
+            if (!tab)
+                return;
+            auto tab_view_id = tab->view().view_id();
+
+            if (!popup_url.has_value()) {
+                HubConnection::the().async_click_extension_action(extension_id, tab_view_id);
+                return;
+            }
+
+            if (m_extension_popup)
+                m_extension_popup->close();
+            auto* popup = new ExtensionPopup(browser_window(), *popup_url, tab_view_id, QRect(button->mapToGlobal(QPoint(0, 0)), button->size()));
+            popup->place();
+            popup->show();
+            m_extension_popup = popup;
+        });
+        m_extension_actions->layout()->addWidget(button);
+    }
+    m_extension_actions->setVisible(!actions.is_empty());
 }
 
 void WindowToolbar::update_downloads_button()

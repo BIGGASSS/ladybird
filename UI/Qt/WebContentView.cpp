@@ -38,6 +38,7 @@
 #include <UI/Qt/Application.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/CrashReportReviewWidget.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/ReportReview.h>
 #include <UI/Qt/ScreenshotViewer.h>
@@ -1153,12 +1154,12 @@ void WebContentView::dropEvent(QDropEvent* event)
 
         QStringList installed;
         for (auto const& path : dropped_extension_packages(*event->mimeData())) {
-            auto extension = WebView::Application::the().install_extension(ak_byte_string_from_qstring(path));
-            if (extension.is_error()) {
-                QMessageBox::warning(this, "Ladybird", QString("Unable to install the extension %1: %2").arg(path, qstring_from_ak_string(MUST(String::formatted("{}", extension.error())))));
+            auto result = HubConnection::the().install_extension(ak_byte_string_from_qstring(path));
+            if (!result.name().has_value()) {
+                QMessageBox::warning(this, "Ladybird", QString("Unable to install the extension %1: %2").arg(path, qstring_from_ak_string(result.error())));
                 continue;
             }
-            installed.append(qstring_from_ak_string(extension.value().name));
+            installed.append(qstring_from_ak_string(*result.name()));
         }
 
         if (!installed.isEmpty())

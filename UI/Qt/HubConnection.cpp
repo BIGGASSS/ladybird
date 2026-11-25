@@ -61,6 +61,16 @@ void HubConnection::die()
     Core::Process::terminate_immediately(1);
 }
 
+void HubConnection::extension_actions_changed()
+{
+    Application::the().update_extension_actions();
+}
+
+void HubConnection::resize_extension_popup(u64 popup_view_id, Gfx::IntSize size)
+{
+    WindowToolbar::resize_extension_popup(popup_view_id, size);
+}
+
 void HubConnection::crash_reports_changed()
 {
 #ifdef LADYBIRD_HUB_IN_OWN_PROCESS
