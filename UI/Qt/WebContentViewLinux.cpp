@@ -1005,7 +1005,11 @@ struct WebContentView::VulkanWindowRenderer final : public QVulkanWindowRenderer
             m_view.fall_back_to_bitmap_rendering();
             return;
         }
+        // NB: The view paints the corners of the page's window, which move with its size.
+        auto size_changed = m_view.m_presented_page_window_size != target_size;
         m_view.m_presented_page_window_size = target_size;
+        if (size_changed)
+            m_view.update_corners_of_page_window();
         m_view.m_presented_page_window_content_serial = content_serial;
     }
 
@@ -1150,6 +1154,50 @@ QRect WebContentView::rect_covered_by_page_window() const
     if (!m_vulkan_window_container || !m_vulkan_window_container->isVisible())
         return {};
     return { QPoint { 0, 0 }, m_presented_page_window_size };
+}
+
+QRect WebContentView::rect_shown_by_page_window() const
+{
+#ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    if (m_page_surface)
+        return m_page_surface_shown_rect;
+#endif
+    return rect_covered_by_page_window();
+}
+
+// Some compositors, such as Hyprland, round each surface of a window at its own corners, so they also round off the
+// corners of the page's surface, where they show what the view paints under it. This covers the radius that windows
+// are commonly rounded with, but a compositor may round them more.
+static constexpr int PAGE_WINDOW_CORNER_SIZE = 20;
+
+// The corners of the page's window, in device pixels of the view.
+QRegion WebContentView::corners_of_page_window() const
+{
+    auto shown_rect = rect_shown_by_page_window();
+    if (shown_rect.isEmpty())
+        return {};
+
+    auto size = min(static_cast<int>(AK::ceil(PAGE_WINDOW_CORNER_SIZE * device_pixel_ratio())), min(shown_rect.width(), shown_rect.height()) / 2);
+    QSize corner { size, size };
+
+    QRegion corners;
+    corners += QRect { shown_rect.topLeft(), corner };
+    corners += QRect { QPoint { shown_rect.right() - size + 1, shown_rect.top() }, corner };
+    corners += QRect { QPoint { shown_rect.left(), shown_rect.bottom() - size + 1 }, corner };
+    corners += QRect { QPoint { shown_rect.right() - size + 1, shown_rect.bottom() - size + 1 }, corner };
+    return corners;
+}
+
+void WebContentView::update_corners_of_page_window()
+{
+    auto ratio = device_pixel_ratio();
+    for (auto const& corner : corners_of_page_window()) {
+        auto left = static_cast<int>(AK::floor(corner.left() / ratio));
+        auto top = static_cast<int>(AK::floor(corner.top() / ratio));
+        auto right = static_cast<int>(AK::ceil((corner.right() + 1) / ratio));
+        auto bottom = static_cast<int>(AK::ceil((corner.bottom() + 1) / ratio));
+        update(QRect { left, top, right - left, bottom - top });
+    }
 }
 
 void WebContentView::vulkan_window_exposure_changed()
@@ -1366,6 +1414,7 @@ void WebContentView::hide_page_surface()
     if (m_page_surface->is_showing())
         m_page_surface->set_synchronized(true);
     m_page_surface->hide();
+    m_page_surface_shown_rect = {};
     if (!m_page_surface_rect.isEmpty()) {
         m_page_surface_rect = {};
         update();
@@ -1455,12 +1504,22 @@ void WebContentView::update_page_surface(PageSurfaceContent content)
     QRect covered_rect;
     if (m_page_surface->is_showing())
         covered_rect = result == WaylandPageSurface::PresentResult::Presented ? frame_rect : m_page_surface_rect;
-    if (!covered_rect.contains(m_page_surface_rect))
+    QRect shown_rect;
+    if (m_page_surface->is_showing())
+        shown_rect = result == WaylandPageSurface::PresentResult::Presented ? target : m_page_surface_shown_rect;
+    auto shown_rect_changed = shown_rect != m_page_surface_shown_rect;
+    m_page_surface_shown_rect = shown_rect;
+    if (!covered_rect.contains(m_page_surface_rect)) {
         update();
-    // NB: Nothing else may make the browser window commit, so have Qt repaint a pixel of it. Qt drops updates to any
-    //     part of the view that the widgets it is in clip away.
-    else if (result == WaylandPageSurface::PresentResult::Presented && m_page_surface->needs_parent_commit())
-        update(QRect { rect_shown_in_window().topLeft(), QSize { 1, 1 } });
+    } else {
+        // NB: The view paints the corners of the page surface, which move with it.
+        if (shown_rect_changed)
+            update_corners_of_page_window();
+        // NB: Nothing else may make the browser window commit, so have Qt repaint a pixel of it. Qt drops updates to
+        //     any part of the view that the widgets it is in clip away.
+        if (result == WaylandPageSurface::PresentResult::Presented && m_page_surface->needs_parent_commit())
+            update(QRect { rect_shown_in_window().topLeft(), QSize { 1, 1 } });
+    }
     m_page_surface_rect = covered_rect;
     if (result == WaylandPageSurface::PresentResult::Presented)
         m_page_surface_position = frame.position;
@@ -1518,6 +1577,7 @@ void WebContentView::destroy_page_surface()
     });
     m_page_surface = nullptr;
     m_page_surface_rect = {};
+    m_page_surface_shown_rect = {};
     // NB: Unheld stores do not need to wait for a Wayland release. Held stores moved their acknowledgements above.
     for (auto& store : exchange(m_backing_stores_waiting_for_release, {}))
         release_backing_store_to_page(store.page_id, store.bitmap_id);

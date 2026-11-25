@@ -182,6 +182,14 @@ WebContentView::WebContentView(QWidget* window, Optional<u64> hub_view_id, WebCo
     on_page_background_color_change = [this](Gfx::Color) {
         update_iosurface_layer_background_color();
     };
+#elif defined(LADYBIRD_QT_USE_VULKAN_WINDOW)
+    // NB: The corners of the page's window show the page's background color painted under them.
+    on_page_background_color_change = [this, last_color = Optional<Gfx::Color> {}](Gfx::Color color) mutable {
+        if (last_color == color)
+            return;
+        last_color = color;
+        update_corners_of_page_window();
+    };
 #endif
 
     QObject::connect(qGuiApp, &QGuiApplication::screenRemoved, this, [this](QScreen*) {
@@ -1264,8 +1272,9 @@ void WebContentView::paintEvent(QPaintEvent*)
     QRegion background { QRect(0, 0, m_viewport_size.width(), m_viewport_size.height()) };
 #    ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
     // NB: Filling the part of the widget under the page's window would only touch memory that nobody sees. During a
-    //     resize, that is most of a window-sized buffer at every step.
+    //     resize, that is most of a window-sized buffer at every step. Its corners are the exception.
     background -= rect_covered_by_page_window();
+    background += corners_of_page_window() & QRect(0, 0, m_viewport_size.width(), m_viewport_size.height());
 #    endif
     for (auto const& rect : background)
         painter.fillRect(rect, QColor(background_color.red(), background_color.green(), background_color.blue()));
