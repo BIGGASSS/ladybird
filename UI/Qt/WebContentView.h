@@ -312,6 +312,9 @@ private:
     void did_update_accessibility_tree(Optional<Vector<i64>> removed_ids);
 
     OwnPtr<WebView::AccessibilityTreeManager> m_accessibility_manager;
+    // Dropping .crx files on a page installs them as extensions, instead of handing them to the page.
+    bool m_dragging_extension_packages { false };
+
     bool m_posted_initial_accessibility_focus { false };
     // Set once this view has asked WebContent for the tree; from then on, WebContent pushes every change on its own.
     bool m_requested_accessibility_tree { false };
