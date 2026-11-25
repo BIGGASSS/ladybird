@@ -2125,21 +2125,27 @@ void BrowserWindow::paintEvent(QPaintEvent* event)
 {
     QMainWindow::paintEvent(event);
 
+    // NB: The chrome takes its colors from the theme, not from the system palette, which can be light on a desktop
+    //     with no Qt platform theme. Whatever the chrome and the page leave uncovered, such as the corners a
+    //     compositor rounds off the page's own surface, should not show up in the system palette's colors.
+    auto chrome_palette = Theme::chrome_palette(*this);
+    auto background = ChromeStyle::chrome_background(chrome_palette);
+
     QPainter painter(this);
     if (!should_draw_window_border()) {
 #if !defined(AK_OS_MACOS)
-        painter.fillRect(rect(), palette().window());
+        painter.fillRect(rect(), background);
 #endif
         return;
     }
 
     if (testAttribute(Qt::WA_OpaquePaintEvent))
-        painter.fillRect(rect(), palette().window());
+        painter.fillRect(rect(), background);
     painter.setRenderHint(QPainter::Antialiasing);
 
-    auto color = ChromeStyle::chrome_window_outline(Theme::chrome_palette(*this));
+    auto color = ChromeStyle::chrome_window_outline(chrome_palette);
     painter.setPen(QPen(color, 1));
-    painter.setBrush(palette().window());
+    painter.setBrush(background);
     painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), WINDOW_CORNER_RADIUS - 0.5, WINDOW_CORNER_RADIUS - 0.5);
 }
 
