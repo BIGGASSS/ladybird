@@ -3490,9 +3490,20 @@ void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffe
         dbgln("Failed to set extensions: {}", result.error());
         return;
     }
+    if (registry.has_extensions())
+        URL::set_chrome_extension_urls_have_tuple_origins();
 
     registry.on_storage_change = [this](String const& extension_id, String const& area, String const& changes) {
         async_did_change_extension_storage(extension_id, area, changes);
+    };
+    registry.on_load_resource = [this](u64 request_id, String const& extension_id, String const& path) {
+        async_request_extension_resource(request_id, extension_id, path);
+    };
+    registry.on_api_call = [this](Web::PageId page_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments) {
+        async_extension_api_call(page_id, context_id, call_id, extension_id, method, arguments);
+    };
+    registry.on_message_response = [this](u64 delivery_id, bool, String const& response) {
+        async_did_handle_extension_message(delivery_id, to_underlying(Web::Extensions::MessageDeliveryStatus::RespondedLater), response);
     };
 
     // The CSS of content scripts is part of each document's user style sheet.
@@ -3507,6 +3518,29 @@ void ConnectionFromClient::set_extension_storage(String storage)
         return;
     }
     Web::Extensions::ExtensionRegistry::the().set_storage(json.release_value().as_object());
+}
+
+void ConnectionFromClient::did_load_extension_resource(u64 request_id, bool found, Core::AnonymousBuffer data, String mime_type)
+{
+    if (found && data.validate_backing_size().is_error())
+        found = false;
+    Web::Extensions::ExtensionRegistry::the().did_load_resource(request_id, found ? Optional<ReadonlyBytes> { data.bytes() } : OptionalNone {}, mime_type);
+}
+
+void ConnectionFromClient::extension_api_call_completed(u64 call_id, u64 context_id, bool succeeded, String result)
+{
+    Web::Extensions::ExtensionRegistry::the().did_complete_call(call_id, context_id, succeeded, result);
+}
+
+void ConnectionFromClient::deliver_extension_event(String extension_id, String name, String arguments)
+{
+    Web::Extensions::ExtensionRegistry::the().deliver_event(extension_id, name, arguments);
+}
+
+void ConnectionFromClient::deliver_extension_message(u64 delivery_id, String extension_id, Optional<Web::PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, String message, String sender)
+{
+    auto result = Web::Extensions::ExtensionRegistry::the().deliver_message(delivery_id, extension_id, content_scripts_of_page, only_top_level_frame, excluded_context_id, message, sender);
+    async_did_handle_extension_message(delivery_id, to_underlying(result.status), result.response);
 }
 
 void ConnectionFromClient::extension_storage_changed(String extension_id, String area, String changes)

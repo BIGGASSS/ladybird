@@ -256,6 +256,8 @@ private:
     virtual void register_dedicated_worker(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport) override;
     virtual void did_update_cookie(HTTP::Cookie::Cookie) override;
     virtual void did_change_extension_storage(String extension_id, String area, String changes) override;
+    virtual void request_extension_resource(u64 request_id, String extension_id, String path) override;
+    virtual void did_handle_extension_message(u64 delivery_id, u8 status, String response) override;
     virtual Messages::WebContentClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String) override;
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection(Optional<Utf16String> top_level_site) override;
     virtual Messages::WebContentClient::RequestMediaServerConnectionResponse request_media_server_connection() override;

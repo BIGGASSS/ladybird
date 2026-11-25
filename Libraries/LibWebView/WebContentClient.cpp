@@ -1005,6 +1005,17 @@ void WebContentClient::did_close_browsing_context(Web::PageId page_id)
     close_server_if_unused();
 }
 
+void WebContentClient::request_extension_resource(u64 request_id, String extension_id, String path)
+{
+    Application::the().load_extension_resource({}, *this, request_id, extension_id, path);
+}
+
+void WebContentClient::did_handle_extension_message(u64 delivery_id, u8 status, String response)
+{
+    if (auto* host = Application::the().extension_host())
+        host->did_handle_message(*this, delivery_id, status, response);
+}
+
 void WebContentClient::did_change_extension_storage(String extension_id, String area, String changes)
 {
     Application::the().extension_storage_did_change({}, *this, extension_id, area, changes);

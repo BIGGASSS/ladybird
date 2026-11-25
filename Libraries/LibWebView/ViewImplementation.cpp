@@ -652,6 +652,9 @@ void ViewImplementation::start_being_hidden()
 
 void ViewImplementation::set_current_tab_of_window(bool current_tab_of_window)
 {
+    static u64 s_became_current_tab_of_window_order = 0;
+    if (current_tab_of_window && !m_current_tab_of_window)
+        m_became_current_tab_of_window_order = ++s_became_current_tab_of_window_order;
     m_current_tab_of_window = current_tab_of_window;
     if (current_tab_of_window) {
         m_hidden_since.clear();

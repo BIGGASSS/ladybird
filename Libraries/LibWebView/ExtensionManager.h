@@ -15,6 +15,7 @@
 #include <AK/Vector.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Forward.h>
+#include <LibURL/URL.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/ExtensionPackage.h>
 
@@ -48,6 +49,26 @@ public:
     ErrorOr<InstalledExtension> install(StringView path, ReadonlySpan<String> preferred_languages);
 
     Core::AnonymousBuffer const& extensions_buffer() const { return m_extensions_buffer; }
+
+    struct Resource {
+        Core::AnonymousBuffer data;
+        String mime_type;
+    };
+    Optional<Resource> resource(StringView extension_id, StringView path) const;
+
+    // The manifest of the extension, with its user-visible strings translated.
+    Optional<JsonObject const&> manifest(StringView extension_id) const;
+    struct Action {
+        String extension_id;
+        String title;
+        Optional<ByteBuffer> icon;
+        Optional<URL::URL> popup_url;
+    };
+    // The toolbar buttons of the extensions that have one.
+    Vector<Action> actions() const;
+
+    // The page that runs the extension's background scripts or service worker, if it has any.
+    Optional<URL::URL> background_page_url(StringView extension_id) const;
     String storage_json() const { return m_storage.serialized(); }
 
     // Applies changes a process hosting web content made to an extension's storage, and saves the storage soon.
@@ -61,6 +82,9 @@ private:
     ByteString m_extensions_directory;
     ByteString m_storage_path;
     Vector<InstalledExtension> m_extensions;
+    HashMap<String, ExtensionPackage> m_packages;
+    HashMap<String, JsonObject> m_manifests;
+    HashMap<String, JsonObject> m_messages;
     Core::AnonymousBuffer m_extensions_buffer;
     JsonObject m_storage;
     RefPtr<Core::Timer> m_storage_save_timer;

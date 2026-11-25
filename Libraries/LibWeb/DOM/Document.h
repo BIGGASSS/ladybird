@@ -1874,8 +1874,10 @@ public:
     // How many of the stages of content scripts, by Extensions::RunAt, have run in this document.
     u8 extension_content_script_stage() const { return m_extension_content_script_stage; }
     void set_extension_content_script_stage(u8 stage) { m_extension_content_script_stage = stage; }
-    GC::Ptr<Extensions::ExtensionWorld> extension_world(StringView extension_id) const;
-    void add_extension_world(GC::Ref<Extensions::ExtensionWorld>);
+    GC::Ptr<Extensions::ExtensionContext> extension_context(StringView extension_id) const;
+    void add_extension_context(GC::Ref<Extensions::ExtensionContext>);
+    bool has_extension_contexts() const { return !m_extension_contexts.is_empty(); }
+    Vector<GC::Ref<Extensions::ExtensionContext>> const& extension_contexts() const { return m_extension_contexts; }
     bool content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names);
 
     void exit_pointer_lock();
@@ -2546,7 +2548,7 @@ private:
     HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_ids;
 
     u8 m_extension_content_script_stage { 0 };
-    Vector<GC::Ref<Extensions::ExtensionWorld>> m_extension_worlds;
+    Vector<GC::Ref<Extensions::ExtensionContext>> m_extension_contexts;
     GC::Ptr<Platform::Timer> m_extension_idle_timer;
 
     Optional<AK::UnixDateTime> m_last_modified;

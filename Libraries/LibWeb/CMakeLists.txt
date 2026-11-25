@@ -271,8 +271,8 @@ set(SOURCES
     Editing/ReplaceSelection.cpp
     EntriesAPI/FileSystemEntry.cpp
     EventTiming/EventTiming.cpp
+    Extensions/ExtensionContext.cpp
     Extensions/ExtensionRegistry.cpp
-    Extensions/ExtensionWorld.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
     Fetch/Engine/FetchBodyDeliveryGate.cpp

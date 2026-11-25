@@ -267,6 +267,10 @@ endpoint WebContentServer routed by Web::PageId page_id
     set_extensions(Core::AnonymousBuffer extensions) =|
     set_extension_storage(String storage) =|
     extension_storage_changed(String extension_id, String area, String changes) =|
+    did_load_extension_resource(u64 request_id, bool found, Core::AnonymousBuffer data, String mime_type) =|
+    extension_api_call_completed(u64 call_id, u64 context_id, bool succeeded, String result) =|
+    deliver_extension_event(String extension_id, String name, String arguments) =|
+    deliver_extension_message(u64 delivery_id, String extension_id, Optional<Web::PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, String message, String sender) =|
 
     set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) =|
     set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) =|

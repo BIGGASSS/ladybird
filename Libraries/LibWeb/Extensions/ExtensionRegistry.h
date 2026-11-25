@@ -15,9 +15,13 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
+#include <LibGC/Function.h>
+#include <LibGC/Root.h>
 #include <LibURL/Forward.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWebCommon/Extensions/MessageDeliveryStatus.h>
+#include <LibWebCommon/Page/PageId.h>
 
 namespace Web::Extensions {
 
@@ -61,6 +65,8 @@ struct Extension {
     String ui_language;
     Vector<ContentScript> content_scripts;
     HashMap<String, WebAccessibleResource> resources;
+    Vector<String> sandboxed_pages;
+    String sandbox_policy;
 };
 
 // The installed extensions, as the browser process told this process about them. Content scripts of these run in the
@@ -93,24 +99,52 @@ public:
 
     Optional<WebAccessibleResource const&> web_accessible_resource(URL::URL const&, URL::Origin const& requester) const;
 
+    // The other files of an extension, which its own pages load, come from the browser process when they are asked for.
+    using ResourceCallback = GC::Ref<GC::Function<void(Optional<ReadonlyBytes>, StringView mime_type)>>;
+    void load_resource(URL::URL const&, ResourceCallback);
+    // The manifest's sandboxed pages are served with a content security policy with a sandbox, which gives them an
+    // opaque origin. This is that policy, if the URL is of such a page.
+    Optional<String> sandbox_policy_for(URL::URL const&) const;
+    void did_load_resource(u64 request_id, Optional<ReadonlyBytes>, StringView mime_type);
+    Function<void(u64 request_id, String const& extension_id, String const& path)> on_load_resource;
+
     // The CSS of the content scripts that match the document, which the document adds to its user style sheet.
     Utf16String style_sheet_for_document(DOM::Document const&) const;
 
     // Runs the content scripts of every stage up to and including the given one that have not yet run in the document.
+    // A page of an extension gets the extension's API first.
     void run_content_scripts(DOM::Document&, RunAt);
+
+    // What the API of an extension asks the browser process to do, such as querying tabs or sending a message, goes to
+    // on_api_call, and its result comes back to did_complete_call().
+    u64 call(u64 context_id, StringView method, StringView arguments_json);
+    void did_complete_call(u64 call_id, u64 context_id, bool succeeded, StringView result_json);
+    Function<void(PageId, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json)> on_api_call;
+
+    // Tells the listeners of the extension's pages, or of the content scripts in the given page, of a message.
+    struct MessageDeliveryResult {
+        MessageDeliveryStatus status { MessageDeliveryStatus::NoListener };
+        String response;
+    };
+    // Tells the extension's pages of an event of its API, such as its toolbar button being clicked.
+    void deliver_event(StringView extension_id, StringView name, StringView arguments_json);
+    MessageDeliveryResult deliver_message(u64 delivery_id, StringView extension_id, Optional<PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, StringView message_json, StringView sender_json);
+    Function<void(u64 delivery_id, bool responded, String const& response_json)> on_message_response;
 
 private:
     ExtensionRegistry() = default;
 
     bool content_script_matches(ContentScript const&, DOM::Document const&) const;
+    void for_each_context(Function<void(ExtensionContext&)>) const;
+    GC::Ptr<ExtensionContext> context(u64 context_id) const;
     void inject(DOM::Document&, Extension const&, Vector<ContentScript const*> const&);
 
     Vector<Extension> m_extensions;
+    HashMap<u64, GC::Root<GC::Function<void(Optional<ReadonlyBytes>, StringView)>>> m_pending_resource_loads;
+    u64 m_next_resource_request_id { 0 };
+    u64 m_next_call_id { 0 };
     // Extension ID -> storage area name -> items.
     HashMap<String, HashMap<String, JsonObject>> m_storage;
 };
-
-WEB_API bool match_pattern_matches(StringView pattern, URL::URL const&);
-WEB_API bool glob_matches(StringView glob, StringView text);
 
 }

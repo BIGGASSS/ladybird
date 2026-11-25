@@ -50,6 +50,7 @@
 #include <LibWebView/BrowserProcess.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/DownloadStore.h>
+#include <LibWebView/ExtensionHost.h>
 #include <LibWebView/ExtensionManager.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
@@ -211,10 +212,16 @@ public:
     Optional<UnixDateTime> content_blocker_list_last_updated_at(StringView identifier) const;
 
     ExtensionManager const* extension_manager() const { return m_extension_manager.ptr(); }
+    // Called when extensions are installed, so that the UI can show their toolbar buttons.
+    virtual void extensions_did_change() { }
+    // The page in an extension's popup would like the popup to be this large.
+    virtual void extension_popup_did_request_size([[maybe_unused]] u64 popup_view_id, [[maybe_unused]] Gfx::IntSize size) { }
     // Installs the Chrome extension (.crx file) at the given path. Pages that are open get its content scripts once
     // they are reloaded.
     ErrorOr<InstalledExtension> install_extension(StringView path);
     void extension_storage_did_change(Badge<WebContentClient>, WebContentClient const&, String const& extension_id, String const& area, String const& changes);
+    void load_extension_resource(Badge<WebContentClient>, WebContentClient&, u64 request_id, String const& extension_id, String const& path);
+    ExtensionHost* extension_host() { return m_extension_host.ptr(); }
 
     static BrowsingSession& default_session() { return *the().m_default_session; }
 
@@ -652,6 +659,7 @@ private:
     JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
     OwnPtr<ExtensionManager> m_extension_manager;
+    OwnPtr<ExtensionHost> m_extension_host;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
     ByteString m_instance_data_directory;
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)

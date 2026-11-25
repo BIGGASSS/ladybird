@@ -1536,6 +1536,15 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
     }
 }
 
+static NonnullRefPtr<Infrastructure::Response> extension_resource_response(ReadonlyBytes data, StringView mime_type)
+{
+    auto response = Infrastructure::Response::create();
+    response->set_status_message("OK"sv);
+    response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Type"sv, mime_type));
+    response->set_body(Infrastructure::byte_sequence_as_response_body(data));
+    return response;
+}
+
 // https://fetch.spec.whatwg.org/#concept-scheme-fetch
 GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchParams const& fetch_params)
 {
@@ -1812,17 +1821,46 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
     }
     // AD-HOC: "chrome-extension"
     else if (request->current_url().scheme() == "chrome-extension"sv) {
-        // Only the files an installed extension makes web accessible to the requesting page can be fetched, as in Chrome.
-        auto const* origin = request->origin().get_pointer<URL::Origin>();
-        auto resource = origin ? Extensions::ExtensionRegistry::the().web_accessible_resource(request->current_url(), *origin) : OptionalNone {};
-        if (!resource.has_value())
-            return PendingResponse::create(fetch_params, Infrastructure::Response::network_error("Request for a resource that is not web accessible"_string));
+        auto& registry = Extensions::ExtensionRegistry::the();
+        auto sandbox_policy = registry.sandbox_policy_for(request->current_url());
+        auto with_sandbox_policy = [&](NonnullRefPtr<Infrastructure::Response> response) {
+            // https://developer.chrome.com/docs/extensions/reference/manifest/sandbox
+            if (sandbox_policy.has_value())
+                response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Security-Policy"sv, *sandbox_policy));
+            return response;
+        };
 
-        auto response = Infrastructure::Response::create();
-        response->set_status_message("OK"sv);
-        response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Type"sv, resource->mime_type));
-        response->set_body(Infrastructure::byte_sequence_as_response_body(resource->data));
-        return PendingResponse::create(fetch_params, response);
+        // A page can fetch the files an installed extension makes web accessible to it, as in Chrome.
+        auto const* origin = request->origin().get_pointer<URL::Origin>();
+        if (auto resource = origin ? registry.web_accessible_resource(request->current_url(), *origin) : OptionalNone {}; resource.has_value())
+            return PendingResponse::create(fetch_params, with_sandbox_policy(extension_resource_response(resource->data, resource->mime_type)));
+
+        // The extension's own pages can fetch any of its files, and the browser can navigate to them. So can its
+        // sandboxed pages, whose origin is opaque.
+        auto const& extension_origin = request->current_url().origin();
+        auto is_browser_navigation = !request->client_snapshot() && request->mode() == Infrastructure::Request::Mode::Navigate;
+        auto is_from_own_sandboxed_page = request->client_snapshot()
+            && request->client_snapshot()->creation_url.scheme() == "chrome-extension"sv
+            && request->client_snapshot()->creation_url.serialized_host() == request->current_url().serialized_host()
+            && registry.sandbox_policy_for(request->client_snapshot()->creation_url).has_value();
+        if (!is_browser_navigation && !is_from_own_sandboxed_page && !(origin && origin->is_same_origin(extension_origin)))
+            return PendingResponse::create(fetch_params, Infrastructure::Response::network_error("Request for a resource that is not web accessible"_string));
+        // NB: The browser process answers the main thread only, so workers get only web accessible resources.
+        if (!Bindings::window_from_global_object(realm.global_object()))
+            return PendingResponse::create(fetch_params, Infrastructure::Response::network_error("Extension resources can only be loaded by windows"_string));
+
+        auto pending_response = PendingResponse::create(fetch_params);
+        registry.load_resource(request->current_url(), GC::create_function(realm.heap(), GC::captures(pending_response, move(sandbox_policy)), [](auto& pending_response, auto& sandbox_policy, Optional<ReadonlyBytes> data, StringView mime_type) {
+            if (!data.has_value()) {
+                pending_response->resolve(Infrastructure::Response::network_error("Extension resource not found"_string));
+                return;
+            }
+            auto response = extension_resource_response(*data, mime_type);
+            if (sandbox_policy.has_value())
+                response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Security-Policy"sv, *sandbox_policy));
+            pending_response->resolve(response);
+        }));
+        return pending_response;
     }
     // -> HTTP(S) scheme
     else if (Infrastructure::is_http_or_https_scheme(request->current_url().scheme())) {

@@ -131,7 +131,7 @@
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/Extensions/ExtensionRegistry.h>
-#include <LibWeb/Extensions/ExtensionWorld.h>
+#include <LibWeb/Extensions/ExtensionContext.h>
 #include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -1017,7 +1017,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
         import->visit_edges(visitor);
     visitor.visit(m_page);
     visitor.visit(m_window);
-    visitor.visit(m_extension_worlds);
+    visitor.visit(m_extension_contexts);
     visitor.visit(m_extension_idle_timer);
     visitor.visit(m_relevant_global_event_target);
     visitor.visit(m_style_sheets);
@@ -1207,18 +1207,18 @@ void Document::invalidate_content_blocker_style_sheet()
     m_content_blocker_style_sheet_checked_ids.clear();
 }
 
-GC::Ptr<Extensions::ExtensionWorld> Document::extension_world(StringView extension_id) const
+GC::Ptr<Extensions::ExtensionContext> Document::extension_context(StringView extension_id) const
 {
-    for (auto const& world : m_extension_worlds) {
-        if (world->extension_id() == extension_id)
-            return world;
+    for (auto const& context : m_extension_contexts) {
+        if (context->extension_id() == extension_id)
+            return context;
     }
     return nullptr;
 }
 
-void Document::add_extension_world(GC::Ref<Extensions::ExtensionWorld> world)
+void Document::add_extension_context(GC::Ref<Extensions::ExtensionContext> context)
 {
-    m_extension_worlds.append(world);
+    m_extension_contexts.append(context);
 }
 
 bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
@@ -6480,10 +6480,10 @@ void Document::destroy()
     // 4. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
     run_unloading_cleanup_steps();
 
-    // AD-HOC: Extension content scripts can no longer run in this document, so let go of their worlds.
-    for (auto& world : m_extension_worlds)
-        world->detach();
-    m_extension_worlds.clear();
+    // AD-HOC: Extensions can no longer run code in this document, so let go of what they keep for it.
+    for (auto& context : m_extension_contexts)
+        context->detach();
+    m_extension_contexts.clear();
 
     // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable().
     //         Tear the layout tree down now instead of holding it until finalization.

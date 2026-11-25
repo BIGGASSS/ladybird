@@ -198,6 +198,9 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_set_cookie(Web::PageId page_id, Optional<Web::HTML::EnvironmentId> environment_id, URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source) => ()
     did_update_cookie(HTTP::Cookie::Cookie cookie) =|
     did_change_extension_storage(String extension_id, String area, String changes) =|
+    request_extension_resource(u64 request_id, String extension_id, String path) =|
+    extension_api_call(Web::PageId page_id, u64 context_id, u64 call_id, String extension_id, String method, String arguments) =|
+    did_handle_extension_message(u64 delivery_id, u8 status, String response) =|
     did_request_delete_all_cookies(Web::PageId page_id, u64 request_id, URL::URL url) =|
 
     did_is_known_hsts_host(String domain) => (bool result)

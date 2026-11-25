@@ -3632,6 +3632,14 @@ Messages::WebContentClient::DidRequestStorageUsageResponse WebContentPage::did_r
     return client().session().storage_jar->usage(*canonical_key);
 }
 
+void WebContentPage::extension_api_call(u64 context_id, u64 call_id, String extension_id, String method, String arguments)
+{
+    if (auto* host = Application::the().extension_host())
+        host->handle_api_call(client(), id(), context_id, call_id, extension_id, method, arguments);
+    else
+        client().async_extension_api_call_completed(call_id, context_id, false, "\"Extensions are not available\""_string);
+}
+
 void WebContentPage::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)
 {
     if (auto settings = hosted_environment(message.environment_id); settings.has_value())

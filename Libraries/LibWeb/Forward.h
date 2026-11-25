@@ -556,7 +556,7 @@ class PerformanceEventTiming;
 
 namespace Web::Extensions {
 
-class ExtensionWorld;
+class ExtensionContext;
 
 }
 

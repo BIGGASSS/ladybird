@@ -11,6 +11,7 @@ use crate::url::{BasicParseOptions, HostKind, Url, basic_parse};
 unsafe extern "C" {
     // NB: LibWeb's library links its own copy of this crate, so process-wide state lives in LibURL's C++.
     fn url_rust_file_scheme_urls_have_tuple_origins() -> bool;
+    fn url_rust_chrome_extension_urls_have_tuple_origins() -> bool;
 
     fn url_rust_registrable_domain(
         domain: *const u8,
@@ -24,6 +25,11 @@ unsafe extern "C" {
 pub struct Host {
     pub kind: HostKind,
     pub serialization: String,
+}
+
+fn chrome_extension_urls_have_tuple_origins() -> bool {
+    // SAFETY: LibURL defines the function, which only reads a flag.
+    unsafe { url_rust_chrome_extension_urls_have_tuple_origins() }
 }
 
 impl Host {
@@ -230,7 +236,10 @@ impl<Serialization: AsRef<str>, BlobUrlEntrySlot> Url<Serialization, BlobUrlEntr
                 };
 
                 // 4. If pathURL’s scheme is "http", "https", or "file", then return pathURL’s origin.
-                if matches!(path_url.scheme(), "http" | "https" | "file") {
+                // AD-HOC: And "chrome-extension", where its URLs have a tuple origin.
+                if matches!(path_url.scheme(), "http" | "https" | "file")
+                    || (path_url.scheme() == "chrome-extension" && chrome_extension_urls_have_tuple_origins())
+                {
                     return path_url.origin();
                 }
 
@@ -247,6 +256,11 @@ impl<Serialization: AsRef<str>, BlobUrlEntrySlot> Url<Serialization, BlobUrlEntr
             // AD-HOC: resource:// URLs are internal browser resources; give them a shared tuple origin
             // so that same-origin checks pass between any two resource:// documents or worker scripts.
             "resource" => Origin::new_tuple("resource", empty_host(), None),
+            // AD-HOC: The files of a browser extension are all of the same origin, as in Chrome, where the scheme is a
+            //         standard one, in a process that knows of browser extensions.
+            "chrome-extension" if chrome_extension_urls_have_tuple_origins() => {
+                Origin::new_tuple("chrome-extension", self.host(), None)
+            }
             // -> "file"
             "file" => {
                 // Unfortunate as it is, this is left as an exercise to the reader. When in doubt, return a new opaque origin.

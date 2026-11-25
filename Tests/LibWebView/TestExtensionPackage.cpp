@@ -6,6 +6,10 @@
 
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
+#include <AK/LexicalPath.h>
+#include <LibCore/Directory.h>
+#include <LibCore/File.h>
+#include <LibTest/TemporaryDirectory.h>
 #include <LibTest/TestCase.h>
 #include <LibWebView/ExtensionManager.h>
 #include <LibWebView/ExtensionPackage.h>
@@ -155,4 +159,130 @@ TEST_CASE(extension_data_requires_supported_manifest_version)
 {
     auto package = package_with({ { "manifest.json"sv, R"({ "manifest_version": 1, "name": "x" })"sv } });
     EXPECT(WebView::extension_data_for_web_content(package, {}).is_error());
+}
+
+// A ZIP archive that stores the given files, as the extension manager reads them from the extensions directory.
+static ByteBuffer stored_zip(Vector<Array<StringView, 2>> files)
+{
+    auto append_u16 = [](ByteBuffer& buffer, u16 value) {
+        buffer.append(static_cast<u8>(value));
+        buffer.append(static_cast<u8>(value >> 8));
+    };
+    auto append_u32 = [&](ByteBuffer& buffer, u32 value) {
+        append_u16(buffer, static_cast<u16>(value));
+        append_u16(buffer, static_cast<u16>(value >> 16));
+    };
+
+    ByteBuffer archive;
+    ByteBuffer central_directory;
+    for (auto const& file : files) {
+        auto offset = static_cast<u32>(archive.size());
+        auto name = file[0];
+        auto contents = file[1];
+
+        append_u32(archive, 0x04034b50);
+        append_u16(archive, 20);
+        append_u16(archive, 0);
+        append_u16(archive, 0);
+        append_u32(archive, 0);
+        append_u32(archive, 0);
+        append_u32(archive, contents.length());
+        append_u32(archive, contents.length());
+        append_u16(archive, name.length());
+        append_u16(archive, 0);
+        archive.append(name.bytes());
+        archive.append(contents.bytes());
+
+        append_u32(central_directory, 0x02014b50);
+        append_u16(central_directory, 20);
+        append_u16(central_directory, 20);
+        append_u16(central_directory, 0);
+        append_u16(central_directory, 0);
+        append_u32(central_directory, 0);
+        append_u32(central_directory, 0);
+        append_u32(central_directory, contents.length());
+        append_u32(central_directory, contents.length());
+        append_u16(central_directory, name.length());
+        append_u16(central_directory, 0);
+        append_u16(central_directory, 0);
+        append_u16(central_directory, 0);
+        append_u16(central_directory, 0);
+        append_u32(central_directory, 0);
+        append_u32(central_directory, offset);
+        central_directory.append(name.bytes());
+    }
+
+    auto central_directory_offset = static_cast<u32>(archive.size());
+    archive.append(central_directory);
+    append_u32(archive, 0x06054b50);
+    append_u16(archive, 0);
+    append_u16(archive, 0);
+    append_u16(archive, files.size());
+    append_u16(archive, files.size());
+    append_u32(archive, central_directory.size());
+    append_u32(archive, central_directory_offset);
+    append_u16(archive, 0);
+    return archive;
+}
+
+TEST_CASE(extension_manager_reads_actions_and_background_pages)
+{
+    Test::TemporaryDirectory directory { "TestExtensionManager"sv };
+    auto extensions_directory = directory.path().append("Extensions"sv).string();
+
+    auto with_popup = stored_zip({
+        { "manifest.json"sv, R"({ "manifest_version": 3, "name": "__MSG_name__", "default_locale": "en",
+            "action": { "default_title": "__MSG_title__", "default_popup": "/popup.html", "default_icon": { "16": "small.png", "48": "large.png", "32": "medium.png" } },
+            "background": { "service_worker": "bg.js", "type": "module" } })"sv },
+        { "_locales/en/messages.json"sv, R"({ "name": { "message": "With Popup" }, "title": { "message": "Open it" } })"sv },
+        { "popup.html"sv, "<p>popup</p>"sv },
+        { "bg.js"sv, "var x;"sv },
+        { "small.png"sv, "small"sv },
+        { "medium.png"sv, "medium"sv },
+        { "large.png"sv, "large"sv },
+    });
+    auto without_popup = stored_zip({
+        { "manifest.json"sv, R"({ "manifest_version": 2, "name": "Without Popup", "browser_action": {}, "background": { "page": "bg.html" } })"sv },
+        { "bg.html"sv, "<script src=bg.js></script>"sv },
+    });
+
+    MUST(Core::Directory::create(extensions_directory, Core::Directory::CreateDirectories::Yes));
+    auto write = [&](StringView name, ReadonlyBytes bytes) {
+        auto file = MUST(Core::File::open(LexicalPath::join(extensions_directory, name).string(), Core::File::OpenMode::Write));
+        MUST(file->write_until_depleted(bytes));
+    };
+    write("a.zip"sv, with_popup);
+    write("b.zip"sv, without_popup);
+
+    WebView::ExtensionManager manager { extensions_directory, directory.path().append("Storage.json"sv).string() };
+    TRY_OR_FAIL(manager.load({}));
+    EXPECT_EQ(manager.extensions().size(), 2u);
+
+    auto actions = manager.actions();
+    EXPECT_EQ(actions.size(), 2u);
+    auto const& popup_action = actions[0].title == "Open it"sv ? actions[0] : actions[1];
+    auto const& plain_action = actions[0].title == "Open it"sv ? actions[1] : actions[0];
+
+    EXPECT_EQ(popup_action.title, "Open it"sv);
+    EXPECT_EQ(StringView { popup_action.icon->bytes() }, "medium"sv);
+    EXPECT_EQ(popup_action.popup_url->serialize(), MUST(String::formatted("chrome-extension://{}/popup.html", popup_action.extension_id)));
+    EXPECT_EQ(plain_action.title, "Without Popup"sv);
+    EXPECT(!plain_action.icon.has_value());
+    EXPECT(!plain_action.popup_url.has_value());
+
+    auto background_page_url = manager.background_page_url(popup_action.extension_id);
+    EXPECT_EQ(background_page_url->serialize(), MUST(String::formatted("chrome-extension://{}/_generated_background_page.html", popup_action.extension_id)));
+    auto background_page = manager.resource(popup_action.extension_id, "/_generated_background_page.html"sv);
+    EXPECT_EQ(background_page->mime_type, "text/html"sv);
+    EXPECT(StringView { background_page->data.bytes() }.contains("<script type=\"module\" src=\"/bg.js\"></script>"sv));
+
+    EXPECT_EQ(manager.background_page_url(plain_action.extension_id)->serialize(), MUST(String::formatted("chrome-extension://{}/bg.html", plain_action.extension_id)));
+
+    auto popup = manager.resource(popup_action.extension_id, "popup.html"sv);
+    EXPECT_EQ(StringView { popup->data.bytes() }, "<p>popup</p>"sv);
+    EXPECT_EQ(popup->mime_type, "text/html"sv);
+    EXPECT(!manager.resource(popup_action.extension_id, "missing.js"sv).has_value());
+    EXPECT(!manager.resource("unknown"sv, "popup.html"sv).has_value());
+
+    EXPECT_EQ(manager.manifest(popup_action.extension_id)->get_string("name"sv), "With Popup"sv);
 }

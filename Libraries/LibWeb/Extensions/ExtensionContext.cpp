@@ -7,14 +7,13 @@
 #include <LibGC/DeferGC.h>
 #include <LibJS/Runtime/ExecutionContext.h>
 #include <LibJS/Runtime/FunctionObject.h>
-#include <LibJS/Runtime/PrimitiveString.h>
 #include <LibWeb/Bindings/HostDefined.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Extensions/ExtensionWorld.h>
+#include <LibWeb/Extensions/ExtensionContext.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
@@ -24,9 +23,11 @@
 
 namespace Web::Extensions {
 
-GC_DEFINE_ALLOCATOR(ExtensionWorld);
+GC_DEFINE_ALLOCATOR(ExtensionContext);
 
-GC::Ref<ExtensionWorld> ExtensionWorld::create(DOM::Document& document, String extension_id)
+static u64 s_next_context_id = 0;
+
+GC::Ref<ExtensionContext> ExtensionContext::create_for_content_scripts(DOM::Document& document, String extension_id)
 {
     auto& window = *document.window();
     auto& settings = document.relevant_settings_object();
@@ -34,7 +35,7 @@ GC::Ref<ExtensionWorld> ExtensionWorld::create(DOM::Document& document, String e
     auto& vm = principal_realm.vm();
     auto& heap = vm.heap();
 
-    // NB: Until the world holds on to it, the realm is reachable only through its execution context, which the GC
+    // NB: Until the context holds on to it, the realm is reachable only through its execution context, which the GC
     //     does not see.
     GC::DeferGC defer_gc(heap);
 
@@ -56,26 +57,38 @@ GC::Ref<ExtensionWorld> ExtensionWorld::create(DOM::Document& document, String e
     MUST(Bindings::initialize_window_web_interfaces(window, realm));
     vm.pop_execution_context();
 
-    return heap.allocate<ExtensionWorld>(move(extension_id), move(execution_context), wrapper_world);
+    return heap.allocate<ExtensionContext>(Kind::ContentScript, move(extension_id), document, realm, move(execution_context), wrapper_world);
 }
 
-ExtensionWorld::ExtensionWorld(String extension_id, NonnullOwnPtr<JS::ExecutionContext> realm_execution_context, GC::Ref<Bindings::WrapperWorld> wrapper_world)
-    : m_extension_id(move(extension_id))
+GC::Ref<ExtensionContext> ExtensionContext::create_for_extension_page(DOM::Document& document, String extension_id)
+{
+    return document.heap().allocate<ExtensionContext>(Kind::ExtensionPage, move(extension_id), document, document.relevant_settings_object().realm(), nullptr, nullptr);
+}
+
+ExtensionContext::ExtensionContext(Kind kind, String extension_id, GC::Ref<DOM::Document> document, GC::Ref<JS::Realm> realm, OwnPtr<JS::ExecutionContext> realm_execution_context, GC::Ptr<Bindings::WrapperWorld> wrapper_world)
+    : m_id(++s_next_context_id)
+    , m_kind(kind)
+    , m_extension_id(move(extension_id))
+    , m_document(document)
+    , m_realm(realm)
     , m_realm_execution_context(move(realm_execution_context))
     , m_wrapper_world(wrapper_world)
 {
 }
 
-void ExtensionWorld::visit_edges(Visitor& visitor)
+void ExtensionContext::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    m_realm_execution_context->visit_edges(visitor);
+    visitor.visit(m_document);
+    visitor.visit(m_realm);
+    if (m_realm_execution_context)
+        m_realm_execution_context->visit_edges(visitor);
     visitor.visit(m_wrapper_world);
     visitor.visit(m_api);
-    visitor.visit(m_dispatch_storage_change);
+    visitor.visit(m_dispatch);
 }
 
-void ExtensionWorld::run_script(Utf16String const& source, StringView filename)
+void ExtensionContext::run_script(Utf16String const& source, StringView filename)
 {
     auto& realm = this->realm();
     auto& settings = HTML::principal_realm_settings_object(realm);
@@ -87,32 +100,32 @@ void ExtensionWorld::run_script(Utf16String const& source, StringView filename)
         HTML::report_exception_to_console(result.value(), realm, HTML::ErrorInPromise::No);
 }
 
-void ExtensionWorld::set_api(GC::Ref<JS::Object> api, GC::Ref<JS::FunctionObject> dispatch_storage_change)
+void ExtensionContext::set_api(GC::Ref<JS::Object> api, GC::Ref<JS::FunctionObject> dispatch)
 {
     m_api = api;
-    m_dispatch_storage_change = dispatch_storage_change;
+    m_dispatch = dispatch;
 }
 
-void ExtensionWorld::dispatch_storage_change(StringView area, StringView changes_json)
+Optional<JS::Value> ExtensionContext::dispatch(ReadonlySpan<JS::Value> arguments)
 {
-    if (!m_dispatch_storage_change || m_wrapper_world->is_detached())
-        return;
+    if (!m_dispatch || m_detached)
+        return {};
 
     auto& realm = this->realm();
-    auto& vm = realm.vm();
-    auto callback = realm.create<WebIDL::CallbackType>(*m_dispatch_storage_change, realm);
-    JS::Value arguments[] = {
-        JS::PrimitiveString::create(vm, Utf16String::from_utf8(area)),
-        JS::PrimitiveString::create(vm, Utf16String::from_utf8(changes_json)),
-    };
-    (void)WebIDL::invoke_callback(*callback, JS::js_undefined(), WebIDL::ExceptionBehavior::Report, arguments);
+    auto callback = realm.create<WebIDL::CallbackType>(*m_dispatch, realm);
+    auto result = WebIDL::invoke_callback(*callback, JS::js_undefined(), WebIDL::ExceptionBehavior::Report, arguments);
+    if (result.is_abrupt())
+        return {};
+    return result.value();
 }
 
-void ExtensionWorld::detach()
+void ExtensionContext::detach()
 {
+    m_detached = true;
     m_api = nullptr;
-    m_dispatch_storage_change = nullptr;
-    m_wrapper_world->detach();
+    m_dispatch = nullptr;
+    if (m_wrapper_world)
+        m_wrapper_world->detach();
 }
 
 }
