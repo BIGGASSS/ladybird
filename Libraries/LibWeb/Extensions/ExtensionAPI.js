@@ -512,15 +512,8 @@
             onRuleMatchedDebug: createEvent()[0],
         };
 
-        // scripting: registered content scripts are kept, but only the manifest's run.
+        // scripting
 
-        const localFunction =
-            compute =>
-            (...args) => {
-                const callback = popCallback(args);
-                return settle(callback, () => compute(...args));
-            };
-        let registeredContentScripts = [];
         const notSupported =
             name =>
             (...args) =>
@@ -528,26 +521,10 @@
                     throw new Error(name + " is not supported");
                 });
         chrome.scripting = {
-            registerContentScripts: localFunction(scripts => {
-                registeredContentScripts = registeredContentScripts.concat(scripts || []);
-            }),
-            updateContentScripts: localFunction(scripts => {
-                for (const script of scripts || []) {
-                    const index = registeredContentScripts.findIndex(existing => existing.id === script.id);
-                    if (index !== -1)
-                        registeredContentScripts[index] = { ...registeredContentScripts[index], ...script };
-                }
-            }),
-            getRegisteredContentScripts: localFunction((filter = {}) =>
-                Array.isArray(filter.ids)
-                    ? registeredContentScripts.filter(script => filter.ids.includes(script.id))
-                    : registeredContentScripts.slice()
-            ),
-            unregisterContentScripts: localFunction((filter = {}) => {
-                registeredContentScripts = Array.isArray(filter.ids)
-                    ? registeredContentScripts.filter(script => !filter.ids.includes(script.id))
-                    : [];
-            }),
+            registerContentScripts: browserFunction("scripting.registerContentScripts", 1),
+            updateContentScripts: browserFunction("scripting.updateContentScripts", 1),
+            getRegisteredContentScripts: browserFunction("scripting.getRegisteredContentScripts", 1),
+            unregisterContentScripts: browserFunction("scripting.unregisterContentScripts", 1),
             executeScript: notSupported("scripting.executeScript"),
             insertCSS: notSupported("scripting.insertCSS"),
             removeCSS: notSupported("scripting.removeCSS"),

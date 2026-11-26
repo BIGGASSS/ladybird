@@ -17,6 +17,7 @@
 #include <LibCore/Timer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibURL/Parser.h>
+#include <LibWebCommon/Extensions/MatchPattern.h>
 #include <LibWebView/ExtensionManager.h>
 
 namespace WebView {
@@ -208,7 +209,8 @@ ErrorOr<JsonObject> extension_data_for_web_content(ExtensionPackage const& packa
             result.set("include_globs"sv, json_string_array(string_array(content_script, "include_globs"sv)));
             result.set("exclude_globs"sv, json_string_array(string_array(content_script, "exclude_globs"sv)));
             result.set("all_frames"sv, content_script.get_bool("all_frames"sv).value_or(false));
-            result.set("match_about_blank"sv, content_script.get_bool("match_about_blank"sv).value_or(false) || content_script.get_bool("match_origin_as_fallback"sv).value_or(false));
+            result.set("match_about_blank"sv, content_script.get_bool("match_about_blank"sv).value_or(false));
+            result.set("match_origin_as_fallback"sv, content_script.get_bool("match_origin_as_fallback"sv).value_or(false));
             result.set("run_at"sv, content_script.get_string("run_at"sv).value_or("document_idle"_string));
             result.set("main_world"sv, content_script.get_string("world"sv) == "MAIN"sv);
             result.set("js"sv, move(scripts));
@@ -280,6 +282,19 @@ ErrorOr<JsonObject> extension_data_for_web_content(ExtensionPackage const& packa
 
     // Processes ask the browser what to do with the requests of pages if an extension may have rules for them.
     auto permissions = string_array(manifest, "permissions"sv);
+    Vector<String> host_permissions;
+    if (manifest_version == 3) {
+        for (auto const& pattern : string_array(manifest, "host_permissions"sv)) {
+            if (Web::Extensions::is_valid_match_pattern(pattern))
+                host_permissions.append(pattern);
+        }
+    } else {
+        for (auto const& permission : permissions) {
+            if (Web::Extensions::is_valid_match_pattern(permission))
+                host_permissions.append(permission);
+        }
+    }
+    data.set("host_permissions"sv, json_string_array(host_permissions));
     data.set("network_rules"sv, permissions.contains_slow("declarativeNetRequest"_string) || permissions.contains_slow("declarativeNetRequestWithHostAccess"_string));
     return data;
 }
@@ -298,6 +313,7 @@ static void warn_about_unsupported_features(InstalledExtension const& extension,
 ExtensionManager::ExtensionManager(ByteString extensions_directory, ByteString storage_path)
     : m_extensions_directory(move(extensions_directory))
     , m_storage_path(move(storage_path))
+    , m_content_scripts_path(LexicalPath::join(LexicalPath { m_storage_path }.parent().string(), "ExtensionContentScripts.json"sv).string())
     , m_network_rules(LexicalPath::join(LexicalPath { m_storage_path }.parent().string(), "ExtensionNetworkRules.json"sv).string(), [this](StringView extension_id, StringView path) -> Optional<ByteBuffer> {
         auto package = m_packages.get(extension_id);
         if (!package.has_value())
@@ -310,6 +326,7 @@ ExtensionManager::ExtensionManager(ByteString extensions_directory, ByteString s
     })
 {
     load_storage();
+    load_content_scripts();
 }
 
 ExtensionManager::~ExtensionManager()
@@ -323,6 +340,272 @@ static ErrorOr<ExtensionPackage> read_package_file(StringView path)
     auto file = TRY(Core::File::open(path, Core::File::OpenMode::Read));
     auto bytes = TRY(file->read_until_eof());
     return read_extension_package(bytes);
+}
+
+static bool manifest_has_scripting_permission(JsonObject const& manifest)
+{
+    return string_array(manifest, "permissions"sv).contains_slow("scripting"_string);
+}
+
+static ErrorOr<Optional<bool>, String> optional_bool_field(JsonObject const& object, StringView key)
+{
+    auto value = object.get(key);
+    if (!value.has_value() || value->is_null())
+        return Optional<bool> {};
+    if (!value->is_bool())
+        return MUST(String::formatted("'{}' must be a boolean", key));
+    return value->as_bool();
+}
+
+static ErrorOr<Optional<String>, String> optional_string_field(JsonObject const& object, StringView key)
+{
+    auto value = object.get(key);
+    if (!value.has_value() || value->is_null())
+        return Optional<String> {};
+    if (!value->is_string())
+        return MUST(String::formatted("'{}' must be a string", key));
+    return Optional<String> { value->as_string() };
+}
+
+static ErrorOr<Optional<Vector<String>>, String> optional_string_array_field(JsonObject const& object, StringView key)
+{
+    auto value = object.get(key);
+    if (!value.has_value() || value->is_null())
+        return Optional<Vector<String>> {};
+    if (!value->is_array())
+        return MUST(String::formatted("'{}' must be an array", key));
+    Vector<String> result;
+    for (auto const& element : value->as_array().values()) {
+        if (!element.is_string())
+            return MUST(String::formatted("'{}' entries must be strings", key));
+        result.append(element.as_string());
+    }
+    return result;
+}
+
+static ErrorOr<void, String> validate_script_id(StringView id)
+{
+    if (id.is_empty())
+        return "Script's ID must not be empty"_string;
+    if (id.starts_with('_'))
+        return MUST(String::formatted("Script's ID '{}' must not start with '_'", id));
+    return {};
+}
+
+static bool match_pattern_has_wildcard_path(StringView pattern)
+{
+    if (pattern == "<all_urls>"sv)
+        return true;
+    auto scheme_end = pattern.find("://"sv);
+    if (!scheme_end.has_value())
+        return false;
+    auto path_start = pattern.find('/', *scheme_end + 3);
+    if (!path_start.has_value())
+        return false;
+    return pattern.substring_view(*path_start) == "/*"sv;
+}
+
+static ErrorOr<void, String> validate_match_patterns(ReadonlySpan<String> patterns, StringView field_name)
+{
+    for (auto const& pattern : patterns) {
+        if (!Web::Extensions::is_valid_match_pattern(pattern))
+            return MUST(String::formatted("Invalid match pattern '{}' in '{}'", pattern, field_name));
+    }
+    return {};
+}
+
+static ErrorOr<ByteString, String> validate_script_file_path(ExtensionPackage const& package, StringView raw_path)
+{
+    if (raw_path.is_empty() || raw_path.contains('\\'))
+        return MUST(String::formatted("Invalid file path '{}' for content script", raw_path));
+    for (auto part : raw_path.split_view('/')) {
+        if (part == ".."sv)
+            return MUST(String::formatted("Invalid file path '{}' for content script", raw_path));
+    }
+    auto normalized = normalized_package_path(raw_path);
+    if (normalized.is_empty() || !package.files.contains(normalized.view()))
+        return MUST(String::formatted("Could not load file '{}' for content script", raw_path));
+    return normalized;
+}
+
+static ErrorOr<Vector<String>, String> validate_script_file_paths(ExtensionPackage const& package, ReadonlySpan<String> raw_paths)
+{
+    Vector<String> paths;
+    for (auto const& raw_path : raw_paths)
+        paths.append(MUST(String::from_byte_string(TRY(validate_script_file_path(package, raw_path)))));
+    return paths;
+}
+
+static ErrorOr<JsonObject, String> resolve_content_script_for_web_content(ExtensionPackage const& package, JsonObject const& messages, auto const& script)
+{
+    JsonArray js_scripts;
+    for (auto const& path : script.js) {
+        auto source = text_file(package, path);
+        if (source.is_error())
+            return MUST(String::formatted("Could not load file '{}' for content script", path));
+        JsonObject js_entry;
+        js_entry.set("path"sv, path);
+        js_entry.set("source"sv, source.release_value());
+        js_scripts.must_append(move(js_entry));
+    }
+
+    StringBuilder css;
+    for (auto const& path : script.css) {
+        auto source = text_file(package, path);
+        if (source.is_error())
+            return MUST(String::formatted("Could not load file '{}' for content script", path));
+        if (!css.is_empty())
+            css.append('\n');
+        css.append(localize(source.release_value(), messages, package.id));
+    }
+
+    JsonObject result;
+    result.set("matches"sv, json_string_array(script.matches));
+    result.set("exclude_matches"sv, json_string_array(script.exclude_matches));
+    result.set("include_globs"sv, JsonArray {});
+    result.set("exclude_globs"sv, JsonArray {});
+    result.set("all_frames"sv, script.all_frames);
+    result.set("match_about_blank"sv, false);
+    result.set("match_origin_as_fallback"sv, script.match_origin_as_fallback);
+    result.set("run_at"sv, script.run_at);
+    result.set("main_world"sv, script.world == "MAIN"sv);
+    result.set("dynamic"sv, true);
+    result.set("js"sv, move(js_scripts));
+    result.set("css"sv, MUST(css.to_string()));
+    return result;
+}
+
+static JsonObject serialize_registered_content_script(auto const& script)
+{
+    JsonObject object;
+    object.set("id"sv, script.id);
+    object.set("matches"sv, json_string_array(script.matches));
+    if (!script.exclude_matches.is_empty())
+        object.set("excludeMatches"sv, json_string_array(script.exclude_matches));
+    if (!script.js.is_empty())
+        object.set("js"sv, json_string_array(script.js));
+    if (!script.css.is_empty())
+        object.set("css"sv, json_string_array(script.css));
+    object.set("allFrames"sv, script.all_frames);
+    object.set("matchOriginAsFallback"sv, script.match_origin_as_fallback);
+    object.set("persistAcrossSessions"sv, script.persist_across_sessions);
+    object.set("runAt"sv, script.run_at);
+    object.set("world"sv, script.world);
+    return object;
+}
+
+template<typename Script>
+static ErrorOr<Script, String> parse_registered_content_script(JsonObject const& object, ExtensionPackage const& package, Optional<Script const&> existing)
+{
+    auto id = TRY(optional_string_field(object, "id"sv));
+    if (!id.has_value())
+        return "Script must have an ID"_string;
+    TRY(validate_script_id(*id));
+
+    Script script = existing.has_value() ? *existing : Script {};
+    script.id = move(*id);
+
+    if (auto matches = TRY(optional_string_array_field(object, "matches"sv)); matches.has_value()) {
+        if (matches->is_empty())
+            return "Script must specify at least one match pattern"_string;
+        TRY(validate_match_patterns(*matches, "matches"sv));
+        script.matches = move(*matches);
+    } else if (!existing.has_value()) {
+        return "Script must specify 'matches'"_string;
+    }
+
+    if (auto exclude_matches = TRY(optional_string_array_field(object, "excludeMatches"sv)); exclude_matches.has_value()) {
+        TRY(validate_match_patterns(*exclude_matches, "excludeMatches"sv));
+        script.exclude_matches = move(*exclude_matches);
+    }
+
+    if (auto js = TRY(optional_string_array_field(object, "js"sv)); js.has_value())
+        script.js = TRY(validate_script_file_paths(package, *js));
+    if (auto css = TRY(optional_string_array_field(object, "css"sv)); css.has_value())
+        script.css = TRY(validate_script_file_paths(package, *css));
+
+    if (auto all_frames = TRY(optional_bool_field(object, "allFrames"sv)); all_frames.has_value())
+        script.all_frames = *all_frames;
+    if (auto match_origin_as_fallback = TRY(optional_bool_field(object, "matchOriginAsFallback"sv)); match_origin_as_fallback.has_value())
+        script.match_origin_as_fallback = *match_origin_as_fallback;
+    if (auto persist_across_sessions = TRY(optional_bool_field(object, "persistAcrossSessions"sv)); persist_across_sessions.has_value())
+        script.persist_across_sessions = *persist_across_sessions;
+
+    if (auto run_at = TRY(optional_string_field(object, "runAt"sv)); run_at.has_value()) {
+        if (!run_at->bytes_as_string_view().is_one_of("document_start"sv, "document_end"sv, "document_idle"sv))
+            return MUST(String::formatted("Invalid runAt value '{}'", *run_at));
+        script.run_at = move(*run_at);
+    }
+
+    if (auto world = TRY(optional_string_field(object, "world"sv)); world.has_value()) {
+        if (!world->bytes_as_string_view().is_one_of("ISOLATED"sv, "MAIN"sv))
+            return MUST(String::formatted("Invalid world value '{}'", *world));
+        script.world = move(*world);
+    }
+
+    if (script.js.is_empty() && script.css.is_empty())
+        return "At least a js or css file must be specified"_string;
+
+    if (script.match_origin_as_fallback) {
+        for (auto const& pattern : script.matches) {
+            if (!match_pattern_has_wildcard_path(pattern))
+                return "matchOriginAsFallback can only be specified with paths of '/*'"_string;
+        }
+    }
+
+    return script;
+}
+
+template<typename Script>
+static ErrorOr<Core::AnonymousBuffer, String> serialize_extensions_buffer(
+    Vector<InstalledExtension> const& extensions,
+    HashMap<String, JsonObject> const& base_extension_data,
+    HashMap<String, ExtensionPackage> const& packages,
+    HashMap<String, JsonObject> const& messages,
+    HashMap<String, Vector<Script>> const& registered_content_scripts)
+{
+    JsonArray extension_data;
+    for (auto const& extension : extensions) {
+        auto base_data = base_extension_data.get(extension.id);
+        if (!base_data.has_value())
+            continue;
+        JsonObject data = *base_data;
+        if (auto registered = registered_content_scripts.get(extension.id); registered.has_value() && !registered->is_empty()) {
+            auto package = packages.get(extension.id);
+            auto ext_messages = messages.get(extension.id);
+            if (package.has_value() && ext_messages.has_value()) {
+                JsonArray content_scripts = data.get_array("content_scripts"sv).value_or({});
+                for (auto const& script : *registered)
+                    content_scripts.must_append(TRY(resolve_content_script_for_web_content(*package, *ext_messages, script)));
+                data.set("content_scripts"sv, move(content_scripts));
+            }
+        }
+        extension_data.must_append(move(data));
+    }
+
+    JsonObject root;
+    root.set("extensions"sv, move(extension_data));
+    auto serialized = root.serialized();
+
+    auto buffer = Core::AnonymousBuffer::create_with_size(serialized.bytes().size());
+    if (buffer.is_error())
+        return MUST(String::formatted("Unable to allocate extension buffer: {}", buffer.error()));
+    if (!serialized.bytes().is_empty())
+        serialized.bytes().copy_to(Bytes { buffer.value().data<u8>(), buffer.value().size() });
+    return buffer.release_value();
+}
+
+static JsonObject persisted_entry_for(String const& version, auto const& scripts)
+{
+    JsonArray persisted_scripts;
+    for (auto const& script : scripts) {
+        if (script.persist_across_sessions)
+            persisted_scripts.must_append(serialize_registered_content_script(script));
+    }
+    JsonObject entry;
+    entry.set("version"sv, version);
+    entry.set("scripts"sv, move(persisted_scripts));
+    return entry;
 }
 
 ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
@@ -342,7 +625,10 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
     HashMap<String, ExtensionPackage> packages;
     HashMap<String, JsonObject> manifests;
     HashMap<String, JsonObject> messages;
-    JsonArray extension_data;
+    HashMap<String, JsonObject> base_extension_data;
+    HashMap<String, Vector<RegisteredContentScript>> registered_content_scripts;
+    JsonObject next_persisted = m_persisted_content_scripts;
+    bool persisted_dirty = false;
     HashTable<String> ids;
 
     for (auto const& path : paths) {
@@ -372,30 +658,99 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
         warn_about_unsupported_features(extension, manifest);
         dbgln("Loaded the extension '{}' {} ({})", extension.name, extension.version, extension.id);
 
+        Vector<RegisteredContentScript> scripts;
+        HashTable<String> script_ids;
+        auto has_scripting = manifest_has_scripting_permission(manifest);
+        auto stored = next_persisted.get_object(extension.id);
+        if (!has_scripting) {
+            if (stored.has_value()) {
+                next_persisted.remove(extension.id);
+                persisted_dirty = true;
+            }
+        } else {
+            if (stored.has_value()) {
+                auto stored_version = stored->get_string("version"sv);
+                if (!stored_version.has_value() || *stored_version != extension.version) {
+                    next_persisted.remove(extension.id);
+                    persisted_dirty = true;
+                } else if (auto stored_scripts = stored->get_array("scripts"sv); stored_scripts.has_value()) {
+                    bool entry_changed = false;
+                    for (auto const& value : stored_scripts->values()) {
+                        if (!value.is_object()) {
+                            entry_changed = true;
+                            continue;
+                        }
+                        auto parsed = parse_registered_content_script<RegisteredContentScript>(value.as_object(), *package, {});
+                        if (parsed.is_error() || !parsed.value().persist_across_sessions || script_ids.set(parsed.value().id) != HashSetResult::InsertedNewEntry) {
+                            entry_changed = true;
+                            continue;
+                        }
+                        scripts.append(parsed.release_value());
+                    }
+                    if (entry_changed) {
+                        if (scripts.is_empty())
+                            next_persisted.remove(extension.id);
+                        else
+                            next_persisted.set(extension.id, persisted_entry_for(extension.version, scripts));
+                        persisted_dirty = true;
+                    }
+                } else {
+                    next_persisted.remove(extension.id);
+                    persisted_dirty = true;
+                }
+            }
+
+            // Session-only dynamic content scripts persist while the browser runs, unless the extension version changed.
+            auto previous_version = extension_version(extension.id);
+            if (previous_version.has_value() && *previous_version == extension.version) {
+                if (auto existing_scripts = m_registered_content_scripts.get(extension.id); existing_scripts.has_value()) {
+                    for (auto const& existing_script : *existing_scripts) {
+                        if (existing_script.persist_across_sessions)
+                            continue;
+                        if (script_ids.contains(existing_script.id))
+                            continue;
+                        auto revalidated = parse_registered_content_script<RegisteredContentScript>(serialize_registered_content_script(existing_script), *package, {});
+                        if (revalidated.is_error())
+                            continue;
+                        script_ids.set(revalidated.value().id);
+                        scripts.append(revalidated.release_value());
+                    }
+                }
+            }
+        }
+
+        if (!scripts.is_empty())
+            registered_content_scripts.set(extension.id, move(scripts));
+
         packages.set(extension.id, package.release_value());
         manifests.set(extension.id, manifest);
         messages.set(extension.id, *data.value().get_object("messages"sv));
+        base_extension_data.set(extension.id, data.release_value());
         extensions.append(move(extension));
-        extension_data.must_append(data.release_value());
     }
 
-    JsonObject root;
-    root.set("extensions"sv, move(extension_data));
-    auto serialized = root.serialized();
+    auto buffer = serialize_extensions_buffer(extensions, base_extension_data, packages, messages, registered_content_scripts);
+    if (buffer.is_error())
+        return Error::from_string_literal("Unable to serialize extension data");
 
-    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(serialized.bytes().size()));
-    serialized.bytes().copy_to(Bytes { buffer.data<u8>(), buffer.size() });
+    if (persisted_dirty) {
+        if (auto saved = save_content_scripts(next_persisted); saved.is_error())
+            warnln("Unable to save registered content scripts to {}: {}", m_content_scripts_path, saved.error());
+    }
 
     m_extensions = move(extensions);
     m_packages = move(packages);
     m_manifests = move(manifests);
     m_messages = move(messages);
+    m_base_extension_data = move(base_extension_data);
+    m_registered_content_scripts = move(registered_content_scripts);
+    m_persisted_content_scripts = move(next_persisted);
 
     Vector<String> extension_ids;
     for (auto const& extension : m_extensions)
         extension_ids.append(extension.id);
     m_network_rules.set_extensions(extension_ids, [this](StringView id) -> JsonObject const& { return *m_manifests.get(id); });
-    m_extensions_buffer = move(buffer);
+    m_extensions_buffer = buffer.release_value();
     return {};
 }
 
@@ -425,6 +780,12 @@ ErrorOr<InstalledExtension> ExtensionManager::install(StringView path, ReadonlyS
 
     TRY(load(preferred_languages));
     m_network_rules.mark_installed(package.id);
+
+    // Reinstalling or updating an extension clears its previously registered dynamic content scripts.
+    if (m_registered_content_scripts.contains(package.id) || m_persisted_content_scripts.has(package.id)) {
+        if (auto cleared = commit_content_scripts(package.id, {}); cleared.is_error())
+            warnln("Unable to clear registered content scripts for {}: {}", package.id, cleared.error());
+    }
 
     for (auto const& extension : m_extensions) {
         if (extension.id == package.id)
@@ -654,6 +1015,228 @@ void ExtensionManager::apply_storage_changes(StringView extension_id, StringView
     m_storage.set(extension_id, move(extension_storage));
     if (area != "session"sv)
         schedule_storage_save();
+}
+
+Optional<String> ExtensionManager::extension_version(StringView extension_id) const
+{
+    for (auto const& extension : m_extensions) {
+        if (extension.id == extension_id)
+            return extension.version;
+    }
+    return {};
+}
+
+bool ExtensionManager::extension_has_scripting_permission(StringView extension_id) const
+{
+    auto manifest = m_manifests.get(extension_id);
+    return manifest.has_value() && manifest_has_scripting_permission(*manifest);
+}
+
+void ExtensionManager::load_content_scripts()
+{
+    auto file = Core::File::open(m_content_scripts_path, Core::File::OpenMode::Read);
+    if (file.is_error())
+        return;
+
+    auto bytes = file.value()->read_until_eof();
+    if (bytes.is_error())
+        return;
+
+    if (auto stored = parse_json_object(bytes.value()); !stored.is_error())
+        m_persisted_content_scripts = stored.release_value();
+    else
+        warnln("Unable to read registered content scripts from {}: {}", m_content_scripts_path, stored.error());
+}
+
+ErrorOr<void, String> ExtensionManager::save_content_scripts(JsonObject const& persisted) const
+{
+    auto result = [&]() -> ErrorOr<void> {
+        TRY(Core::Directory::create(LexicalPath { m_content_scripts_path }.parent(), Core::Directory::CreateDirectories::Yes));
+        auto temp_path = ByteString::formatted("{}.tmp", m_content_scripts_path);
+        auto write_result = [&]() -> ErrorOr<void> {
+            auto file = TRY(Core::File::open(temp_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+            auto serialized = persisted.serialized();
+            TRY(file->write_until_depleted(serialized.bytes()));
+            return {};
+        }();
+        if (write_result.is_error()) {
+            (void)FileSystem::remove(temp_path, FileSystem::RecursionMode::Disallowed);
+            return write_result.release_error();
+        }
+        auto rename_result = FileSystem::move_file(m_content_scripts_path, temp_path);
+        if (rename_result.is_error()) {
+            (void)FileSystem::remove(temp_path, FileSystem::RecursionMode::Disallowed);
+            return rename_result.release_error();
+        }
+        return {};
+    }();
+    if (result.is_error())
+        return MUST(String::formatted("Unable to save registered content scripts: {}", result.error()));
+    return {};
+}
+
+ErrorOr<Core::AnonymousBuffer, String> ExtensionManager::build_extensions_buffer(HashMap<String, Vector<RegisteredContentScript>> const& registered_content_scripts) const
+{
+    return serialize_extensions_buffer(m_extensions, m_base_extension_data, m_packages, m_messages, registered_content_scripts);
+}
+
+ErrorOr<void, String> ExtensionManager::commit_content_scripts(StringView extension_id, Vector<RegisteredContentScript> next_scripts)
+{
+    auto version = extension_version(extension_id);
+    if (!version.has_value())
+        return "The extension is not available"_string;
+
+    auto id_string = MUST(String::from_utf8(extension_id));
+
+    HashMap<String, Vector<RegisteredContentScript>> next_registered = m_registered_content_scripts;
+    if (next_scripts.is_empty())
+        next_registered.remove(id_string);
+    else
+        next_registered.set(id_string, move(next_scripts));
+
+    auto next_buffer = TRY(build_extensions_buffer(next_registered));
+
+    JsonObject next_persisted = m_persisted_content_scripts;
+    auto const* scripts_for_extension = next_registered.get(id_string).ptr();
+    bool has_persisted = scripts_for_extension && any_of(*scripts_for_extension, [](auto const& script) { return script.persist_across_sessions; });
+    if (has_persisted)
+        next_persisted.set(id_string, persisted_entry_for(*version, *scripts_for_extension));
+    else
+        next_persisted.remove(id_string);
+
+    if (next_persisted.serialized() != m_persisted_content_scripts.serialized())
+        TRY(save_content_scripts(next_persisted));
+
+    m_registered_content_scripts = move(next_registered);
+    m_persisted_content_scripts = move(next_persisted);
+    m_extensions_buffer = move(next_buffer);
+    return {};
+}
+
+ErrorOr<void, String> ExtensionManager::register_content_scripts(StringView extension_id, JsonArray const& scripts)
+{
+    if (!extension_has_scripting_permission(extension_id))
+        return "Extension does not have scripting permission"_string;
+    auto package = m_packages.get(extension_id);
+    if (!package.has_value())
+        return "The extension is not available"_string;
+
+    Vector<RegisteredContentScript> next_scripts;
+    HashTable<String> seen_ids;
+    if (auto existing = m_registered_content_scripts.get(extension_id); existing.has_value()) {
+        for (auto const& script : *existing) {
+            seen_ids.set(script.id);
+            next_scripts.append(script);
+        }
+    }
+
+    for (auto const& value : scripts.values()) {
+        if (!value.is_object())
+            return "Content scripts must be objects"_string;
+        auto parsed = TRY(parse_registered_content_script<RegisteredContentScript>(value.as_object(), *package, {}));
+        if (seen_ids.set(parsed.id) != HashSetResult::InsertedNewEntry)
+            return MUST(String::formatted("Duplicate script ID '{}'", parsed.id));
+        next_scripts.append(move(parsed));
+    }
+
+    return commit_content_scripts(extension_id, move(next_scripts));
+}
+
+ErrorOr<void, String> ExtensionManager::update_content_scripts(StringView extension_id, JsonArray const& scripts)
+{
+    if (!extension_has_scripting_permission(extension_id))
+        return "Extension does not have scripting permission"_string;
+    auto package = m_packages.get(extension_id);
+    if (!package.has_value())
+        return "The extension is not available"_string;
+
+    Vector<RegisteredContentScript> next_scripts;
+    if (auto existing = m_registered_content_scripts.get(extension_id); existing.has_value())
+        next_scripts = *existing;
+
+    HashTable<String> updated_ids;
+    for (auto const& value : scripts.values()) {
+        if (!value.is_object())
+            return "Content scripts must be objects"_string;
+        auto id = TRY(optional_string_field(value.as_object(), "id"sv));
+        if (!id.has_value())
+            return "Script must have an ID"_string;
+        TRY(validate_script_id(*id));
+        if (updated_ids.set(*id) != HashSetResult::InsertedNewEntry)
+            return MUST(String::formatted("Duplicate script ID '{}'", *id));
+
+        auto index = next_scripts.find_first_index_if([&](auto const& script) { return script.id == *id; });
+        if (!index.has_value())
+            return MUST(String::formatted("Nonexistent script ID '{}'", *id));
+
+        next_scripts[*index] = TRY(parse_registered_content_script<RegisteredContentScript>(value.as_object(), *package, next_scripts[*index]));
+    }
+
+    return commit_content_scripts(extension_id, move(next_scripts));
+}
+
+ErrorOr<JsonArray, String> ExtensionManager::registered_content_scripts(StringView extension_id, Optional<JsonObject const&> filter) const
+{
+    if (!extension_has_scripting_permission(extension_id))
+        return "Extension does not have scripting permission"_string;
+
+    Optional<HashTable<String>> filter_ids;
+    if (filter.has_value()) {
+        if (auto ids = TRY(optional_string_array_field(*filter, "ids"sv)); ids.has_value()) {
+            filter_ids = HashTable<String> {};
+            for (auto const& id : *ids)
+                filter_ids->set(id);
+        }
+    }
+
+    JsonArray result;
+    if (auto existing = m_registered_content_scripts.get(extension_id); existing.has_value()) {
+        for (auto const& script : *existing) {
+            if (filter_ids.has_value() && !filter_ids->contains(script.id))
+                continue;
+            result.must_append(serialize_registered_content_script(script));
+        }
+    }
+    return result;
+}
+
+ErrorOr<void, String> ExtensionManager::unregister_content_scripts(StringView extension_id, Optional<JsonObject const&> filter)
+{
+    if (!extension_has_scripting_permission(extension_id))
+        return "Extension does not have scripting permission"_string;
+    if (!m_packages.contains(extension_id))
+        return "The extension is not available"_string;
+
+    Optional<Vector<String>> filter_ids;
+    if (filter.has_value())
+        filter_ids = TRY(optional_string_array_field(*filter, "ids"sv));
+
+    if (!filter_ids.has_value())
+        return commit_content_scripts(extension_id, {});
+
+    Vector<RegisteredContentScript> existing_scripts;
+    if (auto existing = m_registered_content_scripts.get(extension_id); existing.has_value())
+        existing_scripts = *existing;
+
+    HashTable<String> existing_ids;
+    for (auto const& script : existing_scripts)
+        existing_ids.set(script.id);
+
+    HashTable<String> to_remove;
+    for (auto const& id : *filter_ids) {
+        TRY(validate_script_id(id));
+        if (!existing_ids.contains(id))
+            return MUST(String::formatted("Nonexistent script ID '{}'", id));
+        to_remove.set(id);
+    }
+
+    Vector<RegisteredContentScript> next_scripts;
+    for (auto& script : existing_scripts) {
+        if (!to_remove.contains(script.id))
+            next_scripts.append(move(script));
+    }
+
+    return commit_content_scripts(extension_id, move(next_scripts));
 }
 
 }

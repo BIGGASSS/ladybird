@@ -1874,6 +1874,8 @@ public:
     // How many of the stages of content scripts, by Extensions::RunAt, have run in this document.
     u8 extension_content_script_stage() const { return m_extension_content_script_stage; }
     void set_extension_content_script_stage(u8 stage) { m_extension_content_script_stage = stage; }
+    Utf16String const& dynamic_extension_style_sheet() const;
+    void snapshot_dynamic_extension_style_sheet();
     GC::Ptr<Extensions::ExtensionContext> extension_context(StringView extension_id) const;
     void add_extension_context(GC::Ref<Extensions::ExtensionContext>);
     bool has_extension_contexts() const { return !m_extension_contexts.is_empty(); }
@@ -2548,6 +2550,7 @@ private:
     HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_ids;
 
     u8 m_extension_content_script_stage { 0 };
+    Optional<Utf16String> m_dynamic_extension_style_sheet;
     Vector<GC::Ref<Extensions::ExtensionContext>> m_extension_contexts;
     GC::Ptr<Platform::Timer> m_extension_idle_timer;
 

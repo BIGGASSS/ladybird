@@ -1193,6 +1193,7 @@ void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_
 
     // 5. Set navigable's parent to parent.
     set_parent(parent);
+    document->snapshot_dynamic_extension_style_sheet();
 
     // 6. Set the initial visibility state of documentState's document to navigable's traversable navigable's system visibility state.
     document->set_initial_visibility_state(system_visibility_state);

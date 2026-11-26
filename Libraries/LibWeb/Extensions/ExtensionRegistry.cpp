@@ -20,8 +20,10 @@
 #include <LibWeb/Extensions/ExtensionContext.h>
 #include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
@@ -42,7 +44,7 @@ ExtensionRegistry& ExtensionRegistry::the()
 
 Extension const* ExtensionRegistry::extension(StringView id) const
 {
-    for (auto const& extension : m_extensions) {
+    for (auto const& extension : m_extensions->extensions) {
         if (extension.id == id)
             return &extension;
     }
@@ -133,6 +135,7 @@ ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
             extension.manifest_json = object.get_object("manifest"sv).map([](auto const& manifest) { return manifest.serialized(); }).value_or("{}"_string);
             extension.messages_json = object.get_object("messages"sv).map([](auto const& messages) { return messages.serialized(); }).value_or("{}"_string);
             extension.ui_language = object.get_string("ui_language"sv).value_or("en-US"_string);
+            extension.host_permissions = string_array(object, "host_permissions"sv);
             // https://developer.chrome.com/docs/extensions/reference/manifest/sandbox
             auto const& manifest = *object.get_object("manifest"sv);
             if (auto sandbox = manifest.get_object("sandbox"sv); sandbox.has_value()) {
@@ -166,7 +169,9 @@ ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
                     content_script.exclude_globs = string_array(content_script_object, "exclude_globs"sv);
                     content_script.all_frames = content_script_object.get_bool("all_frames"sv).value_or(false);
                     content_script.match_about_blank = content_script_object.get_bool("match_about_blank"sv).value_or(false);
+                    content_script.match_origin_as_fallback = content_script_object.get_bool("match_origin_as_fallback"sv).value_or(false);
                     content_script.main_world = content_script_object.get_bool("main_world"sv).value_or(false);
+                    content_script.is_dynamic = content_script_object.get_bool("dynamic"sv).value_or(false);
                     content_script.run_at = run_at_from_string(content_script_object.get_string("run_at"sv).value_or({}));
 
                     if (auto scripts = content_script_object.get_array("js"sv); scripts.has_value()) {
@@ -206,7 +211,9 @@ ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
         }));
     }
 
-    m_extensions = move(extensions);
+    auto list = adopt_ref(*new ExtensionList);
+    list->extensions = move(extensions);
+    m_extensions = move(list);
     m_has_network_rules = has_network_rules;
     return {};
 }
@@ -388,25 +395,48 @@ void ExtensionRegistry::did_load_resource(u64 request_id, Optional<ReadonlyBytes
         (*callback)->function()(data, mime_type);
 }
 
+static Optional<URL::URL> origin_to_match_url(URL::Origin const& origin)
+{
+    if (origin.is_opaque())
+        return {};
+    return URL::Parser::basic_parse(ByteString::formatted("{}/", origin.serialize()));
+}
+
 static Optional<URL::URL> url_for_matching(ContentScript const& content_script, DOM::Document const& document)
 {
     auto const& url = document.url();
     if (!url.scheme().is_one_of("about"sv, "blob"sv, "data"sv))
         return url;
 
-    // Frames such as about:blank, whose URL says nothing of where they came from, match by their origin, if the content
-    // script asks for that. Without it, a data: URL matches as itself.
-    if (!content_script.match_about_blank && url.scheme() == "data"sv)
-        return url;
-    if (!content_script.match_about_blank)
+    // Without match_about_blank or match_origin_as_fallback, a static script matches a data: URL as itself, while
+    // about:, blob:, and dynamic scripts on data: do not match.
+    if (!content_script.match_about_blank && !content_script.match_origin_as_fallback) {
+        if (!content_script.is_dynamic && url.scheme() == "data"sv)
+            return url;
         return {};
-    auto const& origin = document.origin();
-    if (origin.is_opaque())
+    }
+
+    // match_about_blank (without match_origin_as_fallback) matches only a document with a non-opaque origin.
+    if (auto matched = origin_to_match_url(document.origin()); matched.has_value())
+        return matched;
+
+    if (!content_script.match_origin_as_fallback)
         return {};
-    return URL::Parser::basic_parse(ByteString::formatted("{}/", origin.serialize()));
+
+    // Opaque local frames with matchOriginAsFallback use the active session history entry's recorded initiator origin,
+    // and skip injection when it is opaque or absent.
+    if (auto navigable = document.navigable(); navigable && navigable->active_document().ptr() == &document) {
+        if (auto entry = navigable->active_session_history_entry()) {
+            if (auto initiator = entry->document_state()->initiator_origin(); initiator.has_value()) {
+                if (auto matched = origin_to_match_url(*initiator); matched.has_value())
+                    return matched;
+            }
+        }
+    }
+    return {};
 }
 
-bool ExtensionRegistry::content_script_matches(ContentScript const& content_script, DOM::Document const& document) const
+bool ExtensionRegistry::content_script_matches(Extension const& extension, ContentScript const& content_script, DOM::Document const& document) const
 {
     if (!content_script.all_frames) {
         auto navigable = document.navigable();
@@ -416,6 +446,9 @@ bool ExtensionRegistry::content_script_matches(ContentScript const& content_scri
 
     auto url = url_for_matching(content_script, document);
     if (!url.has_value())
+        return false;
+
+    if (content_script.is_dynamic && !any_of(extension.host_permissions, [&](auto const& pattern) { return host_permission_matches(pattern, *url); }))
         return false;
 
     if (!any_of(content_script.matches, [&](auto const& pattern) { return match_pattern_matches(pattern, *url); }))
@@ -432,15 +465,17 @@ bool ExtensionRegistry::content_script_matches(ContentScript const& content_scri
     return true;
 }
 
-Utf16String ExtensionRegistry::style_sheet_for_document(DOM::Document const& document) const
+Utf16String ExtensionRegistry::style_sheet_for_document(DOM::Document const& document, ContentScriptKind kind) const
 {
-    if (m_extensions.is_empty() || document.is_decoded_svg() || !document.browsing_context())
+    auto snapshot = m_extensions;
+    if (snapshot->extensions.is_empty() || document.is_decoded_svg() || !document.browsing_context())
         return {};
 
+    bool want_dynamic = kind == ContentScriptKind::Dynamic;
     Utf16StringBuilder builder;
-    for (auto const& extension : m_extensions) {
+    for (auto const& extension : snapshot->extensions) {
         for (auto const& content_script : extension.content_scripts) {
-            if (content_script.css.is_empty() || !content_script_matches(content_script, document))
+            if (content_script.is_dynamic != want_dynamic || content_script.css.is_empty() || !content_script_matches(extension, content_script, document))
                 continue;
             if (!builder.is_empty())
                 builder.append_ascii('\n');
@@ -692,7 +727,16 @@ ExtensionRegistry::MessageDeliveryResult ExtensionRegistry::deliver_message(u64 
 
 void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_at)
 {
-    if (m_extensions.is_empty())
+    if (document.is_decoded_svg() || !document.browsing_context())
+        return;
+
+    // Snapshot matching registered CSS once the document has an active navigable so later register/unregister updates
+    // do not retroactively alter styles on already-loaded documents.
+    if (document.extension_content_script_stage() == 0 && document.navigable())
+        document.snapshot_dynamic_extension_style_sheet();
+
+    auto snapshot = m_extensions;
+    if (snapshot->extensions.is_empty())
         return;
 
     auto target_stage = to_underlying(run_at) + 1;
@@ -700,7 +744,7 @@ void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_a
         return;
 
     auto window = document.window();
-    if (document.is_decoded_svg() || !window || &window->associated_document() != &document || !document.browsing_context() || !document.is_fully_active() || document.is_scripting_disabled())
+    if (!window || &window->associated_document() != &document || !document.is_fully_active() || document.is_scripting_disabled())
         return;
 
     while (document.extension_content_script_stage() < target_stage) {
@@ -711,7 +755,14 @@ void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_a
         // The pages of an extension get its API before any of their own scripts run.
         if (stage == RunAt::DocumentStart && document.url().scheme() == "chrome-extension"sv) {
             // NB: A sandboxed page of the extension has an opaque origin, and no API, as in Chrome.
-            auto const* extension = this->extension(document.url().serialized_host());
+            auto extension_id = document.url().serialized_host();
+            Extension const* extension = nullptr;
+            for (auto const& candidate : snapshot->extensions) {
+                if (candidate.id == extension_id) {
+                    extension = &candidate;
+                    break;
+                }
+            }
             if (extension && !document.extension_context(extension->id) && document.origin().is_same_origin(document.url().origin())) {
                 auto context = ExtensionContext::create_for_extension_page(document, extension->id);
                 document.add_extension_context(context);
@@ -719,10 +770,10 @@ void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_a
             }
         }
 
-        for (auto const& extension : m_extensions) {
+        for (auto const& extension : snapshot->extensions) {
             Vector<ContentScript const*> content_scripts;
             for (auto const& content_script : extension.content_scripts) {
-                if (content_script.run_at == stage && !content_script.js.is_empty() && content_script_matches(content_script, document))
+                if (content_script.run_at == stage && !content_script.js.is_empty() && content_script_matches(extension, content_script, document))
                     content_scripts.append(&content_script);
             }
             if (content_scripts.is_empty())

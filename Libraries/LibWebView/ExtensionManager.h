@@ -70,6 +70,13 @@ public:
 
     ExtensionNetworkRules& network_rules() { return m_network_rules; }
 
+    // https://developer.chrome.com/docs/extensions/reference/api/scripting
+    bool extension_has_scripting_permission(StringView extension_id) const;
+    ErrorOr<void, String> register_content_scripts(StringView extension_id, JsonArray const& scripts);
+    ErrorOr<void, String> update_content_scripts(StringView extension_id, JsonArray const& scripts);
+    ErrorOr<JsonArray, String> registered_content_scripts(StringView extension_id, Optional<JsonObject const&> filter) const;
+    ErrorOr<void, String> unregister_content_scripts(StringView extension_id, Optional<JsonObject const&> filter);
+
     // The page that runs the extension's background scripts or service worker, if it has any.
     Optional<URL::URL> background_page_url(StringView extension_id) const;
     String storage_json() const { return m_storage.serialized(); }
@@ -78,16 +85,38 @@ public:
     void apply_storage_changes(StringView extension_id, StringView area, StringView changes_json);
 
 private:
+    struct RegisteredContentScript {
+        String id;
+        Vector<String> matches;
+        Vector<String> exclude_matches;
+        Vector<String> js;
+        Vector<String> css;
+        bool all_frames { false };
+        bool match_origin_as_fallback { false };
+        bool persist_across_sessions { true };
+        String run_at { "document_idle"_string };
+        String world { "ISOLATED"_string };
+    };
+
     void load_storage();
     void schedule_storage_save();
     void save_storage();
+    void load_content_scripts();
+    ErrorOr<void, String> save_content_scripts(JsonObject const&) const;
+    ErrorOr<Core::AnonymousBuffer, String> build_extensions_buffer(HashMap<String, Vector<RegisteredContentScript>> const&) const;
+    ErrorOr<void, String> commit_content_scripts(StringView extension_id, Vector<RegisteredContentScript> next_scripts);
+    Optional<String> extension_version(StringView extension_id) const;
 
     ByteString m_extensions_directory;
     ByteString m_storage_path;
+    ByteString m_content_scripts_path;
     Vector<InstalledExtension> m_extensions;
     HashMap<String, ExtensionPackage> m_packages;
     HashMap<String, JsonObject> m_manifests;
     HashMap<String, JsonObject> m_messages;
+    HashMap<String, JsonObject> m_base_extension_data;
+    HashMap<String, Vector<RegisteredContentScript>> m_registered_content_scripts;
+    JsonObject m_persisted_content_scripts;
     ExtensionNetworkRules m_network_rules;
     Core::AnonymousBuffer m_extensions_buffer;
     JsonObject m_storage;

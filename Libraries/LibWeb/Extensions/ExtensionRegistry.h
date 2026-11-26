@@ -11,7 +11,9 @@
 #include <AK/HashMap.h>
 #include <AK/JsonObject.h>
 #include <AK/Noncopyable.h>
+#include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
+#include <AK/RefCounted.h>
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
@@ -47,8 +49,11 @@ struct ContentScript {
     Vector<String> exclude_globs;
     bool all_frames { false };
     bool match_about_blank { false };
+    bool match_origin_as_fallback { false };
     // Scripts of the "MAIN" world run in the page's own world, and get no extension API, as in Chrome.
     bool main_world { false };
+    // Dynamically registered scripts (via chrome.scripting) only inject into pages covered by host permissions.
+    bool is_dynamic { false };
     RunAt run_at { RunAt::DocumentIdle };
     Vector<ContentScriptSource> js;
     Utf16String css;
@@ -66,6 +71,7 @@ struct Extension {
     String manifest_json;
     String messages_json;
     String ui_language;
+    Vector<String> host_permissions;
     Vector<ContentScript> content_scripts;
     HashMap<String, WebAccessibleResource> resources;
     Vector<String> sandboxed_pages;
@@ -81,8 +87,8 @@ class WEB_API ExtensionRegistry {
 public:
     static ExtensionRegistry& the();
 
-    bool has_extensions() const { return !m_extensions.is_empty(); }
-    Vector<Extension> const& extensions() const { return m_extensions; }
+    bool has_extensions() const { return !m_extensions->extensions.is_empty(); }
+    Vector<Extension> const& extensions() const { return m_extensions->extensions; }
     Extension const* extension(StringView id) const;
 
     ErrorOr<void> set_extensions_from_bytes(ReadonlyBytes);
@@ -112,7 +118,11 @@ public:
     Function<void(u64 request_id, String const& extension_id, String const& path)> on_load_resource;
 
     // The CSS of the content scripts that match the document, which the document adds to its user style sheet.
-    Utf16String style_sheet_for_document(DOM::Document const&) const;
+    enum class ContentScriptKind : u8 {
+        Static,
+        Dynamic,
+    };
+    Utf16String style_sheet_for_document(DOM::Document const&, ContentScriptKind) const;
 
     // Runs the content scripts of every stage up to and including the given one that have not yet run in the document.
     // A page of an extension gets the extension's API first.
@@ -156,14 +166,18 @@ public:
     Function<void(u64 delivery_id, bool responded, String const& response_json)> on_message_response;
 
 private:
+    struct ExtensionList : public RefCounted<ExtensionList> {
+        Vector<Extension> extensions;
+    };
+
     ExtensionRegistry() = default;
 
-    bool content_script_matches(ContentScript const&, DOM::Document const&) const;
+    bool content_script_matches(Extension const&, ContentScript const&, DOM::Document const&) const;
     void for_each_context(Function<void(ExtensionContext&)>) const;
     GC::Ptr<ExtensionContext> context(u64 context_id) const;
     void inject(DOM::Document&, Extension const&, Vector<ContentScript const*> const&);
 
-    Vector<Extension> m_extensions;
+    NonnullRefPtr<ExtensionList> m_extensions { adopt_ref(*new ExtensionList) };
     HashMap<u64, GC::Root<GC::Function<void(Optional<ReadonlyBytes>, StringView)>>> m_pending_resource_loads;
     u64 m_next_resource_request_id { 0 };
     u64 m_next_call_id { 0 };

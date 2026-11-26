@@ -9,6 +9,7 @@
 #include <AK/LexicalPath.h>
 #include <LibCore/Directory.h>
 #include <LibCore/File.h>
+#include <LibCore/System.h>
 #include <LibTest/TemporaryDirectory.h>
 #include <LibTest/TestCase.h>
 #include <LibWebView/ExtensionManager.h>
@@ -285,4 +286,198 @@ TEST_CASE(extension_manager_reads_actions_and_background_pages)
     EXPECT(!manager.resource("unknown"sv, "popup.html"sv).has_value());
 
     EXPECT_EQ(manager.manifest(popup_action.extension_id)->get_string("name"sv), "With Popup"sv);
+}
+
+TEST_CASE(extension_manager_registered_content_scripts)
+{
+    Test::TemporaryDirectory directory { "TestExtensionScripting"sv };
+    auto extensions_directory = directory.path().append("Extensions"sv).string();
+    auto storage_path = directory.path().append("Storage.json"sv).string();
+
+    auto with_scripting = stored_zip({
+        { "manifest.json"sv, R"({
+            "manifest_version": 3,
+            "name": "Cosmetic Blocker",
+            "version": "1.0",
+            "default_locale": "en",
+            "permissions": ["scripting"],
+            "host_permissions": ["https://allowed.test/*"]
+        })"sv },
+        { "_locales/en/messages.json"sv, R"({ "tag": { "message": "hidden" } })"sv },
+        { "cosmetic.css"sv, ".ad { display: none; content: '__MSG_tag__'; }"sv },
+        { "inject.js"sv, "window.__injected = 1;"sv },
+        { "extra.js"sv, "window.__extra = 2;"sv },
+    });
+    auto without_scripting = stored_zip({
+        { "manifest.json"sv, R"({
+            "manifest_version": 3,
+            "name": "No Scripting",
+            "version": "1.0",
+            "host_permissions": ["<all_urls>"]
+        })"sv },
+        { "inject.js"sv, "window.__nope = 1;"sv },
+    });
+
+    MUST(Core::Directory::create(extensions_directory, Core::Directory::CreateDirectories::Yes));
+    auto write = [&](StringView name, ReadonlyBytes bytes) {
+        auto file = MUST(Core::File::open(LexicalPath::join(extensions_directory, name).string(), Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+        MUST(file->write_until_depleted(bytes));
+    };
+    write("a.zip"sv, with_scripting);
+    write("b.zip"sv, without_scripting);
+
+    WebView::ExtensionManager manager { extensions_directory, storage_path };
+    TRY_OR_FAIL(manager.load({}));
+
+    auto scripting_id = manager.extensions()[0].name == "Cosmetic Blocker"sv ? manager.extensions()[0].id : manager.extensions()[1].id;
+    auto no_scripting_id = manager.extensions()[0].name == "Cosmetic Blocker"sv ? manager.extensions()[1].id : manager.extensions()[0].id;
+
+    EXPECT(manager.extension_has_scripting_permission(scripting_id));
+    EXPECT(!manager.extension_has_scripting_permission(no_scripting_id));
+
+    auto parse_array = [](StringView json) -> JsonArray {
+        return MUST(JsonValue::from_string(json)).as_array();
+    };
+    auto parse_object = [](StringView json) -> JsonObject {
+        return MUST(JsonValue::from_string(json)).as_object();
+    };
+
+    // Permission gating.
+    EXPECT(manager.register_content_scripts(no_scripting_id, parse_array(R"([{"id":"s1","matches":["<all_urls>"],"js":["inject.js"]}])"sv)).is_error());
+    EXPECT(manager.registered_content_scripts(no_scripting_id, {}).is_error());
+
+    // Validation errors.
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([{"id":"_reserved","matches":["<all_urls>"],"css":["cosmetic.css"]}])"sv)).is_error());
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([{"id":"no-files","matches":["<all_urls>"]}])"sv)).is_error());
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([{"id":"missing-file","matches":["<all_urls>"],"css":["missing.css"]}])"sv)).is_error());
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([{"id":"bad-pattern","matches":["chrome-extension://*/*"],"css":["cosmetic.css"]}])"sv)).is_error());
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([{"id":"bad-fallback","matches":["https://allowed.test/page"],"css":["cosmetic.css"],"matchOriginAsFallback":true}])"sv)).is_error());
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([{"id":"bad-world","matches":["<all_urls>"],"js":["inject.js"],"world":"OTHER"}])"sv)).is_error());
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([{"id":"dup","matches":["<all_urls>"],"js":["inject.js"]},{"id":"dup","matches":["<all_urls>"],"css":["cosmetic.css"]}])"sv)).is_error());
+
+    // Register one persisted script and one session-only script.
+    auto registered = manager.register_content_scripts(scripting_id, parse_array(R"([
+        {"id":"cosmetic","matches":["<all_urls>"],"css":["/cosmetic.css"],"runAt":"document_start","allFrames":true},
+        {"id":"session-only","matches":["https://allowed.test/*"],"js":["./inject.js"],"world":"MAIN","persistAcrossSessions":false}
+    ])"sv));
+    EXPECT(!registered.is_error());
+
+    // Duplicate ID across calls fails atomically.
+    EXPECT(manager.register_content_scripts(scripting_id, parse_array(R"([
+        {"id":"brand-new","matches":["<all_urls>"],"js":["extra.js"]},
+        {"id":"cosmetic","matches":["<all_urls>"],"js":["inject.js"]}
+    ])"sv)).is_error());
+
+    auto listed = manager.registered_content_scripts(scripting_id, {});
+    EXPECT(!listed.is_error());
+    EXPECT_EQ(listed.value().size(), 2u);
+    EXPECT_EQ(listed.value().at(0).as_object().get_string("id"sv), "cosmetic"sv);
+    EXPECT_EQ(listed.value().at(0).as_object().get_array("css"sv)->at(0).as_string(), "cosmetic.css"sv);
+    EXPECT_EQ(listed.value().at(0).as_object().get_bool("persistAcrossSessions"sv), true);
+    EXPECT_EQ(listed.value().at(1).as_object().get_string("id"sv), "session-only"sv);
+    EXPECT_EQ(listed.value().at(1).as_object().get_string("world"sv), "MAIN"sv);
+    EXPECT_EQ(listed.value().at(1).as_object().get_bool("persistAcrossSessions"sv), false);
+
+    // Filtered listing.
+    auto filtered = manager.registered_content_scripts(scripting_id, parse_object(R"({"ids":["session-only","unknown"]})"sv));
+    EXPECT(!filtered.is_error());
+    EXPECT_EQ(filtered.value().size(), 1u);
+    EXPECT_EQ(filtered.value().at(0).as_object().get_string("id"sv), "session-only"sv);
+
+    auto empty_filtered = manager.registered_content_scripts(scripting_id, parse_object(R"({"ids":[]})"sv));
+    EXPECT(!empty_filtered.is_error());
+    EXPECT_EQ(empty_filtered.value().size(), 0u);
+
+    // Verify extensions_buffer includes host_permissions, localized dynamic CSS, and dynamic flag.
+    auto buffer_json = MUST(JsonValue::from_string(StringView { manager.extensions_buffer().bytes() })).as_object();
+    auto const& ext_array = *buffer_json.get_array("extensions"sv);
+    bool checked_buffer = false;
+    for (auto const& ext_value : ext_array.values()) {
+        auto const& ext_obj = ext_value.as_object();
+        if (ext_obj.get_string("id"sv) != scripting_id)
+            continue;
+        checked_buffer = true;
+        EXPECT_EQ(ext_obj.get_array("host_permissions"sv)->size(), 1u);
+        EXPECT_EQ(ext_obj.get_array("host_permissions"sv)->at(0).as_string(), "https://allowed.test/*"sv);
+        auto const& scripts = *ext_obj.get_array("content_scripts"sv);
+        EXPECT_EQ(scripts.size(), 2u);
+        EXPECT_EQ(scripts.at(0).as_object().get_bool("dynamic"sv), true);
+        EXPECT_EQ(scripts.at(0).as_object().get_string("css"sv), ".ad { display: none; content: 'hidden'; }"sv);
+        EXPECT_EQ(scripts.at(1).as_object().get_bool("main_world"sv), true);
+    }
+    EXPECT(checked_buffer);
+
+    // Update existing script preserves unspecified fields and rejects unknown IDs.
+    EXPECT(manager.update_content_scripts(scripting_id, parse_array(R"([{"id":"nope","js":["extra.js"]}])"sv)).is_error());
+    EXPECT(!manager.update_content_scripts(scripting_id, parse_array(R"([{"id":"cosmetic","js":["extra.js"],"excludeMatches":["https://allowed.test/skip*"]}])"sv)).is_error());
+    auto after_update = manager.registered_content_scripts(scripting_id, parse_object(R"({"ids":["cosmetic"]})"sv)).release_value();
+    EXPECT_EQ(after_update.at(0).as_object().get_array("css"sv)->at(0).as_string(), "cosmetic.css"sv);
+    EXPECT_EQ(after_update.at(0).as_object().get_array("js"sv)->at(0).as_string(), "extra.js"sv);
+    EXPECT_EQ(after_update.at(0).as_object().get_array("excludeMatches"sv)->at(0).as_string(), "https://allowed.test/skip*"sv);
+
+    // Reload in a fresh ExtensionManager: persisted script survives, session-only script does not.
+    {
+        WebView::ExtensionManager reloaded { extensions_directory, storage_path };
+        TRY_OR_FAIL(reloaded.load({}));
+        auto persisted = reloaded.registered_content_scripts(scripting_id, {}).release_value();
+        EXPECT_EQ(persisted.size(), 1u);
+        EXPECT_EQ(persisted.at(0).as_object().get_string("id"sv), "cosmetic"sv);
+    }
+
+    // Unregister rejects nonexistent IDs, treats empty ids array as no-op, and clears all when filter omitted.
+    EXPECT(manager.unregister_content_scripts(scripting_id, parse_object(R"({"ids":["nonexistent"]})"sv)).is_error());
+    EXPECT(!manager.unregister_content_scripts(scripting_id, parse_object(R"({"ids":[]})"sv)).is_error());
+    EXPECT_EQ(manager.registered_content_scripts(scripting_id, {}).release_value().size(), 2u);
+
+    EXPECT(!manager.unregister_content_scripts(scripting_id, parse_object(R"({"ids":["session-only"]})"sv)).is_error());
+    EXPECT_EQ(manager.registered_content_scripts(scripting_id, {}).release_value().size(), 1u);
+
+    EXPECT(!manager.unregister_content_scripts(scripting_id, {}).is_error());
+    EXPECT_EQ(manager.registered_content_scripts(scripting_id, {}).release_value().size(), 0u);
+
+    // Version upgrade clears persisted dynamic scripts (and persists the reset).
+    auto upgraded = stored_zip({
+        { "manifest.json"sv, R"({
+            "manifest_version": 3,
+            "name": "Cosmetic Blocker",
+            "version": "2.0",
+            "permissions": ["scripting"],
+            "host_permissions": ["https://allowed.test/*"]
+        })"sv },
+        { "cosmetic.css"sv, ".ad { display: none; }"sv },
+    });
+    // Use CRX3 with fixed ID so the extension ID stays identical across version upgrades.
+    Array<u8, 16> fixed_id { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    auto v1_crx = crx3(fixed_id, with_scripting);
+    auto v2_crx = crx3(fixed_id, upgraded);
+    Test::TemporaryDirectory upgrade_dir { "TestExtensionScriptingUpgrade"sv };
+    auto up_ext_dir = upgrade_dir.path().append("Extensions"sv).string();
+    auto up_storage = upgrade_dir.path().append("Storage.json"sv).string();
+    MUST(Core::Directory::create(up_ext_dir, Core::Directory::CreateDirectories::Yes));
+    auto write_up = [&](ReadonlyBytes bytes) {
+        auto file = MUST(Core::File::open(LexicalPath::join(up_ext_dir, "ext.crx"sv).string(), Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+        MUST(file->write_until_depleted(bytes));
+    };
+    write_up(v1_crx);
+    {
+        WebView::ExtensionManager up_manager { up_ext_dir, up_storage };
+        TRY_OR_FAIL(up_manager.load({}));
+        auto id = up_manager.extensions()[0].id;
+        EXPECT(!up_manager.register_content_scripts(id, parse_array(R"([{"id":"v1","matches":["<all_urls>"],"css":["cosmetic.css"]}])"sv)).is_error());
+    }
+    write_up(v2_crx);
+    {
+        WebView::ExtensionManager up_manager { up_ext_dir, up_storage };
+        TRY_OR_FAIL(up_manager.load({}));
+        auto id = up_manager.extensions()[0].id;
+        EXPECT_EQ(up_manager.registered_content_scripts(id, {}).release_value().size(), 0u);
+    }
+    // Reinstalling v1 after v2 should NOT resurrect stale v1 scripts.
+    write_up(v1_crx);
+    {
+        WebView::ExtensionManager up_manager { up_ext_dir, up_storage };
+        TRY_OR_FAIL(up_manager.load({}));
+        auto id = up_manager.extensions()[0].id;
+        EXPECT_EQ(up_manager.registered_content_scripts(id, {}).release_value().size(), 0u);
+    }
 }

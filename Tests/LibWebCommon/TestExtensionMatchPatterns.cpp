@@ -71,3 +71,37 @@ TEST_CASE(globs)
     EXPECT(Web::Extensions::glob_matches("*/fo?/*"sv, "https://a/foo/b"sv));
     EXPECT(!Web::Extensions::glob_matches("*/foo"sv, "https://a/foo/b"sv));
 }
+
+TEST_CASE(valid_match_patterns)
+{
+    EXPECT(Web::Extensions::is_valid_match_pattern("<all_urls>"sv));
+    EXPECT(Web::Extensions::is_valid_match_pattern("*://*.example.com/*"sv));
+    EXPECT(Web::Extensions::is_valid_match_pattern("http://127.0.0.1:8080/path*"sv));
+    EXPECT(Web::Extensions::is_valid_match_pattern("https://[::1]:8443/*"sv));
+    EXPECT(Web::Extensions::is_valid_match_pattern("https://[::1]/*"sv));
+    EXPECT(Web::Extensions::is_valid_match_pattern("http://localhost:*/*"sv));
+    EXPECT(Web::Extensions::is_valid_match_pattern("file:///tmp/*"sv));
+
+    EXPECT(!Web::Extensions::is_valid_match_pattern(""sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("example.com"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("https://example.com"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("https:///*"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("https://*foo.com/*"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("https://foo.*.com/*"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("https://example.com:/*"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("https://example.com:99999/*"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("chrome-extension://*/*"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("javascript://foo/*"sv));
+    EXPECT(!Web::Extensions::is_valid_match_pattern("data://text/html/*"sv));
+}
+
+TEST_CASE(host_permission_matching)
+{
+    auto url = URL::Parser::basic_parse("https://sub.example.com/some/path?x=1"sv);
+    VERIFY(url.has_value());
+    EXPECT(Web::Extensions::host_permission_matches("<all_urls>"sv, *url));
+    EXPECT(Web::Extensions::host_permission_matches("https://*.example.com/only-this-path"sv, *url));
+    EXPECT(!Web::Extensions::host_permission_matches("https://other.example.com/*"sv, *url));
+    EXPECT(!Web::Extensions::host_permission_matches("http://*.example.com/*"sv, *url));
+    EXPECT(!Web::Extensions::host_permission_matches("tabs"sv, *url));
+}

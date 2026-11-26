@@ -415,6 +415,61 @@ void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_i
         }
     }
 
+    // https://developer.chrome.com/docs/extensions/reference/api/scripting
+    if (method.starts_with_bytes("scripting."sv)) {
+        if (!m_manager.extension_has_scripting_permission(extension_id))
+            return fail("Extension does not have scripting permission"sv);
+        auto broadcast_and_settle = [&](ErrorOr<void, String> result) {
+            if (result.is_error())
+                return fail(result.error());
+            WebContentClient::for_each_client([&](WebContentClient& target) {
+                if (target.is_private() == IsPrivate::No)
+                    target.async_set_extensions(m_manager.extensions_buffer());
+                return IterationDecision::Continue;
+            });
+            respond(true, {});
+        };
+        auto argument_array = [&](size_t index) -> Optional<JsonArray const&> {
+            if (index < arguments.size() && arguments.at(index).is_array())
+                return arguments.at(index).as_array();
+            return {};
+        };
+        auto argument_optional_object = [&](size_t index) -> ErrorOr<Optional<JsonObject const&>, String> {
+            if (index >= arguments.size() || arguments.at(index).is_null())
+                return Optional<JsonObject const&> {};
+            if (!arguments.at(index).is_object())
+                return "filter must be an object"_string;
+            return arguments.at(index).as_object();
+        };
+        if (method == "scripting.registerContentScripts"sv) {
+            auto scripts = argument_array(0);
+            if (!scripts.has_value())
+                return fail("scripts must be a list"sv);
+            return broadcast_and_settle(m_manager.register_content_scripts(extension_id, *scripts));
+        }
+        if (method == "scripting.updateContentScripts"sv) {
+            auto scripts = argument_array(0);
+            if (!scripts.has_value())
+                return fail("scripts must be a list"sv);
+            return broadcast_and_settle(m_manager.update_content_scripts(extension_id, *scripts));
+        }
+        if (method == "scripting.getRegisteredContentScripts"sv) {
+            auto filter = argument_optional_object(0);
+            if (filter.is_error())
+                return fail(filter.error());
+            auto result = m_manager.registered_content_scripts(extension_id, filter.value());
+            if (result.is_error())
+                return fail(result.error());
+            return respond(true, result.release_value());
+        }
+        if (method == "scripting.unregisterContentScripts"sv) {
+            auto filter = argument_optional_object(0);
+            if (filter.is_error())
+                return fail(filter.error());
+            return broadcast_and_settle(m_manager.unregister_content_scripts(extension_id, filter.value()));
+        }
+    }
+
     fail(MUST(String::formatted("{} is not supported", method)));
 }
 

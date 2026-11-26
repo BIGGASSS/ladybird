@@ -1207,6 +1207,23 @@ void Document::invalidate_content_blocker_style_sheet()
     m_content_blocker_style_sheet_checked_ids.clear();
 }
 
+Utf16String const& Document::dynamic_extension_style_sheet() const
+{
+    static Utf16String const empty_style_sheet;
+    if (m_dynamic_extension_style_sheet.has_value())
+        return *m_dynamic_extension_style_sheet;
+    return empty_style_sheet;
+}
+
+void Document::snapshot_dynamic_extension_style_sheet()
+{
+    if (m_dynamic_extension_style_sheet.has_value() || !m_navigable)
+        return;
+    m_dynamic_extension_style_sheet = Extensions::ExtensionRegistry::the().style_sheet_for_document(*this, Extensions::ExtensionRegistry::ContentScriptKind::Dynamic);
+    if (!m_dynamic_extension_style_sheet->is_empty())
+        m_style_scope.invalidate_user_style_sheet();
+}
+
 GC::Ptr<Extensions::ExtensionContext> Document::extension_context(StringView extension_id) const
 {
     for (auto const& context : m_extension_contexts) {
@@ -7540,6 +7557,8 @@ void Document::make_active()
 
     // 3. Set document's browsing context's WindowProxy's [[Window]] internal slot value to window.
     m_browsing_context->set_active_window(window);
+
+    snapshot_dynamic_extension_style_sheet();
 
     auto current_navigable = this->navigable();
     if (current_navigable && current_navigable->is_top_level_traversable()) {

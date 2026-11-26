@@ -295,14 +295,15 @@ void StyleScope::build_user_style_sheet_if_needed()
     auto const& content_blocker_style_source = document().content_blocker_style_sheet();
     // NB: Chrome adds the CSS of content scripts as author style sheets. Here, they are part of the user style sheet,
     //     which is close enough for what they are mostly used for: hiding and restyling parts of the page.
-    auto extension_style_source = Extensions::ExtensionRegistry::the().style_sheet_for_document(document());
-    if (!user_style_source.has_value() && content_blocker_style_source.is_empty() && extension_style_source.is_empty())
+    auto static_extension_style_source = Extensions::ExtensionRegistry::the().style_sheet_for_document(document(), Extensions::ExtensionRegistry::ContentScriptKind::Static);
+    auto const& dynamic_extension_style_source = document().dynamic_extension_style_sheet();
+    if (!user_style_source.has_value() && content_blocker_style_source.is_empty() && static_extension_style_source.is_empty() && dynamic_extension_style_source.is_empty())
         return;
 
     Utf16StringBuilder source;
     if (user_style_source.has_value())
         source.append(user_style_source->utf16_view());
-    for (Utf16String const& extra_source : { content_blocker_style_source, extension_style_source }) {
+    for (Utf16String const& extra_source : { content_blocker_style_source, static_extension_style_source, dynamic_extension_style_source }) {
         if (extra_source.is_empty())
             continue;
         if (!source.is_empty())

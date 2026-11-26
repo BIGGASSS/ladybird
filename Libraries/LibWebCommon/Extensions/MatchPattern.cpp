@@ -15,6 +15,64 @@ bool glob_matches(StringView glob, StringView text)
     return text.matches(glob, CaseSensitivity::CaseSensitive);
 }
 
+bool is_valid_match_pattern(StringView pattern)
+{
+    if (pattern == "<all_urls>"sv)
+        return true;
+
+    auto scheme_end = pattern.find("://"sv);
+    if (!scheme_end.has_value())
+        return false;
+
+    auto scheme = pattern.substring_view(0, *scheme_end);
+    if (!scheme.is_one_of("*"sv, "http"sv, "https"sv, "file"sv, "ftp"sv, "ws"sv, "wss"sv))
+        return false;
+
+    auto remainder = pattern.substring_view(*scheme_end + 3);
+    auto path_start = remainder.find('/');
+    if (!path_start.has_value())
+        return false;
+
+    if (scheme == "file"sv)
+        return true;
+
+    auto host = remainder.substring_view(0, *path_start);
+    if (host.is_empty())
+        return false;
+
+    auto bracket = host.find_last(']');
+    if (auto colon = host.find_last(':'); colon.has_value() && (!bracket.has_value() || *colon > *bracket)) {
+        auto port = host.substring_view(*colon + 1);
+        host = host.substring_view(0, *colon);
+        if (host.is_empty())
+            return false;
+        if (port != "*"sv && !port.to_number<u16>().has_value())
+            return false;
+    }
+
+    if (host == "*"sv)
+        return true;
+    if (host.starts_with("*."sv)) {
+        auto domain = host.substring_view(2);
+        return !domain.is_empty() && !domain.contains('*');
+    }
+    return !host.contains('*');
+}
+
+bool host_permission_matches(StringView pattern, URL::URL const& url)
+{
+    if (pattern == "<all_urls>"sv)
+        return match_pattern_matches(pattern, url);
+    auto host_start = pattern.find("://"sv);
+    if (!host_start.has_value())
+        return false;
+    auto path_start = pattern.find('/', *host_start + 3);
+    if (!path_start.has_value())
+        return false;
+    auto any_path = ByteString::formatted("{}/*", pattern.substring_view(0, *path_start));
+    return match_pattern_matches(any_path, url);
+}
+
 // https://developer.chrome.com/docs/extensions/develop/concepts/match-patterns
 bool match_pattern_matches(StringView pattern, URL::URL const& url)
 {
