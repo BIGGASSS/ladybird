@@ -1229,6 +1229,103 @@ static Optional<URL::URL> url_for_content_script_match(URL::URL const& document_
     return {};
 }
 
+bool ExtensionManager::extension_has_active_tab_permission(StringView extension_id) const
+{
+    auto manifest = this->manifest(extension_id);
+    if (!manifest.has_value())
+        return false;
+    auto permissions = manifest->get_array("permissions"sv);
+    if (!permissions.has_value())
+        return false;
+    return any_of(permissions->values(), [](JsonValue const& value) {
+        return value.is_string() && value.as_string() == "activeTab"sv;
+    });
+}
+
+bool ExtensionManager::extension_has_host_permission(StringView extension_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin) const
+{
+    auto base_data = m_base_extension_data.get(extension_id);
+    if (!base_data.has_value())
+        return false;
+    auto host_permissions = base_data->get_array("host_permissions"sv);
+    if (!host_permissions.has_value() || host_permissions->is_empty())
+        return false;
+
+    Optional<URL::URL> url_to_check;
+    if (document_url.scheme().is_one_of("http"sv, "https"sv, "file"sv)) {
+        url_to_check = document_url;
+    } else if (document_url.scheme().is_one_of("about"sv, "blob"sv, "data"sv)) {
+        Optional<URL::Origin> effective_origin;
+        if (!document_origin.is_opaque())
+            effective_origin = document_origin;
+        else if (initiator_origin.has_value() && !initiator_origin->is_opaque())
+            effective_origin = *initiator_origin;
+        if (effective_origin.has_value()) {
+            if (auto matched = origin_to_match_url(*effective_origin); matched.has_value() && matched->scheme().is_one_of("http"sv, "https"sv, "file"sv))
+                url_to_check = matched.release_value();
+        }
+    }
+    if (!url_to_check.has_value())
+        return false;
+
+    for (auto const& value : host_permissions->values()) {
+        if (value.is_string() && Web::Extensions::host_permission_matches(value.as_string(), *url_to_check))
+            return true;
+    }
+    return false;
+}
+
+ErrorOr<Vector<String>, String> ExtensionManager::normalize_scripting_file_paths(ReadonlySpan<String> raw_paths) const
+{
+    Vector<String> paths;
+    for (auto const& raw_path : raw_paths) {
+        if (raw_path.is_empty() || raw_path.bytes_as_string_view().contains('\\'))
+            return MUST(String::formatted("Invalid file path '{}'", raw_path));
+        for (auto part : raw_path.bytes_as_string_view().split_view('/')) {
+            if (part == ".."sv)
+                return MUST(String::formatted("Invalid file path '{}'", raw_path));
+        }
+        auto normalized = normalized_package_path(raw_path);
+        if (normalized.is_empty())
+            return MUST(String::formatted("Invalid file path '{}'", raw_path));
+        paths.append(MUST(String::from_byte_string(normalized)));
+    }
+    return paths;
+}
+
+ErrorOr<Vector<ExtensionManager::ScriptingFile>, String> ExtensionManager::resolve_scripting_js_files(StringView extension_id, ReadonlySpan<String> raw_paths) const
+{
+    auto package = m_packages.get(extension_id);
+    if (!package.has_value())
+        return "The extension is not available"_string;
+    auto validated_paths = TRY(validate_script_file_paths(*package, raw_paths));
+    Vector<ScriptingFile> files;
+    for (auto const& path : validated_paths) {
+        auto source = text_file(*package, path);
+        if (source.is_error())
+            return MUST(String::formatted("Could not load file '{}'", path));
+        files.append({ path, source.release_value() });
+    }
+    return files;
+}
+
+ErrorOr<Vector<ExtensionManager::ScriptingFile>, String> ExtensionManager::resolve_scripting_css_files(StringView extension_id, ReadonlySpan<String> raw_paths) const
+{
+    auto package = m_packages.get(extension_id);
+    auto messages = m_messages.get(extension_id);
+    if (!package.has_value() || !messages.has_value())
+        return "The extension is not available"_string;
+    auto validated_paths = TRY(validate_script_file_paths(*package, raw_paths));
+    Vector<ScriptingFile> files;
+    for (auto const& path : validated_paths) {
+        auto source = text_file(*package, path);
+        if (source.is_error())
+            return MUST(String::formatted("Could not load file '{}'", path));
+        files.append({ path, localize(source.release_value(), *messages, package->id) });
+    }
+    return files;
+}
+
 bool ExtensionManager::extension_can_run_content_script(StringView extension_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin, bool is_top_level) const
 {
     auto base_data = m_base_extension_data.get(extension_id);

@@ -3499,8 +3499,8 @@ void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffe
     registry.on_load_resource = [this](u64 request_id, String const& extension_id, String const& path) {
         async_request_extension_resource(request_id, extension_id, path);
     };
-    registry.on_api_call = [this](Web::PageId page_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments) {
-        async_extension_api_call(page_id, context_id, call_id, extension_id, method, arguments);
+    registry.on_api_call = [this](Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments) {
+        async_extension_api_call(page_id, document_id, context_id, call_id, extension_id, method, arguments);
     };
     registry.on_evaluate_network_request = [this](Web::PageId page_id, u64 request_id, Web::Extensions::ExtensionRegistry::NetworkRequest const& request) {
         Vector<URL::URL> frame_urls;
@@ -3533,6 +3533,12 @@ void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffe
     };
     registry.on_disconnect_context_ports = [this](u64 context_id) {
         async_disconnect_extension_context_ports(context_id);
+    };
+    registry.on_script_injection_complete = [this](u64 injection_id, u32 target_index, bool succeeded, String const& result_json, String const& error) {
+        async_did_complete_extension_script_injection(injection_id, target_index, succeeded, result_json, error);
+    };
+    registry.on_css_injection_complete = [this](u64 injection_id, u32 target_index, bool succeeded, String const& error) {
+        async_did_complete_extension_css_injection(injection_id, target_index, succeeded, error);
     };
 
     // The CSS of content scripts is part of each document's user style sheet.
@@ -3592,6 +3598,21 @@ void ConnectionFromClient::deliver_extension_port_message(u64 context_id, u64 lo
 void ConnectionFromClient::disconnect_extension_port_endpoint(u64 context_id, u64 local_port_id, String error, bool notify)
 {
     Web::Extensions::ExtensionRegistry::the().disconnect_port_endpoint(context_id, local_port_id, error, notify);
+}
+
+void ConnectionFromClient::execute_extension_script(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool main_world, bool inject_immediately, Vector<String> file_paths, Vector<String> file_sources, Optional<String> func_source, Optional<String> args_json)
+{
+    Web::Extensions::ExtensionRegistry::the().execute_script(injection_id, target_index, extension_id, page_id, document_id, main_world, inject_immediately, file_paths, file_sources, func_source, args_json);
+}
+
+void ConnectionFromClient::insert_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys, Vector<String> css_sources, bool is_user_origin)
+{
+    Web::Extensions::ExtensionRegistry::the().insert_css(injection_id, target_index, extension_id, page_id, document_id, css_keys, css_sources, is_user_origin);
+}
+
+void ConnectionFromClient::remove_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys)
+{
+    Web::Extensions::ExtensionRegistry::the().remove_css(injection_id, target_index, extension_id, page_id, document_id, css_keys);
 }
 
 void ConnectionFromClient::extension_storage_changed(String extension_id, String area, String changes)

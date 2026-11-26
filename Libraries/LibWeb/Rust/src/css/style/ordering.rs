@@ -97,7 +97,7 @@ impl RetainedState {
             important,
             context_depth: self.tree_scope_depth(tree_scope),
             element_attachment,
-            layer_rank: self.rules.layer_rank(tree_scope, CascadeLayerID::UNLAYERED),
+            layer_rank: self.rules.layer_rank_for_origin(origin, tree_scope, CascadeLayerID::UNLAYERED),
             specificity: Specificity::default(),
             scope_proximity: u32::MAX,
             sheet_rank: u64::MAX,

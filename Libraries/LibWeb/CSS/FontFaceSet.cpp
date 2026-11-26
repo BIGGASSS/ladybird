@@ -15,6 +15,7 @@
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
@@ -244,11 +245,66 @@ bool web_css_font_face_set_for_each_font_face_rule(void* set, void* context, voi
     auto* window = HTML::window_from_global_object(set_from_abi(set).relevant_settings_object().global_object());
     if (!window)
         return false;
-    Vector<Parser::ValueParserFFI::NativeStyleSheet const*> sheets;
-    window->associated_document().for_each_active_css_style_sheet([&](StyleSheetState& sheet) {
-        sheets.append(sheet.native_sheet().handle());
+    auto& document = window->associated_document();
+
+    Vector<Parser::ValueParserFFI::NativeStyleSheet const*> user_sheets;
+    Extensions::ExtensionRegistry::the().for_each_inserted_user_style_sheet(document, [&](StyleSheetState& sheet) {
+        user_sheets.append(sheet.native_sheet().handle());
     });
-    Parser::ValueParserFFI::rust_style_sheets_visit_font_face_rules(sheets.data(), sheets.size(), context, callback);
+
+    Vector<Parser::ValueParserFFI::NativeStyleSheet const*> author_sheets;
+    document.for_each_active_css_style_sheet([&](StyleSheetState& sheet) {
+        author_sheets.append(sheet.native_sheet().handle());
+    });
+
+    if (user_sheets.is_empty()) {
+        Parser::ValueParserFFI::rust_style_sheets_visit_font_face_rules(author_sheets.data(), author_sheets.size(), context, callback);
+        return true;
+    }
+
+    // Normal USER @font-face rules cascade before AUTHOR @font-face rules, with USER cascade layers
+    // ordered ahead of unlayered USER rules and all USER ranks strictly below every AUTHOR rank.
+    struct CollectedEntry {
+        u64 identity { 0 };
+        size_t rank { 0 };
+    };
+    struct Collector {
+        Vector<CollectedEntry> entries;
+        size_t max_layered_rank { 0 };
+        bool saw_layered { false };
+    };
+    Collector user_collector;
+    Parser::ValueParserFFI::rust_style_sheets_visit_font_face_rules(
+        user_sheets.data(), user_sheets.size(), &user_collector,
+        [](void* raw_collector, u64 identity, size_t rank) {
+            auto& collector = *static_cast<Collector*>(raw_collector);
+            if (rank != NumericLimits<size_t>::max()) {
+                collector.saw_layered = true;
+                collector.max_layered_rank = max(collector.max_layered_rank, rank);
+            }
+            collector.entries.append({ identity, rank });
+        });
+
+    size_t unlayered_user_rank = user_collector.saw_layered ? (user_collector.max_layered_rank + 1) : 0;
+    size_t author_rank_offset = unlayered_user_rank + 1;
+    for (auto const& entry : user_collector.entries) {
+        size_t effective_rank = entry.rank == NumericLimits<size_t>::max() ? unlayered_user_rank : entry.rank;
+        callback(context, entry.identity, effective_rank);
+    }
+
+    struct AuthorForwarder {
+        void* context { nullptr };
+        void (*callback)(void*, u64, size_t) { nullptr };
+        size_t rank_offset { 0 };
+    };
+    AuthorForwarder author_forwarder { context, callback, author_rank_offset };
+    Parser::ValueParserFFI::rust_style_sheets_visit_font_face_rules(
+        author_sheets.data(), author_sheets.size(), &author_forwarder,
+        [](void* raw_forwarder, u64 identity, size_t rank) {
+            auto& forwarder = *static_cast<AuthorForwarder*>(raw_forwarder);
+            size_t effective_rank = rank == NumericLimits<size_t>::max() ? rank : (forwarder.rank_offset + rank);
+            forwarder.callback(forwarder.context, identity, effective_rank);
+        });
     return true;
 }
 

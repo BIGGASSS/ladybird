@@ -79,8 +79,17 @@ public:
     void mark_install_event_delivered(StringView extension_id, StringView delivered_version);
 
     // https://developer.chrome.com/docs/extensions/reference/api/scripting
+    struct ScriptingFile {
+        String path;
+        String content;
+    };
     bool extension_has_scripting_permission(StringView extension_id) const;
+    bool extension_has_active_tab_permission(StringView extension_id) const;
+    bool extension_has_host_permission(StringView extension_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin = {}) const;
     bool extension_can_run_content_script(StringView extension_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin, bool is_top_level) const;
+    ErrorOr<Vector<String>, String> normalize_scripting_file_paths(ReadonlySpan<String> raw_paths) const;
+    ErrorOr<Vector<ScriptingFile>, String> resolve_scripting_js_files(StringView extension_id, ReadonlySpan<String> raw_paths) const;
+    ErrorOr<Vector<ScriptingFile>, String> resolve_scripting_css_files(StringView extension_id, ReadonlySpan<String> raw_paths) const;
     ErrorOr<void, String> register_content_scripts(StringView extension_id, JsonArray const& scripts);
     ErrorOr<void, String> update_content_scripts(StringView extension_id, JsonArray const& scripts);
     ErrorOr<JsonArray, String> registered_content_scripts(StringView extension_id, Optional<JsonObject const&> filter) const;

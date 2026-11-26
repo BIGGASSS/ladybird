@@ -2082,7 +2082,7 @@ public:
         m_view = new WebContentView(this, {}, view_initial_state);
         layout->addWidget(m_view);
 
-        HubConnection::the().async_set_tab_of_extension_popup(m_view->view_id(), tab_view_id);
+        HubConnection::the().async_set_tab_of_extension_popup(m_view->view_id(), tab_view_id, MUST(String::from_utf8(url.serialized_host())));
         m_view->on_close = [this] { close(); };
         // A link the popup opens in a new tab, or a window it opens, becomes a tab of the window it was opened from.
         m_view->on_open_new_view = [window = QPointer<BrowserWindow>(&window)](auto activate_tab, auto, u64 hub_view_id) {

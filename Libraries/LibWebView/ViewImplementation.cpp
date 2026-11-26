@@ -405,6 +405,8 @@ void ViewImplementation::did_change_active_document(Badge<CanonicalTraversable>)
     m_permissions_requested_by_page.clear();
     set_title(Utf16String::from_utf8(url().serialize()));
     set_favicon({});
+    if (auto* host = Application::the().extension_host())
+        host->on_tab_document_committed(*this);
     did_update_url();
 }
 

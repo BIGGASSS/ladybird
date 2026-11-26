@@ -275,6 +275,9 @@ endpoint WebContentServer routed by Web::PageId page_id
     open_extension_port(u64 channel_id, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool target_extension_page, u64 excluded_context_id, String name, String sender) =|
     deliver_extension_port_message(u64 context_id, u64 local_port_id, String message) =|
     disconnect_extension_port_endpoint(u64 context_id, u64 local_port_id, String error, bool notify) =|
+    execute_extension_script(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool main_world, bool inject_immediately, Vector<String> file_paths, Vector<String> file_sources, Optional<String> func_source, Optional<String> args_json) =|
+    insert_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys, Vector<String> css_sources, bool is_user_origin) =|
+    remove_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys) =|
 
     set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) =|
     set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) =|

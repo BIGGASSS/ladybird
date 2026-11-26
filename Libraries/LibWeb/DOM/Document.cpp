@@ -7057,6 +7057,7 @@ void Document::did_stop_being_active_document_in_navigable()
 
     for (auto& context : m_extension_contexts)
         Extensions::ExtensionRegistry::the().disconnect_ports_of_context(context->id(), Extensions::ExtensionRegistry::NotifyLocalPorts::Yes);
+    Extensions::ExtensionRegistry::the().cancel_pending_script_injections_for_document(*this);
 
     stop_compositor_animation_timers();
     tear_down_layout_tree();
@@ -10243,6 +10244,9 @@ GC::Ref<WebIDL::ObservableArray> Document::adopted_style_sheets() const
 
 void Document::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const
 {
+    // Injected AUTHOR stylesheets precede page stylesheets in Chrome's cascade order.
+    Extensions::ExtensionRegistry::the().for_each_inserted_author_style_sheet(*this, callback);
+
     for (auto& style_sheet : m_style_scope.style_sheets()) {
         if (!style_sheet->disabled())
             callback(*style_sheet);

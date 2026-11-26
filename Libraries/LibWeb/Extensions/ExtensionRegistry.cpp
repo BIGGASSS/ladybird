@@ -11,11 +11,19 @@
 #include <AK/StringBuilder.h>
 #include <AK/Utf16StringBuilder.h>
 #include <LibJS/Runtime/AbstractOperations.h>
+#include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/FunctionObject.h>
+#include <LibJS/Runtime/JSONObject.h>
 #include <LibJS/Runtime/PrimitiveString.h>
+#include <LibJS/Runtime/Promise.h>
 #include <LibURL/Parser.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/CSS/FontFaceSet.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/CSS/StyleScope.h>
+#include <LibWeb/DOM/AdoptedStyleSheets.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Extensions/ExtensionContext.h>
 #include <LibWeb/Extensions/ExtensionRegistry.h>
@@ -30,6 +38,7 @@
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/Extensions/MatchPattern.h>
 
 namespace Web::Extensions {
@@ -53,6 +62,8 @@ Extension const* ExtensionRegistry::extension(StringView id) const
 
 bool ExtensionRegistry::has_extensions_for_document(DOM::Document const& document) const
 {
+    if (m_deferred_script_injections.contains(&document))
+        return true;
     if (auto snapshot = m_document_extension_snapshots.get(&document); snapshot.has_value())
         return snapshot->generation && !snapshot->generation->extensions.is_empty();
     return !m_current_injection_generation->extensions.is_empty();
@@ -518,6 +529,37 @@ Utf16String ExtensionRegistry::style_sheet_for_document(DOM::Document const& doc
     return builder.to_string();
 }
 
+u64 ExtensionRegistry::inserted_user_style_sheets_version(DOM::Document const& document) const
+{
+    return m_document_inserted_user_css_versions.get(&document).value_or(0);
+}
+
+void ExtensionRegistry::for_each_inserted_user_style_sheet(DOM::Document const& document, Function<void(CSS::StyleSheetState&)> const& callback) const
+{
+    if (document.is_decoded_svg() || !document.browsing_context())
+        return;
+    auto inserted = m_document_inserted_css.get(&document);
+    if (!inserted.has_value())
+        return;
+    for (auto const& entry : *inserted) {
+        if (entry.is_user_origin && !entry.sheet->disabled())
+            callback(*entry.sheet);
+    }
+}
+
+void ExtensionRegistry::for_each_inserted_author_style_sheet(DOM::Document const& document, Function<void(CSS::StyleSheetState&)> const& callback) const
+{
+    if (document.is_decoded_svg() || !document.browsing_context())
+        return;
+    auto inserted = m_document_inserted_css.get(&document);
+    if (!inserted.has_value())
+        return;
+    for (auto const& entry : *inserted) {
+        if (!entry.is_user_origin && !entry.sheet->disabled())
+            callback(*entry.sheet);
+    }
+}
+
 static JS::ThrowCompletionOr<String> string_argument(JS::VM& vm, size_t index)
 {
     return TRY(vm.argument(index).to_utf16_string(vm)).to_well_formed_utf8();
@@ -729,7 +771,11 @@ u64 ExtensionRegistry::call(u64 context_id, StringView method, StringView argume
         did_complete_call(call_id, context_id, false, "\"The extension context is gone\""sv);
         return call_id;
     }
-    on_api_call(context->document().page().client().id(), context_id, call_id, context->extension_id(), MUST(String::from_utf8(method)), MUST(String::from_utf8(arguments)));
+    if (method.starts_with("scripting."sv) && context->kind() != ExtensionContext::Kind::ExtensionPage) {
+        did_complete_call(call_id, context_id, false, "\"Extension context is not authorized\""sv);
+        return call_id;
+    }
+    on_api_call(context->document().page().client().id(), context->document().id(), context_id, call_id, context->extension_id(), MUST(String::from_utf8(method)), MUST(String::from_utf8(arguments)));
     return call_id;
 }
 
@@ -1023,9 +1069,560 @@ void ExtensionRegistry::snapshot_extensions_for_document(DOM::Document const& do
     });
 }
 
+bool ExtensionRegistry::take_pending_script_injection(DOM::Document const* document, u64 injection_id, u32 target_index)
+{
+    auto it = m_pending_script_injections.find(document);
+    if (it == m_pending_script_injections.end())
+        return false;
+    Optional<u64> file_batch_id;
+    bool removed = it->value.remove_first_matching([&](PendingScriptInjection const& entry) {
+        if (entry.injection_id == injection_id && entry.target_index == target_index) {
+            file_batch_id = entry.file_batch_id;
+            return true;
+        }
+        return false;
+    });
+    if (it->value.is_empty())
+        m_pending_script_injections.remove(it);
+    if (file_batch_id.has_value())
+        m_pending_file_batches.remove(*file_batch_id);
+    return removed;
+}
+
+bool ExtensionRegistry::is_pending_script_injection(DOM::Document const* document, u64 injection_id, u32 target_index) const
+{
+    auto it = m_pending_script_injections.find(document);
+    if (it == m_pending_script_injections.end())
+        return false;
+    return any_of(it->value, [&](PendingScriptInjection const& entry) {
+        return entry.injection_id == injection_id && entry.target_index == target_index;
+    });
+}
+
+void ExtensionRegistry::cancel_pending_script_injections_for_document(DOM::Document const& document)
+{
+    if (auto deferred = m_deferred_script_injections.take(&document); deferred.has_value()) {
+        for (auto const& request : *deferred) {
+            if (on_script_injection_complete)
+                on_script_injection_complete(request.injection_id, request.target_index, false, String {}, "The frame was removed."_string);
+        }
+    }
+    if (auto pending = m_pending_script_injections.take(&document); pending.has_value()) {
+        for (auto const& entry : *pending) {
+            if (entry.file_batch_id.has_value())
+                m_pending_file_batches.remove(*entry.file_batch_id);
+            if (on_script_injection_complete)
+                on_script_injection_complete(entry.injection_id, entry.target_index, false, String {}, "The frame was removed."_string);
+        }
+    }
+}
+
 void ExtensionRegistry::did_destroy_document(DOM::Document const& document)
 {
     m_document_extension_snapshots.remove(&document);
+    m_document_inserted_user_css_versions.remove(&document);
+    if (auto inserted = m_document_inserted_css.take(&document); inserted.has_value()) {
+        for (auto& entry : *inserted)
+            entry.sheet->remove_owning_document_or_shadow_root(const_cast<DOM::Document&>(document));
+    }
+    cancel_pending_script_injections_for_document(document);
+}
+
+GC::Ptr<DOM::Document> ExtensionRegistry::find_active_document(PageId page_id, HTML::CrossProcessId document_id) const
+{
+    auto documents = HTML::main_thread_event_loop().documents_in_this_event_loop_matching([&](DOM::Document& candidate) {
+        return !candidate.is_decoded_svg()
+            && candidate.browsing_context()
+            && candidate.page().client().id() == page_id
+            && candidate.has_id()
+            && candidate.id() == document_id
+            && candidate.is_fully_active();
+    });
+    if (documents.is_empty())
+        return nullptr;
+    return documents.first().ptr();
+}
+
+static constexpr size_t MAX_SCRIPT_RESULT_BYTES = 4 * MiB;
+
+static Optional<String> serialize_script_result(JS::VM& vm, JS::Value value)
+{
+    if (value.is_undefined())
+        return String {};
+    if (value.is_null())
+        return "null"_string;
+    auto serialized = JS::JSONObject::stringify_impl(vm, value, JS::js_undefined(), JS::js_undefined());
+    if (serialized.is_error())
+        return String {};
+    if (!serialized.value().has_value())
+        return String {};
+    auto utf8 = serialized.value()->to_well_formed_utf8();
+    if (utf8.bytes().size() > MAX_SCRIPT_RESULT_BYTES)
+        return {};
+    return utf8;
+}
+
+static CSS::StyleSheetState* first_author_page_sheet(DOM::Document& document)
+{
+    auto const& style_sheets = document.style_scope().style_sheets();
+    if (!style_sheets.is_empty())
+        return style_sheets.first().ptr();
+    CSS::StyleSheetState* first_adopted = nullptr;
+    auto adopted = DOM::AdoptedStyleSheetsAccess::adopted_style_sheets(document);
+    DOM::for_each_adopted_style_sheet(adopted, [&](CSS::StyleSheetState& sheet) {
+        if (!first_adopted)
+            first_adopted = &sheet;
+    });
+    return first_adopted;
+}
+
+void ExtensionRegistry::execute_script(u64 injection_id, u32 target_index, StringView extension_id, PageId page_id, HTML::CrossProcessId document_id, bool main_world, bool inject_immediately, ReadonlySpan<String> file_paths, ReadonlySpan<String> file_sources, Optional<String> const& func_source, Optional<String> const& args_json)
+{
+    auto finish = [&](bool succeeded, String const& result_json, String const& error) {
+        if (on_script_injection_complete)
+            on_script_injection_complete(injection_id, target_index, succeeded, result_json, error);
+    };
+
+    auto document = find_active_document(page_id, document_id);
+    if (!document)
+        return finish(false, {}, "The frame was removed."_string);
+    auto window = document->window();
+    if (!window || &window->associated_document() != document.ptr())
+        return finish(false, {}, "The frame was removed."_string);
+    if (document->is_scripting_disabled())
+        return finish(false, {}, "Cannot execute script in a script-disabled frame."_string);
+
+    ScriptInjectionRequest request {
+        .injection_id = injection_id,
+        .target_index = target_index,
+        .extension_id = MUST(String::from_utf8(extension_id)),
+        .page_id = page_id,
+        .document_id = document_id,
+        .main_world = main_world,
+        .file_paths = Vector<String> { file_paths },
+        .file_sources = Vector<String> { file_sources },
+        .func_source = func_source,
+        .args_json = args_json,
+    };
+
+    if (!inject_immediately && document->extension_content_script_stage() <= to_underlying(RunAt::DocumentIdle) && document->readiness() != HTML::DocumentReadyState::Complete) {
+        m_deferred_script_injections.ensure(document.ptr()).append(move(request));
+        return;
+    }
+
+    run_script_injection_now(*document, move(request));
+}
+
+void ExtensionRegistry::run_script_injection_now(DOM::Document& document, ScriptInjectionRequest request)
+{
+    auto injection_id = request.injection_id;
+    auto target_index = request.target_index;
+    auto finish = [&](bool succeeded, String const& result_json, String const& error) {
+        if (on_script_injection_complete)
+            on_script_injection_complete(injection_id, target_index, succeeded, result_json, error);
+    };
+
+    auto window = document.window();
+    if (!window || &window->associated_document() != &document || !document.is_fully_active())
+        return finish(false, {}, "The frame was removed."_string);
+    if (document.is_scripting_disabled())
+        return finish(false, {}, "Cannot execute script in a script-disabled frame."_string);
+
+    // Keep a strong reference to the generation across JS execution so nested event loops cannot free metadata.
+    NonnullRefPtr<InjectionGeneration> generation = m_current_injection_generation;
+    InjectionExtension const* extension = nullptr;
+    for (auto const& candidate : generation->extensions) {
+        if (candidate.id == request.extension_id) {
+            extension = &candidate;
+            break;
+        }
+    }
+    if (!extension)
+        return finish(false, {}, "Extension is not available."_string);
+
+    GC::Ptr<ExtensionContext> context;
+    if (!request.main_world) {
+        context = document.extension_context(extension->id);
+        if (!context) {
+            context = ExtensionContext::create_for_content_scripts(document, extension->id);
+            document.add_extension_context(*context);
+            install_api(*context, extension->id, extension->manifest_json, extension->messages_json, extension->ui_language);
+        }
+    }
+
+    auto& realm = context ? context->realm() : document.relevant_settings_object().realm();
+    auto& vm = realm.vm();
+    auto& settings = HTML::principal_realm_settings_object(realm);
+    HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+
+    auto report_script_error = [&](JS::Completion const& completion) {
+        if (!request.main_world)
+            HTML::report_exception_to_console(completion.value(), realm, HTML::ErrorInPromise::No);
+        else
+            HTML::report_exception(completion, realm);
+    };
+
+    if (!request.func_source.has_value()) {
+        auto file_count = min(request.file_paths.size(), request.file_sources.size());
+        if (file_count == 0)
+            return finish(true, String {}, {});
+
+        // Evaluate all files in order first (matching Chromium's PausableScriptExecutor) so a later file
+        // can settle a Promise returned by an earlier file without deadlocking.
+        GC::RootVector<JS::Value> file_results;
+        file_results.ensure_capacity(file_count);
+        for (size_t i = 0; i < file_count; ++i) {
+            if (!document.is_fully_active())
+                return finish(false, {}, "The frame was removed."_string);
+            auto filename = ByteString::formatted("chrome-extension://{}/{}", request.extension_id, request.file_paths[i]);
+            auto source = Utf16String::from_utf8(request.file_sources[i]);
+            auto script = HTML::ClassicScript::create_in_realm(filename, source, settings, realm, settings.api_base_url());
+            auto run_result = script->run(HTML::ClassicScript::RethrowErrors::Yes);
+            if (run_result.is_error()) {
+                report_script_error(run_result);
+                file_results.append(JS::js_undefined());
+            } else {
+                file_results.append(run_result.value());
+            }
+        }
+
+        if (!document.is_fully_active())
+            return finish(false, {}, "The frame was removed."_string);
+
+        size_t object_count = 0;
+        for (auto const& value : file_results) {
+            if (value.is_object())
+                ++object_count;
+        }
+        if (object_count == 0) {
+            auto serialized = serialize_script_result(vm, file_results.last());
+            if (!serialized.has_value())
+                return finish(false, {}, "Script result exceeded maximum allowed size."_string);
+            return finish(true, *serialized, {});
+        }
+
+        auto batch_id = ++m_next_file_batch_id;
+        PendingFileBatch batch {
+            .injection_id = injection_id,
+            .target_index = target_index,
+            .remaining = object_count,
+            .last_result_json = {},
+            .last_result_error = {},
+        };
+        if (!file_results.last().is_object()) {
+            auto serialized = serialize_script_result(vm, file_results.last());
+            if (serialized.has_value())
+                batch.last_result_json = *serialized;
+            else
+                batch.last_result_error = "Script result exceeded maximum allowed size."_string;
+        }
+        m_pending_file_batches.set(batch_id, move(batch));
+        m_pending_script_injections.ensure(&document).append({ injection_id, target_index, batch_id });
+
+        for (size_t i = 0; i < file_count; ++i) {
+            if (!file_results[i].is_object())
+                continue;
+            bool is_last = (i + 1 == file_count);
+            auto promise = WebIDL::create_resolved_promise(realm, file_results[i]);
+            auto on_fulfilled = GC::create_function(realm.heap(), GC::captures(GC::Ref { realm }, GC::Ref { document }, batch_id, injection_id, target_index, is_last), [](auto& realm, auto& document, auto batch_id, auto injection_id, auto target_index, auto is_last, JS::Value resolved) -> WebIDL::ExceptionOr<JS::Value> {
+                ExtensionRegistry::the().settle_file_batch_item(*document, *realm, batch_id, injection_id, target_index, is_last, true, resolved, false);
+                return JS::js_undefined();
+            });
+            auto on_rejected = GC::create_function(realm.heap(), GC::captures(GC::Ref { realm }, GC::Ref { document }, batch_id, injection_id, target_index, is_last, request.main_world), [](auto& realm, auto& document, auto batch_id, auto injection_id, auto target_index, auto is_last, auto main_world, JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
+                ExtensionRegistry::the().settle_file_batch_item(*document, *realm, batch_id, injection_id, target_index, is_last, false, reason, main_world);
+                return JS::js_undefined();
+            });
+            auto reacted = WebIDL::react_to_promise(promise, on_fulfilled, on_rejected);
+            WebIDL::mark_promise_as_handled(reacted);
+        }
+        return;
+    }
+
+    auto filename = ByteString::formatted("chrome-extension://{}/scripting-func.js", request.extension_id);
+    auto wrapped = Utf16String::formatted("({})", *request.func_source);
+    auto script = HTML::ClassicScript::create_in_realm(filename, wrapped, settings, realm, settings.api_base_url());
+    JS::Value fn_value = JS::js_undefined();
+    if (script->parse_error().is_null()) {
+        auto eval_result = script->run(HTML::ClassicScript::RethrowErrors::Yes);
+        if (eval_result.is_error()) {
+            report_script_error(eval_result);
+            return finish(true, String {}, {});
+        }
+        fn_value = eval_result.value();
+    } else {
+        // Support object method shorthand syntax such as `myMethod(x) { return x; }`.
+        auto method_wrapped = Utf16String::formatted("({{ {} }})", *request.func_source);
+        auto method_script = HTML::ClassicScript::create_in_realm(filename, method_wrapped, settings, realm, settings.api_base_url());
+        auto eval_result = method_script->run(HTML::ClassicScript::RethrowErrors::Yes);
+        if (eval_result.is_error()) {
+            report_script_error(eval_result);
+            return finish(true, String {}, {});
+        }
+        if (eval_result.value().is_object()) {
+            auto keys = eval_result.value().as_object().internal_own_property_keys();
+            if (!keys.is_error() && !keys.value().is_empty()) {
+                auto key = JS::PropertyKey::from_value(vm, keys.value().first());
+                if (!key.is_error()) {
+                    auto extracted = eval_result.value().as_object().get(key.value());
+                    if (!extracted.is_error())
+                        fn_value = extracted.value();
+                }
+            }
+        }
+    }
+    if (!fn_value.is_function())
+        return finish(false, {}, "Injected function could not be compiled."_string);
+
+    Vector<JS::Value> call_args;
+    if (request.args_json.has_value()) {
+        auto parsed = JS::JSONObject::parse_json(vm, Utf16String::from_utf8(*request.args_json));
+        if (parsed.is_error() || !parsed.value().is_object() || !is<JS::Array>(parsed.value().as_object()))
+            return finish(false, {}, "Invalid arguments for injected function."_string);
+        auto parsed_value = parsed.release_value();
+        auto& array = static_cast<JS::Array&>(parsed_value.as_object());
+        auto length = MUST(JS::length_of_array_like(vm, array));
+        for (size_t i = 0; i < length; ++i)
+            call_args.append(MUST(array.get(i)));
+    }
+
+    auto call_result = JS::call(vm, fn_value.as_function(), JS::js_undefined(), call_args.span());
+    if (call_result.is_error()) {
+        report_script_error(call_result);
+        if (!document.is_fully_active())
+            return finish(false, {}, "The frame was removed."_string);
+        return finish(true, String {}, {});
+    }
+    auto result_value = call_result.value();
+
+    if (!document.is_fully_active())
+        return finish(false, {}, "The frame was removed."_string);
+
+    // Primitives cannot be thenables; objects go through a single Promise assimilation step so `.then` is read once.
+    if (!result_value.is_object()) {
+        auto serialized = serialize_script_result(vm, result_value);
+        if (!document.is_fully_active())
+            return finish(false, {}, "The frame was removed."_string);
+        if (!serialized.has_value())
+            return finish(false, {}, "Script result exceeded maximum allowed size."_string);
+        return finish(true, *serialized, {});
+    }
+
+    m_pending_script_injections.ensure(&document).append({ injection_id, target_index, {} });
+
+    auto promise = WebIDL::create_resolved_promise(realm, result_value);
+    auto on_fulfilled = GC::create_function(realm.heap(), GC::captures(GC::Ref { realm }, GC::Ref { document }, injection_id, target_index), [](auto& realm, auto& document, auto injection_id, auto target_index, JS::Value resolved) -> WebIDL::ExceptionOr<JS::Value> {
+        auto& registry = ExtensionRegistry::the();
+        if (!registry.is_pending_script_injection(document.ptr(), injection_id, target_index))
+            return JS::js_undefined();
+        if (!document->is_fully_active()) {
+            registry.take_pending_script_injection(document.ptr(), injection_id, target_index);
+            if (auto& callback = registry.on_script_injection_complete)
+                callback(injection_id, target_index, false, String {}, "The frame was removed."_string);
+            return JS::js_undefined();
+        }
+        // Keep the pending entry registered across serialization so document teardown during
+        // reentrant JavaScript settles it once and prevents a duplicate success completion.
+        Optional<String> serialized;
+        {
+            HTML::TemporaryExecutionContext execution_context { *realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+            serialized = serialize_script_result(realm->vm(), resolved);
+        }
+        if (!registry.take_pending_script_injection(document.ptr(), injection_id, target_index))
+            return JS::js_undefined();
+        if (!document->is_fully_active()) {
+            if (auto& callback = registry.on_script_injection_complete)
+                callback(injection_id, target_index, false, String {}, "The frame was removed."_string);
+            return JS::js_undefined();
+        }
+        if (auto& callback = registry.on_script_injection_complete) {
+            if (serialized.has_value())
+                callback(injection_id, target_index, true, *serialized, String {});
+            else
+                callback(injection_id, target_index, false, String {}, "Script result exceeded maximum allowed size."_string);
+        }
+        return JS::js_undefined();
+    });
+    auto on_rejected = GC::create_function(realm.heap(), GC::captures(GC::Ref { realm }, GC::Ref { document }, injection_id, target_index, request.main_world), [](auto& realm, auto& document, auto injection_id, auto target_index, auto main_world, JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
+        auto& registry = ExtensionRegistry::the();
+        if (!registry.take_pending_script_injection(document.ptr(), injection_id, target_index))
+            return JS::js_undefined();
+        if (!main_world)
+            HTML::report_exception_to_console(reason, *realm, HTML::ErrorInPromise::Yes);
+        if (!document->is_fully_active()) {
+            if (auto& callback = registry.on_script_injection_complete)
+                callback(injection_id, target_index, false, String {}, "The frame was removed."_string);
+            return JS::js_undefined();
+        }
+        if (auto& callback = registry.on_script_injection_complete)
+            callback(injection_id, target_index, true, String {}, String {});
+        return JS::js_undefined();
+    });
+    auto reacted = WebIDL::react_to_promise(promise, on_fulfilled, on_rejected);
+    WebIDL::mark_promise_as_handled(reacted);
+}
+
+void ExtensionRegistry::settle_file_batch_item(DOM::Document& document, JS::Realm& realm, u64 batch_id, u64 injection_id, u32 target_index, bool is_last, bool fulfilled, JS::Value value, bool main_world)
+{
+    if (!is_pending_script_injection(&document, injection_id, target_index) || !m_pending_file_batches.contains(batch_id))
+        return;
+
+    if (!fulfilled && !main_world)
+        HTML::report_exception_to_console(value, realm, HTML::ErrorInPromise::Yes);
+
+    if (!document.is_fully_active()) {
+        take_pending_script_injection(&document, injection_id, target_index);
+        if (on_script_injection_complete)
+            on_script_injection_complete(injection_id, target_index, false, String {}, "The frame was removed."_string);
+        return;
+    }
+
+    // Serialize into locals before looking up the batch so reentrant JavaScript (e.g. `toJSON` getters
+    // or nested event loops) cannot invalidate a held hash-map iterator.
+    String serialized_result_json;
+    String serialized_result_error;
+    if (is_last && fulfilled) {
+        HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+        auto serialized = serialize_script_result(realm.vm(), value);
+        if (serialized.has_value())
+            serialized_result_json = move(*serialized);
+        else
+            serialized_result_error = "Script result exceeded maximum allowed size."_string;
+    }
+
+    if (!is_pending_script_injection(&document, injection_id, target_index))
+        return;
+    auto it = m_pending_file_batches.find(batch_id);
+    if (it == m_pending_file_batches.end())
+        return;
+
+    if (!document.is_fully_active()) {
+        take_pending_script_injection(&document, injection_id, target_index);
+        if (on_script_injection_complete)
+            on_script_injection_complete(injection_id, target_index, false, String {}, "The frame was removed."_string);
+        return;
+    }
+
+    if (is_last) {
+        it->value.last_result_json = move(serialized_result_json);
+        it->value.last_result_error = move(serialized_result_error);
+    }
+
+    if (it->value.remaining > 0)
+        --it->value.remaining;
+    if (it->value.remaining > 0)
+        return;
+
+    auto result_json = move(it->value.last_result_json);
+    auto result_error = move(it->value.last_result_error);
+    take_pending_script_injection(&document, injection_id, target_index);
+    if (on_script_injection_complete) {
+        if (result_error.is_empty())
+            on_script_injection_complete(injection_id, target_index, true, result_json, String {});
+        else
+            on_script_injection_complete(injection_id, target_index, false, String {}, result_error);
+    }
+}
+
+void ExtensionRegistry::insert_css(u64 injection_id, u32 target_index, StringView extension_id, PageId page_id, HTML::CrossProcessId document_id, ReadonlySpan<String> css_keys, ReadonlySpan<String> css_sources, bool is_user_origin)
+{
+    auto finish = [&](bool succeeded, String const& error) {
+        if (on_css_injection_complete)
+            on_css_injection_complete(injection_id, target_index, succeeded, error);
+    };
+
+    auto document = find_active_document(page_id, document_id);
+    if (!document)
+        return finish(false, "The frame was removed."_string);
+
+    auto count = min(css_keys.size(), css_sources.size());
+    auto& inserted = m_document_inserted_css.ensure(document.ptr());
+    auto extension_id_string = MUST(String::from_utf8(extension_id));
+    for (size_t i = 0; i < count; ++i) {
+        auto sheet = Web::parse_css_stylesheet(CSS::Parser::ParsingParams(*document), Utf16String::from_utf8(css_sources[i]));
+        sheet->add_owning_document_or_shadow_root(*document);
+        if (!is_user_origin) {
+            auto* before = first_author_page_sheet(*document);
+            CSS::record_stylesheet_attached(*sheet, *document, before);
+            sheet->evaluate_media_queries(*document);
+            CSS::record_stylesheet_conditions(*sheet, *document, !sheet->disabled() && sheet->native_media_list().matches());
+        }
+        inserted.append({
+            .extension_id = extension_id_string,
+            .key = css_keys[i],
+            .is_user_origin = is_user_origin,
+            .sheet = move(sheet),
+        });
+    }
+
+    if (count > 0) {
+        if (is_user_origin) {
+            ++m_document_inserted_user_css_versions.ensure(document.ptr());
+            document->fonts()->synchronize_css_connected_font_order();
+            document->style_scope().invalidate_style_cache();
+            document->style_scope().invalidate_counter_style_cache();
+            if (document->style_computer_if_created())
+                CSS::record_non_author_stylesheets(*document);
+        } else {
+            document->fonts()->synchronize_css_connected_font_order();
+            document->style_scope().invalidate_style_cache();
+            document->style_scope().invalidate_counter_style_cache();
+        }
+        if (document->navigable())
+            document->page().client().request_frame_for(*document);
+    }
+    finish(true, {});
+}
+
+void ExtensionRegistry::remove_css(u64 injection_id, u32 target_index, StringView extension_id, PageId page_id, HTML::CrossProcessId document_id, ReadonlySpan<String> css_keys)
+{
+    auto finish = [&](bool succeeded, String const& error) {
+        if (on_css_injection_complete)
+            on_css_injection_complete(injection_id, target_index, succeeded, error);
+    };
+
+    auto document = find_active_document(page_id, document_id);
+    if (!document)
+        return finish(false, "The frame was removed."_string);
+
+    if (auto it = m_document_inserted_css.find(document.ptr()); it != m_document_inserted_css.end()) {
+        bool removed_user = false;
+        bool removed_author = false;
+        for (auto const& key : css_keys) {
+            for (ssize_t i = static_cast<ssize_t>(it->value.size()) - 1; i >= 0; --i) {
+                auto& entry = it->value[i];
+                if (entry.extension_id != extension_id || entry.key != key)
+                    continue;
+                entry.sheet->remove_owning_document_or_shadow_root(*document);
+                if (entry.is_user_origin) {
+                    removed_user = true;
+                } else {
+                    CSS::record_stylesheet_detached(*entry.sheet, *document);
+                    removed_author = true;
+                }
+                it->value.remove(i);
+                break;
+            }
+        }
+        if (it->value.is_empty())
+            m_document_inserted_css.remove(it);
+        if (removed_user) {
+            ++m_document_inserted_user_css_versions.ensure(document.ptr());
+            document->style_scope().invalidate_style_cache();
+            document->style_scope().invalidate_counter_style_cache();
+            if (document->style_computer_if_created())
+                CSS::record_non_author_stylesheets(*document);
+        }
+        if (removed_author) {
+            document->style_scope().invalidate_style_cache();
+            document->style_scope().invalidate_counter_style_cache();
+        }
+        if (removed_user || removed_author) {
+            document->fonts()->synchronize_css_connected_font_order();
+            if (document->navigable())
+                document->page().client().request_frame_for(*document);
+        }
+    }
+    finish(true, {});
 }
 
 void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_at)
@@ -1046,11 +1643,25 @@ void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_a
     if (document.extension_content_script_stage() == 0 && document.navigable())
         document.snapshot_dynamic_extension_style_sheet();
 
+    auto flush_deferred_if_idle = [&] {
+        if (document.extension_content_script_stage() <= to_underlying(RunAt::DocumentIdle))
+            return;
+        if (auto deferred = m_deferred_script_injections.take(&document); deferred.has_value()) {
+            for (auto& request : *deferred) {
+                if (document.is_fully_active())
+                    run_script_injection_now(document, move(request));
+                else if (on_script_injection_complete)
+                    on_script_injection_complete(request.injection_id, request.target_index, false, String {}, "The frame was removed."_string);
+            }
+        }
+    };
+
     auto release_snapshot_if_finished = [&] {
         if (document.extension_content_script_stage() > to_underlying(RunAt::DocumentIdle)) {
             if (auto entry = m_document_extension_snapshots.get(&document); entry.has_value())
                 entry->generation = nullptr;
         }
+        flush_deferred_if_idle();
     };
 
     RefPtr<InjectionGeneration> generation = snapshot_entry.generation;

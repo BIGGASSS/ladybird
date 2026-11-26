@@ -1379,6 +1379,7 @@ mod tests {
                 host.host(),
                 0,
                 false,
+                false,
                 std::ptr::null_mut(),
                 prepare,
             )

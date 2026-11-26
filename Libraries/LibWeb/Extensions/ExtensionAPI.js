@@ -633,20 +633,161 @@
 
         // scripting
 
-        const notSupported =
-            name =>
-            (...args) =>
-                settle(popCallback(args), () => {
-                    throw new Error(name + " is not supported");
-                });
+        function normalizeScriptingTarget(target) {
+            if (!target || typeof target !== "object")
+                throw new TypeError("injection.target must be an object");
+            if (!Number.isSafeInteger(target.tabId) || target.tabId < 0)
+                throw new TypeError("target.tabId must be a non-negative integer");
+            const normalized = { tabId: target.tabId };
+            if (target.allFrames !== undefined) {
+                if (typeof target.allFrames !== "boolean")
+                    throw new TypeError("target.allFrames must be a boolean");
+                normalized.allFrames = target.allFrames;
+            }
+            if (target.frameIds !== undefined) {
+                if (!Array.isArray(target.frameIds) || target.frameIds.length === 0)
+                    throw new TypeError("target.frameIds must be a non-empty array");
+                for (const frameId of target.frameIds) {
+                    if (!Number.isSafeInteger(frameId) || frameId < 0)
+                        throw new TypeError("target.frameIds entries must be non-negative integers");
+                }
+                normalized.frameIds = target.frameIds.slice();
+            }
+            if (target.documentIds !== undefined) {
+                if (!Array.isArray(target.documentIds) || target.documentIds.length === 0)
+                    throw new TypeError("target.documentIds must be a non-empty array");
+                for (const documentId of target.documentIds) {
+                    if (typeof documentId !== "string" || documentId.length === 0)
+                        throw new TypeError("target.documentIds entries must be non-empty strings");
+                }
+                normalized.documentIds = target.documentIds.slice();
+            }
+            if (normalized.allFrames && (normalized.frameIds || normalized.documentIds))
+                throw new Error("Cannot specify both 'allFrames' and 'frameIds' or 'documentIds'");
+            if (normalized.frameIds && normalized.documentIds)
+                throw new Error("Cannot specify both 'frameIds' and 'documentIds'");
+            return normalized;
+        }
+
+        function normalizeCSSInjection(injection) {
+            if (!injection || typeof injection !== "object")
+                throw new TypeError("injection must be an object");
+            const target = normalizeScriptingTarget(injection.target);
+            const hasCSS = injection.css !== undefined;
+            const hasFiles = injection.files !== undefined;
+            if (hasCSS === hasFiles)
+                throw new Error("Exactly one of 'css' or 'files' must be specified");
+            const payload = { target };
+            if (hasCSS) {
+                if (typeof injection.css !== "string")
+                    throw new TypeError("injection.css must be a string");
+                payload.css = injection.css;
+            } else {
+                if (!Array.isArray(injection.files) || injection.files.length === 0)
+                    throw new TypeError("injection.files must be a non-empty array");
+                for (const file of injection.files) {
+                    if (typeof file !== "string" || file.length === 0)
+                        throw new TypeError("injection.files entries must be non-empty strings");
+                }
+                payload.files = injection.files.slice();
+            }
+            if (injection.origin !== undefined) {
+                if (injection.origin !== "AUTHOR" && injection.origin !== "USER")
+                    throw new TypeError("injection.origin must be 'AUTHOR' or 'USER'");
+                payload.origin = injection.origin;
+            } else {
+                payload.origin = "AUTHOR";
+            }
+            return payload;
+        }
+
         chrome.scripting = {
             registerContentScripts: browserFunction("scripting.registerContentScripts", 1),
             updateContentScripts: browserFunction("scripting.updateContentScripts", 1),
             getRegisteredContentScripts: browserFunction("scripting.getRegisteredContentScripts", 1),
             unregisterContentScripts: browserFunction("scripting.unregisterContentScripts", 1),
-            executeScript: notSupported("scripting.executeScript"),
-            insertCSS: notSupported("scripting.insertCSS"),
-            removeCSS: notSupported("scripting.removeCSS"),
+            executeScript(...args) {
+                const callback = popCallback(args);
+                const injection = args[0];
+                return settle(callback, () => {
+                    if (!injection || typeof injection !== "object")
+                        throw new TypeError("injection must be an object");
+                    const target = normalizeScriptingTarget(injection.target);
+                    const hasFiles = injection.files !== undefined;
+                    const hasFunc = injection.func !== undefined;
+                    if (hasFiles === hasFunc)
+                        throw new Error("Exactly one of 'files' or 'func' must be specified");
+                    const payload = { target };
+                    if (hasFiles) {
+                        if (injection.args !== undefined)
+                            throw new Error("'args' may only be specified with 'func'");
+                        if (!Array.isArray(injection.files) || injection.files.length === 0)
+                            throw new TypeError("injection.files must be a non-empty array");
+                        for (const file of injection.files) {
+                            if (typeof file !== "string" || file.length === 0)
+                                throw new TypeError("injection.files entries must be non-empty strings");
+                        }
+                        payload.files = injection.files.slice();
+                    } else {
+                        if (typeof injection.func !== "function")
+                            throw new TypeError("injection.func must be a function");
+                        const funcSource = Function.prototype.toString.call(injection.func);
+                        if (funcSource.includes("[native code]"))
+                            throw new Error("Native or bound functions cannot be injected");
+                        payload.func = funcSource;
+                        if (injection.args !== undefined) {
+                            if (!Array.isArray(injection.args))
+                                throw new TypeError("injection.args must be an array");
+                            let argsJSON;
+                            try {
+                                argsJSON = JSON.stringify(injection.args);
+                            } catch (e) {
+                                throw new TypeError("injection.args must be JSON-serializable");
+                            }
+                            if (typeof argsJSON !== "string")
+                                throw new TypeError("injection.args must be JSON-serializable");
+                            payload.argsJSON = argsJSON;
+                        }
+                    }
+                    if (injection.world !== undefined) {
+                        if (injection.world !== "ISOLATED" && injection.world !== "MAIN")
+                            throw new TypeError("injection.world must be 'ISOLATED' or 'MAIN'");
+                        payload.world = injection.world;
+                    } else {
+                        payload.world = "ISOLATED";
+                    }
+                    if (injection.injectImmediately !== undefined) {
+                        if (typeof injection.injectImmediately !== "boolean")
+                            throw new TypeError("injection.injectImmediately must be a boolean");
+                        payload.injectImmediately = injection.injectImmediately;
+                    } else {
+                        payload.injectImmediately = false;
+                    }
+                    return callBrowser("scripting.executeScript", payload).then(results =>
+                        Array.isArray(results)
+                            ? results.map(entry => {
+                                  const out = { frameId: entry.frameId, documentId: entry.documentId };
+                                  if (typeof entry.resultJSON === "string") {
+                                      try {
+                                          out.result = JSON.parse(entry.resultJSON);
+                                      } catch {}
+                                  }
+                                  return out;
+                              })
+                            : results
+                    );
+                });
+            },
+            insertCSS(...args) {
+                const callback = popCallback(args);
+                const injection = args[0];
+                return settle(callback, () => callBrowser("scripting.insertCSS", normalizeCSSInjection(injection)));
+            },
+            removeCSS(...args) {
+                const callback = popCallback(args);
+                const injection = args[0];
+                return settle(callback, () => callBrowser("scripting.removeCSS", normalizeCSSInjection(injection)));
+            },
         };
 
         // alarms

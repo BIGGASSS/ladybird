@@ -24,6 +24,7 @@
 #include <LibWeb/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWebCommon/Extensions/MessageDeliveryStatus.h>
 #include <LibWebCommon/Extensions/NetworkRequestOutcome.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
@@ -120,18 +121,29 @@ public:
         Dynamic,
     };
     Utf16String style_sheet_for_document(DOM::Document const&, ContentScriptKind) const;
+    u64 inserted_user_style_sheets_version(DOM::Document const&) const;
+    void for_each_inserted_user_style_sheet(DOM::Document const&, Function<void(CSS::StyleSheetState&)> const&) const;
+    void for_each_inserted_author_style_sheet(DOM::Document const&, Function<void(CSS::StyleSheetState&)> const&) const;
 
     // Runs the content scripts of every stage up to and including the given one that have not yet run in the document.
     // A page of an extension gets the extension's API first.
     void snapshot_extensions_for_document(DOM::Document const&, Optional<u64> generation = {});
     void did_destroy_document(DOM::Document const&);
+    void cancel_pending_script_injections_for_document(DOM::Document const&);
     void run_content_scripts(DOM::Document&, RunAt);
+
+    // On-demand injection (chrome.scripting.executeScript / insertCSS / removeCSS).
+    void execute_script(u64 injection_id, u32 target_index, StringView extension_id, PageId, HTML::CrossProcessId document_id, bool main_world, bool inject_immediately, ReadonlySpan<String> file_paths, ReadonlySpan<String> file_sources, Optional<String> const& func_source, Optional<String> const& args_json);
+    void insert_css(u64 injection_id, u32 target_index, StringView extension_id, PageId, HTML::CrossProcessId document_id, ReadonlySpan<String> css_keys, ReadonlySpan<String> css_sources, bool is_user_origin);
+    void remove_css(u64 injection_id, u32 target_index, StringView extension_id, PageId, HTML::CrossProcessId document_id, ReadonlySpan<String> css_keys);
+    Function<void(u64 injection_id, u32 target_index, bool succeeded, String const& result_json, String const& error)> on_script_injection_complete;
+    Function<void(u64 injection_id, u32 target_index, bool succeeded, String const& error)> on_css_injection_complete;
 
     // What the API of an extension asks the browser process to do, such as querying tabs or sending a message, goes to
     // on_api_call, and its result comes back to did_complete_call().
     u64 call(u64 context_id, StringView method, StringView arguments_json);
     void did_complete_call(u64 call_id, u64 context_id, bool succeeded, StringView result_json);
-    Function<void(PageId, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json)> on_api_call;
+    Function<void(PageId, HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json)> on_api_call;
 
     // Tells the listeners of the extension's pages, or of the content scripts in the given page, of a message.
     struct MessageDeliveryResult {
@@ -202,9 +214,44 @@ private:
         RefPtr<InjectionGeneration> generation;
         URL::URL creation_url;
     };
+    struct InsertedCSS {
+        String extension_id;
+        String key;
+        bool is_user_origin { false };
+        NonnullRefPtr<CSS::StyleSheetState> sheet;
+    };
+    struct ScriptInjectionRequest {
+        u64 injection_id { 0 };
+        u32 target_index { 0 };
+        String extension_id;
+        PageId page_id { 0 };
+        HTML::CrossProcessId document_id {};
+        bool main_world { false };
+        Vector<String> file_paths;
+        Vector<String> file_sources;
+        Optional<String> func_source;
+        Optional<String> args_json;
+    };
+    struct PendingScriptInjection {
+        u64 injection_id { 0 };
+        u32 target_index { 0 };
+        Optional<u64> file_batch_id {};
+    };
+    struct PendingFileBatch {
+        u64 injection_id { 0 };
+        u32 target_index { 0 };
+        size_t remaining { 0 };
+        String last_result_json {};
+        String last_result_error {};
+    };
 
     ExtensionRegistry() = default;
 
+    GC::Ptr<DOM::Document> find_active_document(PageId, HTML::CrossProcessId document_id) const;
+    bool take_pending_script_injection(DOM::Document const*, u64 injection_id, u32 target_index);
+    bool is_pending_script_injection(DOM::Document const*, u64 injection_id, u32 target_index) const;
+    void run_script_injection_now(DOM::Document&, ScriptInjectionRequest);
+    void settle_file_batch_item(DOM::Document&, JS::Realm&, u64 batch_id, u64 injection_id, u32 target_index, bool is_last, bool fulfilled, JS::Value value, bool main_world);
     Optional<URL::URL> url_for_matching(ContentScript const&, DOM::Document const&, bool use_live_document_url = false) const;
     bool content_script_matches(InjectionExtension const&, ContentScript const&, DOM::Document const&, bool use_live_document_url = false) const;
     void for_each_context(Function<void(ExtensionContext&)>) const;
@@ -215,6 +262,12 @@ private:
     NonnullRefPtr<InjectionGeneration> m_current_injection_generation { adopt_ref(*new InjectionGeneration) };
     OrderedHashMap<u64, NonnullRefPtr<InjectionGeneration>> m_recent_injection_generations;
     HashMap<DOM::Document const*, DocumentExtensionSnapshot> m_document_extension_snapshots;
+    HashMap<DOM::Document const*, Vector<InsertedCSS>> m_document_inserted_css;
+    HashMap<DOM::Document const*, u64> m_document_inserted_user_css_versions;
+    HashMap<DOM::Document const*, Vector<ScriptInjectionRequest>> m_deferred_script_injections;
+    HashMap<DOM::Document const*, Vector<PendingScriptInjection>> m_pending_script_injections;
+    HashMap<u64, PendingFileBatch> m_pending_file_batches;
+    u64 m_next_file_batch_id { 0 };
     HashMap<u64, GC::Root<GC::Function<void(Optional<ReadonlyBytes>, StringView)>>> m_pending_resource_loads;
     u64 m_next_resource_request_id { 0 };
     u64 m_next_call_id { 0 };

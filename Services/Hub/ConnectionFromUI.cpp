@@ -191,10 +191,10 @@ void ConnectionFromUI::click_extension_action(String extension_id, u64 tab_view_
         host->click_action(extension_id, tab_view_id);
 }
 
-void ConnectionFromUI::set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id)
+void ConnectionFromUI::set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id, String extension_id)
 {
     if (auto* host = Application::the().extension_host())
-        host->set_tab_of_popup(popup_view_id, tab_view_id);
+        host->set_tab_of_popup(popup_view_id, tab_view_id, extension_id);
     // What the popup opens, such as with links that open in a new tab, goes to the UI as a tab's would.
     if (auto* view = find_view(popup_view_id))
         view->forward_new_views_to_ui();

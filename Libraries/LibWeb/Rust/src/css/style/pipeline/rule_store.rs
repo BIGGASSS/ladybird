@@ -407,6 +407,8 @@ pub struct RuleStore {
     /// Qualified layer-name ranks in each tree scope. Important declarations reverse the rank
     /// through the cascade-priority operator rather than maintaining a second order.
     layer_ranks: Column<Option<HashMap<CascadeLayerID, u32>>>,
+    /// Qualified layer-name ranks for the user origin in the document tree scope.
+    user_layer_ranks: Option<HashMap<CascadeLayerID, u32>>,
 
     scopes_using_document_sheets: BitColumn,
     /// The `@scope` levels the scoped style rules are inside, by the scope their versions name,
@@ -510,8 +512,9 @@ impl RuleStore {
                 .sum::<usize>();
         let sheets_by_scope =
             self.sheets_by_scope.heap_size() + self.sheets_by_scope.iter().map(vec_bytes).sum::<usize>();
-        let layer_ranks =
-            self.layer_ranks.heap_size() + self.layer_ranks.iter().flatten().map(map_bytes).sum::<usize>();
+        let layer_ranks = self.layer_ranks.heap_size()
+            + self.layer_ranks.iter().flatten().map(map_bytes).sum::<usize>()
+            + self.user_layer_ranks.as_ref().map_or(0, map_bytes);
         sheets
             + self.rules.heap_size(sizer, |_, _| 0)
             + vec_bytes(&self.rule_children)
@@ -1169,6 +1172,7 @@ impl RuleStore {
 
     /// The comparable rank of a layer. A topology change rewrites these ranks without touching any
     /// rule that references the layer.
+    #[cfg(test)]
     #[must_use]
     pub fn layer_rank(&self, scope: TreeScopeID, layer: CascadeLayerID) -> u64 {
         u64::from(self.layer_index(scope, layer))
@@ -1179,6 +1183,56 @@ impl RuleStore {
     #[must_use]
     pub fn layer_index(&self, scope: TreeScopeID, layer: CascadeLayerID) -> u32 {
         let Some(ranks) = self.layer_ranks.get(scope.0 as usize).and_then(Option::as_ref) else {
+            return 0;
+        };
+        if layer != CascadeLayerID::UNLAYERED
+            && let Some(&rank) = ranks.get(&layer)
+        {
+            return rank;
+        }
+        u32::try_from(ranks.len()).expect("cascade layer count exhausted")
+    }
+
+    #[must_use]
+    pub fn user_layer_ranks_match(&self, ranks: &HashMap<CascadeLayerID, u32>) -> bool {
+        self.user_layer_ranks
+            .as_ref()
+            .map_or(ranks.is_empty(), |current| current == ranks)
+    }
+
+    pub(crate) fn set_user_layer_ranks(&mut self, ranks: HashMap<CascadeLayerID, u32>) -> bool {
+        let initialized = self.user_layer_ranks.is_some();
+        if !initialized && ranks.is_empty() {
+            return false;
+        }
+        if self.user_layer_ranks.as_ref() == Some(&ranks) {
+            return false;
+        }
+        self.user_layer_ranks = Some(ranks);
+        true
+    }
+
+    #[must_use]
+    pub fn user_layer_order_is_initialized(&self) -> bool {
+        self.user_layer_ranks.is_some()
+    }
+
+    #[must_use]
+    pub fn user_layer_ranks(&self) -> HashMap<CascadeLayerID, u32> {
+        self.user_layer_ranks.clone().unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn layer_rank_for_origin(&self, origin: CascadeOrigin, scope: TreeScopeID, layer: CascadeLayerID) -> u64 {
+        u64::from(self.layer_index_for_origin(origin, scope, layer))
+    }
+
+    #[must_use]
+    pub fn layer_index_for_origin(&self, origin: CascadeOrigin, scope: TreeScopeID, layer: CascadeLayerID) -> u32 {
+        if origin != CascadeOrigin::User {
+            return self.layer_index(scope, layer);
+        }
+        let Some(ranks) = self.user_layer_ranks.as_ref() else {
             return 0;
         };
         if layer != CascadeLayerID::UNLAYERED

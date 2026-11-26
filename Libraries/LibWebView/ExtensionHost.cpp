@@ -47,6 +47,8 @@ ExtensionHost::~ExtensionHost()
     m_endpoint_to_channel.clear();
     m_pending_messages.clear();
     m_pending_tab_removes.clear();
+    m_pending_scripting_injections.clear();
+    m_active_tab_grants.clear();
     m_closing_tab_ids.clear();
     m_awaiting_close_tab_ids.clear();
     m_known_tab_ids.clear();
@@ -106,10 +108,12 @@ void ExtensionHost::start_background_pages(Optional<StringView> only_extension_i
     }
 }
 
-void ExtensionHost::set_tab_of_popup(u64 popup_view_id, u64 tab_view_id)
+void ExtensionHost::set_tab_of_popup(u64 popup_view_id, u64 tab_view_id, String const& extension_id)
 {
     m_tabs_of_popups.remove_all_matching([](u64 popup_view_id, u64) { return !ViewImplementation::find_view_by_id(popup_view_id).has_value(); });
     m_tabs_of_popups.set(popup_view_id, tab_view_id);
+    if (!extension_id.is_empty())
+        grant_active_tab(extension_id, tab_view_id);
 }
 
 bool ExtensionHost::is_tab(ViewImplementation const& view) const
@@ -207,7 +211,10 @@ bool ExtensionHost::may_see_url_of(String const& extension_id, URL::URL const& u
 
 bool ExtensionHost::may_see_url_of(String const& extension_id, ViewImplementation& view) const
 {
-    return may_see_url_of(extension_id, view.url());
+    if (may_see_url_of(extension_id, view.url()))
+        return true;
+    auto const& document = view.traversable().active_document();
+    return has_active_tab_grant(extension_id, view.view_id(), view.traversable().active_document_url(), document.origin());
 }
 
 JsonObject ExtensionHost::describe_tab(ViewImplementation& view, String const& extension_id) const
@@ -254,7 +261,7 @@ static Optional<URL::URL> url_for_extension(String const& extension_id, Optional
     return result;
 }
 
-void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json)
+void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json)
 {
     auto respond = [&](bool succeeded, Optional<JsonValue> result) {
         client.async_extension_api_call_completed(call_id, context_id, succeeded, result.has_value() ? result->serialized() : String {});
@@ -557,6 +564,26 @@ void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_i
 
     // https://developer.chrome.com/docs/extensions/reference/api/scripting
     if (method.starts_with_bytes("scripting."sv)) {
+        auto* page = client.page(page_id);
+        bool caller_is_extension_page = false;
+        if (page && page->is_open() && page->has_traversable()) {
+            page->view().traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
+                auto& document = navigable.active_document();
+                auto const& url = navigable.active_document_url();
+                if (document.id() == document_id && document.host().ptr() == page
+                    && url.scheme() == "chrome-extension"sv
+                    && url.serialized_host() == extension_id
+                    && !document.origin().is_opaque()
+                    && document.origin().scheme() == "chrome-extension"sv
+                    && document.origin().host().serialize() == extension_id) {
+                    caller_is_extension_page = true;
+                    return IterationDecision::Break;
+                }
+                return IterationDecision::Continue;
+            });
+        }
+        if (!caller_is_extension_page)
+            return fail("Extension context is not authorized"sv);
         if (!m_manager.extension_has_scripting_permission(extension_id))
             return fail("Extension does not have scripting permission"sv);
         auto broadcast_and_settle = [&](ErrorOr<void, String> result) {
@@ -609,6 +636,11 @@ void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_i
                 return fail(filter.error());
             return broadcast_and_settle(m_manager.unregister_content_scripts(extension_id, filter.value()));
         }
+        if (method.is_one_of("scripting.executeScript"sv, "scripting.insertCSS"sv, "scripting.removeCSS"sv)) {
+            if (arguments.is_empty() || !arguments.at(0).is_object())
+                return fail("injection must be an object"sv);
+            return execute_scripting_injection(client, context_id, call_id, extension_id, method, arguments.at(0).as_object());
+        }
     }
 
     fail(MUST(String::formatted("{} is not supported", method)));
@@ -635,12 +667,61 @@ void ExtensionHost::deliver_event(String const& extension_id, String const& name
     });
 }
 
+void ExtensionHost::grant_active_tab(String const& extension_id, u64 tab_view_id)
+{
+    if (!m_manager.extension_has_active_tab_permission(extension_id))
+        return;
+    auto view = tab(tab_view_id);
+    if (!view.has_value())
+        return;
+    auto const& top_document = view->traversable().active_document();
+    auto const& url = view->traversable().active_document_url();
+    if (top_document.origin().is_opaque() || !url.scheme().is_one_of("http"sv, "https"sv, "file"sv))
+        return;
+    m_active_tab_grants.set({ extension_id, tab_view_id }, top_document.origin());
+}
+
+void ExtensionHost::revoke_active_tab_grants_for_tab(u64 tab_view_id, Optional<URL::Origin> const& current_origin)
+{
+    m_active_tab_grants.remove_all_matching([&](ActiveTabGrantKey const& key, URL::Origin const& granted_origin) {
+        if (key.tab_view_id != tab_view_id)
+            return false;
+        if (!current_origin.has_value())
+            return true;
+        return !granted_origin.is_same_origin(*current_origin);
+    });
+}
+
+bool ExtensionHost::has_active_tab_grant(StringView extension_id, u64 tab_view_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin) const
+{
+    if (!m_manager.extension_has_active_tab_permission(extension_id))
+        return false;
+    auto grant = m_active_tab_grants.get({ MUST(String::from_utf8(extension_id)), tab_view_id });
+    if (!grant.has_value())
+        return false;
+    auto view = tab(tab_view_id);
+    if (!view.has_value())
+        return false;
+    auto const& top_origin = view->traversable().active_document().origin();
+    if (top_origin.is_opaque() || !grant->is_same_origin(top_origin))
+        return false;
+    if (!document_url.scheme().is_one_of("http"sv, "https"sv, "file"sv, "about"sv, "blob"sv, "data"sv))
+        return false;
+    if (!document_origin.is_opaque())
+        return grant->is_same_origin(document_origin);
+    if (document_url.scheme().is_one_of("about"sv, "blob"sv, "data"sv) && initiator_origin.has_value() && !initiator_origin->is_opaque())
+        return grant->is_same_origin(*initiator_origin);
+    return false;
+}
+
 // https://developer.chrome.com/docs/extensions/reference/api/action#event-onClicked
 void ExtensionHost::click_action(String const& extension_id, u64 tab_view_id)
 {
     auto view = tab(tab_view_id);
     if (!view.has_value() || !m_manager.manifest(extension_id).has_value())
         return;
+
+    grant_active_tab(extension_id, tab_view_id);
 
     JsonArray arguments;
     arguments.must_append(describe_tab(*view, extension_id));
@@ -660,15 +741,24 @@ void ExtensionHost::on_tab_created(ViewImplementation& view)
     }
 }
 
+void ExtensionHost::on_tab_document_committed(ViewImplementation& view)
+{
+    if (!is_tab(view))
+        return;
+    revoke_active_tab_grants_for_tab(view.view_id(), view.traversable().active_document().origin());
+}
+
 void ExtensionHost::on_tab_updated(ViewImplementation& view, TabUpdate const& update)
 {
     if (!is_tab(view) || !m_known_tab_ids.contains(view.view_id()))
         return;
+    if (update.url.has_value())
+        revoke_active_tab_grants_for_tab(view.view_id(), view.traversable().active_document().origin());
     for (auto const& extension : m_manager.extensions()) {
         JsonObject change_info;
         if (update.status.has_value())
             change_info.set("status"sv, *update.status);
-        if (update.url.has_value() && may_see_url_of(extension.id, *update.url))
+        if (update.url.has_value() && (may_see_url_of(extension.id, *update.url) || has_active_tab_grant(extension.id, view.view_id(), *update.url, view.traversable().active_document().origin())))
             change_info.set("url"sv, update.url->serialize());
         if (update.title.has_value() && may_see_url_of(extension.id, view))
             change_info.set("title"sv, update.title->to_well_formed_utf8());
@@ -730,6 +820,7 @@ void ExtensionHost::fail_pending_tab_removes_for(u64 tab_id, StringView error_me
 
 void ExtensionHost::on_tab_removed(u64 view_id)
 {
+    revoke_active_tab_grants_for_tab(view_id);
     m_closing_tab_ids.remove(view_id);
     m_awaiting_close_tab_ids.remove(view_id);
     if (!m_known_tab_ids.remove(view_id))
@@ -762,6 +853,7 @@ void ExtensionHost::on_tab_close_declined(u64 view_id)
 
 void ExtensionHost::on_tab_crashed(u64 view_id)
 {
+    revoke_active_tab_grants_for_tab(view_id);
     if (!m_closing_tab_ids.contains(view_id))
         return;
     // Defer so crash handlers that schedule tab removal (e.g. headless child tabs) settle via on_tab_removed() first.
@@ -1344,6 +1436,11 @@ void ExtensionHost::disconnect_context_ports(WebContentClient& client, u64 conte
     }
     for (auto local_port_id : port_ids)
         disconnect_port_endpoint_internal(client, local_port_id, context_id, PortDisconnectReason::Passive);
+
+    // Discard any pending scripting injections whose caller context tore down.
+    m_pending_scripting_injections.remove_all_matching([&](u64, PendingScriptingInjection const& pending) {
+        return pending.caller_key == &client && pending.context_id == context_id;
+    });
 }
 
 void ExtensionHost::on_client_disconnected(WebContentClient& client)
@@ -1371,6 +1468,413 @@ void ExtensionHost::on_client_disconnected(WebContentClient& client)
             maybe_finish_port_channel(channel_id);
         }
     }
+
+    Vector<u64> dropped_injections;
+    Vector<u64> completed_injections;
+    for (auto& [injection_id, pending] : m_pending_scripting_injections) {
+        if (pending.caller_key == &client) {
+            dropped_injections.append(injection_id);
+            continue;
+        }
+        for (auto& target : pending.targets) {
+            if (!target.completed && target.client_key == &client) {
+                target.completed = true;
+                target.succeeded = false;
+                target.error = "The frame was removed."_string;
+                if (pending.remaining > 0)
+                    --pending.remaining;
+            }
+        }
+        if (pending.remaining == 0)
+            completed_injections.append(injection_id);
+    }
+    for (auto injection_id : dropped_injections)
+        m_pending_scripting_injections.remove(injection_id);
+    for (auto injection_id : completed_injections)
+        finish_scripting_injection(injection_id);
+}
+
+void ExtensionHost::execute_scripting_injection(WebContentClient& caller_client, u64 context_id, u64 call_id, String const& extension_id, StringView method, JsonObject const& injection)
+{
+    auto fail = [&](StringView error) {
+        if (caller_client.is_open())
+            caller_client.async_extension_api_call_completed(call_id, context_id, false, JsonValue { MUST(String::from_utf8(error)) }.serialized());
+    };
+
+    auto target_obj = injection.get_object("target"sv);
+    if (!target_obj.has_value())
+        return fail("injection.target must be an object"sv);
+
+    auto tab_id = target_obj->get_integer<u64>("tabId"sv);
+    if (!tab_id.has_value())
+        return fail("target.tabId must be a non-negative integer"sv);
+
+    auto target_tab = tab(*tab_id);
+    if (!target_tab.has_value())
+        return fail(MUST(String::formatted("No tab with id: {}.", *tab_id)));
+
+    bool all_frames = false;
+    if (auto value = target_obj->get("allFrames"sv); value.has_value() && !value->is_null()) {
+        if (!value->is_bool())
+            return fail("target.allFrames must be a boolean"sv);
+        all_frames = value->as_bool();
+    }
+
+    Optional<Vector<u64>> requested_frame_ids;
+    if (auto value = target_obj->get("frameIds"sv); value.has_value() && !value->is_null()) {
+        if (!value->is_array() || value->as_array().is_empty())
+            return fail("target.frameIds must be a non-empty array"sv);
+        Vector<u64> ids;
+        for (auto const& item : value->as_array().values()) {
+            auto id = item.get_integer<u64>();
+            if (!id.has_value())
+                return fail("target.frameIds entries must be non-negative integers"sv);
+            if (!ids.contains_slow(*id))
+                ids.append(*id);
+        }
+        requested_frame_ids = move(ids);
+    }
+
+    Optional<Vector<String>> requested_document_ids;
+    if (auto value = target_obj->get("documentIds"sv); value.has_value() && !value->is_null()) {
+        if (!value->is_array() || value->as_array().is_empty())
+            return fail("target.documentIds must be a non-empty array"sv);
+        Vector<String> ids;
+        for (auto const& item : value->as_array().values()) {
+            if (!item.is_string() || item.as_string().is_empty())
+                return fail("target.documentIds entries must be non-empty strings"sv);
+            if (!ids.contains_slow(item.as_string()))
+                ids.append(item.as_string());
+        }
+        requested_document_ids = move(ids);
+    }
+
+    if (all_frames && (requested_frame_ids.has_value() || requested_document_ids.has_value()))
+        return fail("Cannot specify both 'allFrames' and 'frameIds' or 'documentIds'"sv);
+    if (requested_frame_ids.has_value() && requested_document_ids.has_value())
+        return fail("Cannot specify both 'frameIds' and 'documentIds'"sv);
+
+    auto kind = PendingScriptingInjection::Kind::ExecuteScript;
+    if (method == "scripting.insertCSS"sv)
+        kind = PendingScriptingInjection::Kind::InsertCSS;
+    else if (method == "scripting.removeCSS"sv)
+        kind = PendingScriptingInjection::Kind::RemoveCSS;
+
+    bool main_world = false;
+    bool inject_immediately = false;
+    bool is_user_origin = false;
+    Vector<String> file_paths;
+    Vector<String> file_sources;
+    Optional<String> func_source;
+    Optional<String> args_json;
+    Vector<String> css_keys;
+    Vector<String> css_sources;
+
+    if (kind == PendingScriptingInjection::Kind::ExecuteScript) {
+        auto has_files = injection.has("files"sv) && !injection.get("files"sv)->is_null();
+        auto has_func = injection.has("func"sv) && !injection.get("func"sv)->is_null();
+        if (has_files == has_func)
+            return fail("Exactly one of 'files' or 'func' must be specified"sv);
+
+        if (auto world = injection.get_string("world"sv); world.has_value()) {
+            if (*world == "MAIN"sv)
+                main_world = true;
+            else if (*world != "ISOLATED"sv)
+                return fail("injection.world must be 'ISOLATED' or 'MAIN'"sv);
+        }
+        if (auto immediate = injection.get("injectImmediately"sv); immediate.has_value() && !immediate->is_null()) {
+            if (!immediate->is_bool())
+                return fail("injection.injectImmediately must be a boolean"sv);
+            inject_immediately = immediate->as_bool();
+        }
+
+        if (has_files) {
+            if (injection.has("argsJSON"sv) && !injection.get("argsJSON"sv)->is_null())
+                return fail("'args' may only be specified with 'func'"sv);
+            auto files_array = injection.get_array("files"sv);
+            if (!files_array.has_value() || files_array->is_empty())
+                return fail("injection.files must be a non-empty array"sv);
+            Vector<String> raw_paths;
+            for (auto const& item : files_array->values()) {
+                if (!item.is_string() || item.as_string().is_empty())
+                    return fail("injection.files entries must be non-empty strings"sv);
+                raw_paths.append(item.as_string());
+            }
+            auto resolved = m_manager.resolve_scripting_js_files(extension_id, raw_paths);
+            if (resolved.is_error())
+                return fail(resolved.error());
+            for (auto& file : resolved.value()) {
+                file_paths.append(move(file.path));
+                file_sources.append(move(file.content));
+            }
+        } else {
+            auto func = injection.get_string("func"sv);
+            if (!func.has_value() || func->is_empty())
+                return fail("injection.func must be a function"sv);
+            func_source = *func;
+            if (auto args = injection.get_string("argsJSON"sv); args.has_value())
+                args_json = *args;
+        }
+    } else {
+        auto has_css = injection.has("css"sv) && !injection.get("css"sv)->is_null();
+        auto has_files = injection.has("files"sv) && !injection.get("files"sv)->is_null();
+        if (has_css == has_files)
+            return fail("Exactly one of 'css' or 'files' must be specified"sv);
+
+        auto origin = injection.get_string("origin"sv).value_or("AUTHOR"_string);
+        if (origin != "AUTHOR"sv && origin != "USER"sv)
+            return fail("injection.origin must be 'AUTHOR' or 'USER'"sv);
+        is_user_origin = origin == "USER"sv;
+
+        if (has_css) {
+            auto css = injection.get_string("css"sv);
+            if (!css.has_value())
+                return fail("injection.css must be a string"sv);
+            css_keys.append(MUST(String::formatted("{}:css:{}", origin, *css)));
+            css_sources.append(*css);
+        } else {
+            auto files_array = injection.get_array("files"sv);
+            if (!files_array.has_value() || files_array->is_empty())
+                return fail("injection.files must be a non-empty array"sv);
+            Vector<String> raw_paths;
+            for (auto const& item : files_array->values()) {
+                if (!item.is_string() || item.as_string().is_empty())
+                    return fail("injection.files entries must be non-empty strings"sv);
+                raw_paths.append(item.as_string());
+            }
+            if (kind == PendingScriptingInjection::Kind::RemoveCSS) {
+                auto normalized = m_manager.normalize_scripting_file_paths(raw_paths);
+                if (normalized.is_error())
+                    return fail(normalized.error());
+                for (auto const& path : normalized.value())
+                    css_keys.append(MUST(String::formatted("{}:file:{}", origin, path)));
+            } else {
+                auto resolved = m_manager.resolve_scripting_css_files(extension_id, raw_paths);
+                if (resolved.is_error())
+                    return fail(resolved.error());
+                for (auto& file : resolved.value()) {
+                    css_keys.append(MUST(String::formatted("{}:file:{}", origin, file.path)));
+                    css_sources.append(move(file.content));
+                }
+            }
+        }
+    }
+
+    struct ResolvedTarget {
+        CanonicalNavigable* navigable { nullptr };
+        CanonicalDocument* document { nullptr };
+        WebContentPage* page { nullptr };
+        u64 frame_id { 0 };
+        String document_id_str;
+    };
+    Vector<ResolvedTarget> targets;
+    HashTable<u64> found_frame_ids;
+    HashTable<String> found_document_ids;
+    bool top_frame_denied = false;
+    bool explicit_target_denied = false;
+
+    target_tab->traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
+        auto& document = navigable.active_document();
+        auto host = document.host();
+        if (!host || !host->is_open() || host->client().is_private() == IsPrivate::Yes)
+            return IterationDecision::Continue;
+        auto frame_id = navigable.extension_frame_id();
+        auto doc_id_str = MUST(String::formatted("{}", document.id()));
+
+        bool selected = false;
+        if (requested_frame_ids.has_value()) {
+            if (requested_frame_ids->contains_slow(frame_id)) {
+                selected = true;
+                found_frame_ids.set(frame_id);
+            }
+        } else if (requested_document_ids.has_value()) {
+            if (requested_document_ids->contains_slow(doc_id_str)) {
+                selected = true;
+                found_document_ids.set(doc_id_str);
+            }
+        } else if (all_frames) {
+            selected = true;
+        } else {
+            selected = navigable.is_top_level_traversable();
+        }
+        if (!selected)
+            return IterationDecision::Continue;
+
+        Optional<URL::Origin> initiator_origin;
+        if (auto const& entry = navigable.active_session_history_entry())
+            initiator_origin = entry->document_state->initiator_origin;
+
+        auto allowed = m_manager.extension_has_host_permission(extension_id, navigable.active_document_url(), document.origin(), initiator_origin)
+            || has_active_tab_grant(extension_id, *tab_id, navigable.active_document_url(), document.origin(), initiator_origin);
+        if (!allowed) {
+            if (navigable.is_top_level_traversable())
+                top_frame_denied = true;
+            if (!all_frames)
+                explicit_target_denied = true;
+            return IterationDecision::Continue;
+        }
+
+        targets.append({
+            .navigable = &navigable,
+            .document = &document,
+            .page = host.ptr(),
+            .frame_id = frame_id,
+            .document_id_str = move(doc_id_str),
+        });
+        return IterationDecision::Continue;
+    });
+
+    if (requested_frame_ids.has_value()) {
+        for (auto frame_id : *requested_frame_ids) {
+            if (!found_frame_ids.contains(frame_id))
+                return fail(MUST(String::formatted("No frame with id {} in tab {}.", frame_id, *tab_id)));
+        }
+    }
+    if (requested_document_ids.has_value()) {
+        for (auto const& doc_id : *requested_document_ids) {
+            if (!found_document_ids.contains(doc_id))
+                return fail(MUST(String::formatted("No document with id {} in tab {}.", doc_id, *tab_id)));
+        }
+    }
+    if (top_frame_denied || explicit_target_denied)
+        return fail("Cannot access contents of the page. Extension manifest must request permission to access the respective host."sv);
+    if (targets.is_empty())
+        return fail("No target frames available."sv);
+
+    auto injection_id = ++m_next_scripting_injection_id;
+    PendingScriptingInjection pending;
+    pending.kind = kind;
+    pending.caller = caller_client;
+    pending.caller_key = &caller_client;
+    pending.call_id = call_id;
+    pending.context_id = context_id;
+    pending.remaining = targets.size();
+
+    for (u32 index = 0; index < targets.size(); ++index) {
+        auto& target = targets[index];
+        auto& target_client = target.page->client();
+        pending.targets.append({
+            .client = target_client,
+            .client_key = &target_client,
+            .frame_id = target.frame_id,
+            .document_id = target.document_id_str,
+        });
+
+        // Authorize newly injected ISOLATED-world contexts for message ports on this document.
+        if (kind == PendingScriptingInjection::Kind::ExecuteScript && !main_world) {
+            Optional<URL::Origin> initiator_origin;
+            if (auto const& entry = target.navigable->active_session_history_entry())
+                initiator_origin = entry->document_state->initiator_origin;
+            snapshot_content_script_authorization(*target.navigable, *target.document, initiator_origin);
+            target.document->authorized_content_script_extensions().set(extension_id);
+        }
+    }
+
+    m_pending_scripting_injections.set(injection_id, move(pending));
+
+    for (u32 index = 0; index < targets.size(); ++index) {
+        auto& target = targets[index];
+        auto& target_client = target.page->client();
+        if (kind == PendingScriptingInjection::Kind::ExecuteScript) {
+            target_client.async_execute_extension_script(injection_id, index, extension_id, target.page->id(), target.document->id(), main_world, inject_immediately, file_paths, file_sources, func_source, args_json);
+        } else if (kind == PendingScriptingInjection::Kind::InsertCSS) {
+            target_client.async_insert_extension_css(injection_id, index, extension_id, target.page->id(), target.document->id(), css_keys, css_sources, is_user_origin);
+        } else {
+            target_client.async_remove_extension_css(injection_id, index, extension_id, target.page->id(), target.document->id(), css_keys);
+        }
+    }
+}
+
+void ExtensionHost::did_complete_script_injection(WebContentClient& client, u64 injection_id, u32 target_index, bool succeeded, String const& result_json, String const& error)
+{
+    auto it = m_pending_scripting_injections.find(injection_id);
+    if (it == m_pending_scripting_injections.end() || it->value.kind != PendingScriptingInjection::Kind::ExecuteScript)
+        return;
+    auto& pending = it->value;
+    if (target_index >= pending.targets.size())
+        return;
+    auto& target = pending.targets[target_index];
+    if (target.completed || target.client_key != &client)
+        return;
+
+    target.completed = true;
+    target.succeeded = succeeded;
+    target.error = error;
+    if (succeeded && !result_json.is_empty())
+        target.result_json = result_json;
+    if (pending.remaining > 0)
+        --pending.remaining;
+    if (pending.remaining == 0)
+        finish_scripting_injection(injection_id);
+}
+
+void ExtensionHost::did_complete_css_injection(WebContentClient& client, u64 injection_id, u32 target_index, bool succeeded, String const& error)
+{
+    auto it = m_pending_scripting_injections.find(injection_id);
+    if (it == m_pending_scripting_injections.end() || it->value.kind == PendingScriptingInjection::Kind::ExecuteScript)
+        return;
+    auto& pending = it->value;
+    if (target_index >= pending.targets.size())
+        return;
+    auto& target = pending.targets[target_index];
+    if (target.completed || target.client_key != &client)
+        return;
+
+    target.completed = true;
+    target.succeeded = succeeded;
+    target.error = error;
+    if (pending.remaining > 0)
+        --pending.remaining;
+    if (pending.remaining == 0)
+        finish_scripting_injection(injection_id);
+}
+
+void ExtensionHost::finish_scripting_injection(u64 injection_id)
+{
+    auto pending = m_pending_scripting_injections.take(injection_id);
+    if (!pending.has_value())
+        return;
+    auto caller = pending->caller.strong_ref();
+    if (!caller || !caller->is_open())
+        return;
+
+    if (pending->kind == PendingScriptingInjection::Kind::ExecuteScript) {
+        JsonArray results;
+        Optional<String> first_error;
+        for (auto const& target : pending->targets) {
+            if (!target.succeeded) {
+                if (!first_error.has_value() && !target.error.is_empty())
+                    first_error = target.error;
+                continue;
+            }
+            JsonObject entry;
+            entry.set("frameId"sv, target.frame_id);
+            entry.set("documentId"sv, target.document_id);
+            if (target.result_json.has_value())
+                entry.set("resultJSON"sv, *target.result_json);
+            results.must_append(move(entry));
+        }
+        if (results.is_empty() && first_error.has_value()) {
+            caller->async_extension_api_call_completed(pending->call_id, pending->context_id, false, JsonValue { *first_error }.serialized());
+            return;
+        }
+        caller->async_extension_api_call_completed(pending->call_id, pending->context_id, true, JsonValue { move(results) }.serialized());
+        return;
+    }
+
+    bool any_succeeded = false;
+    Optional<String> first_error;
+    for (auto const& target : pending->targets) {
+        if (target.succeeded)
+            any_succeeded = true;
+        else if (!first_error.has_value() && !target.error.is_empty())
+            first_error = target.error;
+    }
+    if (!any_succeeded && first_error.has_value()) {
+        caller->async_extension_api_call_completed(pending->call_id, pending->context_id, false, JsonValue { *first_error }.serialized());
+        return;
+    }
+    caller->async_extension_api_call_completed(pending->call_id, pending->context_id, true, String {});
 }
 
 }

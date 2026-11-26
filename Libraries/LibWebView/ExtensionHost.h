@@ -43,7 +43,7 @@ public:
     // (Re)starts the background page of every extension that has one, or of the given one.
     void start_background_pages(Optional<StringView> only_extension_id = {});
 
-    void handle_api_call(WebContentClient&, Web::PageId, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json);
+    void handle_api_call(WebContentClient&, Web::PageId, Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json);
     void did_handle_message(WebContentClient&, u64 delivery_id, u8 status, String const& response_json);
 
     void connect_port(WebContentClient&, Web::PageId, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id, String const& extension_id, String const& name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id);
@@ -52,6 +52,8 @@ public:
     void post_port_message(WebContentClient&, u64 context_id, u64 local_port_id, String const& message_json);
     void disconnect_port(WebContentClient&, u64 context_id, u64 local_port_id);
     void disconnect_context_ports(WebContentClient&, u64 context_id);
+    void did_complete_script_injection(WebContentClient&, u64 injection_id, u32 target_index, bool succeeded, String const& result_json, String const& error);
+    void did_complete_css_injection(WebContentClient&, u64 injection_id, u32 target_index, bool succeeded, String const& error);
     void on_client_disconnected(WebContentClient&);
     enum class RetainPendingGeneration : u8 {
         No,
@@ -63,7 +65,7 @@ public:
     u64 minimum_retained_extension_generation() const;
 
     // An extension's popup acts for the tab of the window it was opened from.
-    void set_tab_of_popup(u64 popup_view_id, u64 tab_view_id);
+    void set_tab_of_popup(u64 popup_view_id, u64 tab_view_id, String const& extension_id);
 
     // What the network rules of the extensions make of a request of a page.
     void evaluate_network_request(WebContentClient&, u64 request_id, DeclarativeNetRequest::Request const&, ExtensionNetworkRules::FrameContext const&);
@@ -77,6 +79,7 @@ public:
         Optional<Utf16String> title {};
     };
     void on_tab_created(ViewImplementation&);
+    void on_tab_document_committed(ViewImplementation&);
     void on_tab_updated(ViewImplementation&, TabUpdate const&);
     void on_tab_activated(ViewImplementation&);
     void on_tab_removed(u64 view_id);
@@ -107,6 +110,11 @@ private:
     void disconnect_port_endpoint_internal(WebContentClient const&, u64 local_port_id, Optional<u64> required_context_id, PortDisconnectReason);
     void finish_tab_remove(u64 remove_id);
     void fail_pending_tab_removes_for(u64 tab_id, StringView error_message);
+    void grant_active_tab(String const& extension_id, u64 tab_view_id);
+    void revoke_active_tab_grants_for_tab(u64 tab_view_id, Optional<URL::Origin> const& current_origin = {});
+    bool has_active_tab_grant(StringView extension_id, u64 tab_view_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin = {}) const;
+    void execute_scripting_injection(WebContentClient&, u64 context_id, u64 call_id, String const& extension_id, StringView method, JsonObject const& injection);
+    void finish_scripting_injection(u64 injection_id);
 
     ExtensionManager& m_manager;
     HashMap<String, NonnullOwnPtr<HeadlessWebView>> m_background_pages;
@@ -180,6 +188,46 @@ private:
         size_t queued_message_bytes { 0 };
         RefPtr<Core::Timer> open_timeout_timer {};
     };
+    struct PendingScriptingInjection {
+        enum class Kind : u8 {
+            ExecuteScript,
+            InsertCSS,
+            RemoveCSS,
+        };
+        struct TargetState {
+            WeakPtr<WebContentClient> client;
+            WebContentClient const* client_key { nullptr };
+            u64 frame_id { 0 };
+            String document_id;
+            bool completed { false };
+            bool succeeded { false };
+            Optional<String> result_json {};
+            String error {};
+        };
+        Kind kind { Kind::ExecuteScript };
+        WeakPtr<WebContentClient> caller;
+        WebContentClient const* caller_key { nullptr };
+        u64 call_id { 0 };
+        u64 context_id { 0 };
+        Vector<TargetState> targets {};
+        size_t remaining { 0 };
+    };
+    HashMap<u64, PendingScriptingInjection> m_pending_scripting_injections;
+    u64 m_next_scripting_injection_id { 0 };
+
+    struct ActiveTabGrantKey {
+        String extension_id;
+        u64 tab_view_id { 0 };
+        bool operator==(ActiveTabGrantKey const&) const = default;
+    };
+    struct ActiveTabGrantKeyTraits : public AK::Traits<ActiveTabGrantKey> {
+        static unsigned hash(ActiveTabGrantKey const& key)
+        {
+            return pair_int_hash(key.extension_id.hash(), u64_hash(key.tab_view_id));
+        }
+    };
+    HashMap<ActiveTabGrantKey, URL::Origin, ActiveTabGrantKeyTraits> m_active_tab_grants;
+
     HashMap<u64, PortChannel> m_port_channels;
     HashMap<PortEndpointKey, u64, PortEndpointKeyTraits> m_endpoint_to_channel;
     u64 m_next_port_channel_id { 0 };

@@ -160,6 +160,7 @@ if (NOT WIN32)
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
         TestExtensionPorts.cpp
+        TestExtensionScripting.cpp
         TestFavicon.cpp
         TestFileDownloader.cpp
         TestFocusWithoutSystemFocus.cpp

@@ -265,6 +265,9 @@ private:
     virtual void open_extension_port(u64 channel_id, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool target_extension_page, u64 excluded_context_id, String name, String sender) override;
     virtual void deliver_extension_port_message(u64 context_id, u64 local_port_id, String message) override;
     virtual void disconnect_extension_port_endpoint(u64 context_id, u64 local_port_id, String error, bool notify) override;
+    virtual void execute_extension_script(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool main_world, bool inject_immediately, Vector<String> file_paths, Vector<String> file_sources, Optional<String> func_source, Optional<String> args_json) override;
+    virtual void insert_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys, Vector<String> css_sources, bool is_user_origin) override;
+    virtual void remove_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys) override;
 
     virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
     virtual void set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) override;

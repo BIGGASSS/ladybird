@@ -1672,8 +1672,13 @@ pub(crate) unsafe fn run_style_update(
     let mut functions = std::mem::take(&mut engine.document_functions);
     // SAFETY: The host lends the custom functions the inputs name for this call.
     unsafe {
-        functions.take_in(&mut computation_inputs, &engine.document_media, |scope, layer| {
-            engine.layer_index(scope, layer)
+        functions.take_in(&mut computation_inputs, &engine.document_media, |origin, scope, layer| {
+            let origin = match origin {
+                0 => CascadeOrigin::UserAgent,
+                1 => CascadeOrigin::User,
+                _ => CascadeOrigin::Author,
+            };
+            engine.layer_index_for_origin(origin, scope, layer)
         });
     }
     engine.document_functions = functions;

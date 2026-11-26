@@ -158,7 +158,7 @@ private:
     virtual Messages::HubServer::InstallExtensionResponse install_extension(ByteString path) override;
     virtual Messages::HubServer::ExtensionActionsResponse extension_actions() override;
     virtual void click_extension_action(String extension_id, u64 tab_view_id) override;
-    virtual void set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id) override;
+    virtual void set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id, String extension_id) override;
     virtual void answer_clipboard_text(u64 request_id, Utf16String text) override;
     virtual void answer_clipboard_item(u64 request_id, Web::Clipboard::SystemClipboardItem item) override;
     virtual void answer_download_path(u64 request_id, Optional<ByteString> path) override;

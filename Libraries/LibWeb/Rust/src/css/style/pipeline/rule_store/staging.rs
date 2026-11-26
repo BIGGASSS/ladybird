@@ -131,6 +131,7 @@ pub(in crate::css::style) struct ProgramStaging {
     rule_gated_by_container_query: StagedField<RuleID, bool>,
     rule_liveness: StagedField<RuleID, bool>,
     layer_orders: StagedField<TreeScopeID, HashMap<CascadeLayerID, u32>>,
+    user_layer_orders: StagedField<TreeScopeID, HashMap<CascadeLayerID, u32>>,
     scopes_using_document_sheets: StagedField<TreeScopeID, bool>,
     sheets_in_scope: StagedField<TreeScopeID, Vec<SheetID>>,
     sheet_rule_replacements: Column<Option<SheetRuleReplacement>>,
@@ -151,6 +152,7 @@ impl ProgramStaging {
             || !self.rule_gated_by_container_query.is_empty()
             || !self.rule_liveness.is_empty()
             || !self.layer_orders.is_empty()
+            || !self.user_layer_orders.is_empty()
             || !self.scopes_using_document_sheets.is_empty()
             || !self.sheets_in_scope.is_empty()
             || self.sheet_rule_replacements.iter().any(Option::is_some)
@@ -186,6 +188,7 @@ impl ProgramStaging {
         self.rule_gated_by_container_query.clear();
         self.rule_liveness.clear();
         self.layer_orders.clear();
+        self.user_layer_orders.clear();
         self.scopes_using_document_sheets.clear();
         self.sheets_in_scope.clear();
         for index in 0..self.sheet_rule_replacements.len() {
@@ -280,9 +283,48 @@ impl StyleEngine {
             .stage(scope, || self.retained.rules.layer_ranks(scope), ranks);
     }
 
+    /// Put the qualified layer names in the order the user origin declares them in.
+    pub fn set_user_layer_order(&mut self, layers: &[CascadeLayerID]) {
+        let ranks = RuleStore::layer_ranks_in_order(layers);
+        let pending_order = self.host.program_staging.user_layer_orders.after(TreeScopeID::DOCUMENT);
+        if pending_order.map_or_else(
+            || self.retained.rules.user_layer_ranks_match(&ranks),
+            |pending| pending == &ranks,
+        ) {
+            return;
+        }
+        self.host.program_staging.user_layer_orders.stage(
+            TreeScopeID::DOCUMENT,
+            || self.retained.rules.user_layer_ranks(),
+            ranks,
+        );
+    }
+
     /// The dense layer rank consumed by the C++ property cascade and non-style rule lookup.
+    #[cfg(test)]
     #[must_use]
     pub fn layer_index(&self, scope: TreeScopeID, layer: CascadeLayerID) -> u32 {
+        self.layer_index_for_origin(CascadeOrigin::Author, scope, layer)
+    }
+
+    #[must_use]
+    pub fn layer_index_for_origin(&self, origin: CascadeOrigin, scope: TreeScopeID, layer: CascadeLayerID) -> u32 {
+        if origin == CascadeOrigin::User {
+            return self
+                .host
+                .program_staging
+                .user_layer_orders
+                .after(TreeScopeID::DOCUMENT)
+                .map_or_else(
+                    || self.retained.rules.layer_index_for_origin(origin, scope, layer),
+                    |ranks| {
+                        ranks
+                            .get(&layer)
+                            .copied()
+                            .unwrap_or_else(|| u32::try_from(ranks.len()).expect("cascade layer count exhausted"))
+                    },
+                );
+        }
         self.host.program_staging.layer_orders.after(scope).map_or_else(
             || self.retained.rules.layer_index(scope, layer),
             |ranks| {
@@ -567,11 +609,18 @@ impl StyleEngine {
         changes.sheets.sort_unstable();
         changes.sheets.dedup();
 
-        changes.layered_scopes = moved(staging.layer_orders.pairs()).collect();
+        changes.layered_scopes = moved(staging.layer_orders.pairs())
+            .chain(moved(staging.user_layer_orders.pairs()))
+            .collect();
+        changes.layered_scopes.sort_unstable();
+        changes.layered_scopes.dedup();
         // NB: A scope's first layer order places no layered rule that was there before it.
         changes
             .reordered_scopes
             .extend(moved(staging.layer_orders.pairs()).filter(|&scope| program.layer_order_is_initialized(scope)));
+        changes
+            .reordered_scopes
+            .extend(moved(staging.user_layer_orders.pairs()).filter(|_| program.user_layer_order_is_initialized()));
         changes.reordered_scopes.sort_unstable();
         changes.reordered_scopes.dedup();
         changes
@@ -622,10 +671,14 @@ impl StyleEngine {
         }
 
         let layer_orders = self.host.program_staging.layer_orders.take_dirty();
+        let user_layer_orders = self.host.program_staging.user_layer_orders.take_dirty();
         let scopes = self.host.program_staging.scopes_using_document_sheets.take_dirty();
-        if !layer_orders.is_empty() || !scopes.is_empty() {
+        if !layer_orders.is_empty() || !user_layer_orders.is_empty() || !scopes.is_empty() {
             for (scope, ranks) in layer_orders {
                 self.retained.rules.set_layer_ranks(scope, ranks);
+            }
+            for (_, ranks) in user_layer_orders {
+                self.retained.rules.set_user_layer_ranks(ranks);
             }
             for (scope, uses_document_sheets) in scopes {
                 if uses_document_sheets {

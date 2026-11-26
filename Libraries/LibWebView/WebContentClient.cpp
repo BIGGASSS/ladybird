@@ -1060,6 +1060,18 @@ void WebContentClient::disconnect_extension_context_ports(u64 context_id)
         host->disconnect_context_ports(*this, context_id);
 }
 
+void WebContentClient::did_complete_extension_script_injection(u64 injection_id, u32 target_index, bool succeeded, String result_json, String error)
+{
+    if (auto* host = Application::the().extension_host())
+        host->did_complete_script_injection(*this, injection_id, target_index, succeeded, result_json, error);
+}
+
+void WebContentClient::did_complete_extension_css_injection(u64 injection_id, u32 target_index, bool succeeded, String error)
+{
+    if (auto* host = Application::the().extension_host())
+        host->did_complete_css_injection(*this, injection_id, target_index, succeeded, error);
+}
+
 void WebContentClient::did_change_extension_storage(String extension_id, String area, String changes)
 {
     Application::the().extension_storage_did_change({}, *this, extension_id, area, changes);

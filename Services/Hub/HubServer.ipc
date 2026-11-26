@@ -242,7 +242,7 @@ endpoint HubServer
     install_extension(ByteString path) => (Optional<String> name, String error)
     extension_actions() => (Vector<Hub::ExtensionAction> actions)
     click_extension_action(String extension_id, u64 tab_view_id) =|
-    set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id) =|
+    set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id, String extension_id) =|
     answer_clipboard_text(u64 request_id, Utf16String text) =|
     answer_clipboard_item(u64 request_id, Web::Clipboard::SystemClipboardItem item) =|
     answer_download_path(u64 request_id, Optional<ByteString> path) =|
