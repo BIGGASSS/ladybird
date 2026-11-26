@@ -847,6 +847,7 @@ public:
     Optional<HTTP::Cookie::SameSiteStatus> navigation_same_site_status;
     Optional<URL::Origin> inline_content_origin;
     Optional<CrossProcessId> document_id;
+    Optional<u64> extension_generation;
 
     void apply_to(NonnullRefPtr<SessionHistoryEntry> entry);
 

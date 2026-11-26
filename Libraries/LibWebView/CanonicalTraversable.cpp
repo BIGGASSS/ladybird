@@ -1615,6 +1615,9 @@ void CanonicalTraversable::send_changing_navigable_continuation_task(HistoryOper
     VERIFY(changing_navigable.continuation.has_value());
     auto endpoint = changing_job_endpoint(changing_navigable);
     auto continuation = *changing_navigable.continuation;
+    Optional<u64> extension_generation;
+    if (auto const& populated = changing_navigable.target_entry->document_state->populated_document; populated.has_value())
+        extension_generation = populated->document->extension_generation();
     endpoint->owe_reply({ OwedReply::Kind::ContinuationApplied, operation.operation_id, changing_navigable.id });
     endpoint->async_apply_changing_navigable_continuation(
         operation.operation_id, changing_navigable.id, changing_navigable.target_entry->identity(),
@@ -1622,7 +1625,8 @@ void CanonicalTraversable::send_changing_navigable_continuation_task(HistoryOper
         continuation.history_object_length_and_index.script_history_index,
         move(continuation.entries_for_navigation_api),
         changing_navigable.clears_classic_history_api_state,
-        changing_navigable.clears_navigable_target_name);
+        changing_navigable.clears_navigable_target_name,
+        extension_generation);
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
@@ -1650,6 +1654,9 @@ void CanonicalTraversable::send_displayed_document_unload_task(HistoryOperation&
     }
 
     auto continuation = *changing_navigable.continuation;
+    Optional<u64> extension_generation;
+    if (auto const& populated = document_state.populated_document; populated.has_value())
+        extension_generation = populated->document->extension_generation();
     endpoint->owe_reply({ OwedReply::Kind::ContinuationApplied, operation.operation_id, changing_navigable.id });
     endpoint->async_unload_displayed_document_and_apply_changing_navigable_continuation(
         operation.operation_id, changing_navigable.id, changing_navigable.target_entry->identity(),
@@ -1657,7 +1664,8 @@ void CanonicalTraversable::send_displayed_document_unload_task(HistoryOperation&
         continuation.history_object_length_and_index.script_history_index,
         move(continuation.entries_for_navigation_api),
         changing_navigable.clears_classic_history_api_state,
-        changing_navigable.clears_navigable_target_name);
+        changing_navigable.clears_navigable_target_name,
+        extension_generation);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#deactivate-a-document-for-a-cross-document-navigation

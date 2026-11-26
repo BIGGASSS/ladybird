@@ -573,6 +573,8 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_about_base_url = navigation_params.about_base_url;
     document->set_url(*creation_url);
     document->set_id(navigation_params.document_id.has_value() ? *navigation_params.document_id : browsing_context->page().client().allocate_cross_process_id());
+    if (navigation_params.extension_generation.has_value())
+        Extensions::ExtensionRegistry::the().snapshot_extensions_for_document(*document, navigation_params.extension_generation);
 
     // AD-HOC: Record when the readiness becomes "loading" for PerformanceTiming's domLoading. The window is not yet
     //         associated with document, so relate the time to loadTimingInfo directly.
@@ -972,6 +974,7 @@ void Document::finalize()
         m_layout_node_arena->set_document({}, nullptr);
     }
     CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
+    Extensions::ExtensionRegistry::the().did_destroy_document(*this);
     Base::finalize();
     HTML::main_thread_event_loop().unregister_document({}, *this);
 }
@@ -5050,7 +5053,7 @@ void Document::update_readiness(HTML::DocumentReadyState readiness_value)
     //         Chrome.
     if (readiness_value == HTML::DocumentReadyState::Interactive) {
         Extensions::ExtensionRegistry::the().run_content_scripts(*this, Extensions::RunAt::DocumentEnd);
-        if (Extensions::ExtensionRegistry::the().has_extensions() && !m_extension_idle_timer) {
+        if (Extensions::ExtensionRegistry::the().has_extensions_for_document(*this) && !m_extension_idle_timer) {
             m_extension_idle_timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(200), GC::create_function(heap(), GC::captures(GC::Ref { *this }), [](auto& document) {
                 HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*document), GC::create_function(document->heap(), GC::captures(document), [](auto& document) {
                     Extensions::ExtensionRegistry::the().run_content_scripts(*document, Extensions::RunAt::DocumentIdle);
@@ -6501,6 +6504,7 @@ void Document::destroy()
     for (auto& context : m_extension_contexts)
         context->detach();
     m_extension_contexts.clear();
+    Extensions::ExtensionRegistry::the().did_destroy_document(*this);
 
     // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable().
     //         Tear the layout tree down now instead of holding it until finalization.
@@ -7051,6 +7055,9 @@ void Document::did_stop_being_active_document_in_navigable()
 {
     page().active_media_session_tracker().document_became_inactive(*this);
 
+    for (auto& context : m_extension_contexts)
+        Extensions::ExtensionRegistry::the().disconnect_ports_of_context(context->id(), Extensions::ExtensionRegistry::NotifyLocalPorts::Yes);
+
     stop_compositor_animation_timers();
     tear_down_layout_tree();
 
@@ -7558,6 +7565,7 @@ void Document::make_active()
     // 3. Set document's browsing context's WindowProxy's [[Window]] internal slot value to window.
     m_browsing_context->set_active_window(window);
 
+    Extensions::ExtensionRegistry::the().snapshot_extensions_for_document(*this);
     snapshot_dynamic_extension_style_sheet();
 
     auto current_navigable = this->navigable();
@@ -7595,7 +7603,7 @@ void Document::make_active()
     // AD-HOC: Content scripts run once the document is active. Those of document_start run as soon as the document
     //         element exists, but a document that has none, or that got further before it became active, gets those
     //         of the stages it has reached here.
-    if (Extensions::ExtensionRegistry::the().has_extensions()) {
+    if (Extensions::ExtensionRegistry::the().has_extensions_for_document(*this)) {
         HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*this), GC::create_function(heap(), GC::captures(GC::Ref { *this }), [](auto& document) {
             // NB: A document that is still loading gets its document element from the parser, which runs them then.
             if (document->readiness() == HTML::DocumentReadyState::Loading && !document->document_element())

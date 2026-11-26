@@ -83,6 +83,9 @@ struct NavigationParams : GC::Cell {
     // AD-HOC: The id the UI process gave the new Document.
     Optional<CrossProcessId> document_id;
 
+    // AD-HOC: The extension registration generation selected by the UI process for the new Document.
+    Optional<u64> extension_generation;
+
     // AD-HOC: The group of the new top-level browsing context the UI process obtained for the new Document, when a
     //         browsing context group switch gave it one.
     Optional<u64> new_browsing_context_group_id;

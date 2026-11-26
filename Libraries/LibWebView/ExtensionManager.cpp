@@ -789,6 +789,7 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
         extension_ids.append(extension.id);
     m_network_rules.set_extensions(extension_ids, [this](StringView id) -> JsonObject const& { return *m_manifests.get(id); });
     m_extensions_buffer = buffer.release_value();
+    ++m_generation;
     return {};
 }
 
@@ -1197,6 +1198,120 @@ bool ExtensionManager::extension_has_scripting_permission(StringView extension_i
     return manifest.has_value() && manifest_has_scripting_permission(*manifest);
 }
 
+static Optional<URL::URL> origin_to_match_url(URL::Origin const& origin)
+{
+    if (origin.is_opaque())
+        return {};
+    return URL::Parser::basic_parse(ByteString::formatted("{}/", origin.serialize()));
+}
+
+static Optional<URL::URL> url_for_content_script_match(URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin, bool match_about_blank, bool match_origin_as_fallback, bool is_dynamic)
+{
+    if (!document_url.scheme().is_one_of("about"sv, "blob"sv, "data"sv))
+        return document_url;
+
+    if (!match_about_blank && !match_origin_as_fallback) {
+        if (!is_dynamic && document_url.scheme() == "data"sv)
+            return document_url;
+        return {};
+    }
+
+    if (auto matched = origin_to_match_url(document_origin); matched.has_value())
+        return matched;
+
+    if (!match_origin_as_fallback)
+        return {};
+
+    if (initiator_origin.has_value()) {
+        if (auto matched = origin_to_match_url(*initiator_origin); matched.has_value())
+            return matched;
+    }
+    return {};
+}
+
+bool ExtensionManager::extension_can_run_content_script(StringView extension_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin, bool is_top_level) const
+{
+    auto base_data = m_base_extension_data.get(extension_id);
+    if (!base_data.has_value())
+        return false;
+
+    auto string_array_matches = [](JsonArray const& array, auto const& predicate) {
+        for (auto const& value : array.values()) {
+            if (value.is_string() && predicate(value.as_string()))
+                return true;
+        }
+        return false;
+    };
+
+    if (auto content_scripts = base_data->get_array("content_scripts"sv); content_scripts.has_value()) {
+        for (auto const& value : content_scripts->values()) {
+            if (!value.is_object())
+                continue;
+            auto const& script = value.as_object();
+            if (script.get_bool("main_world"sv).value_or(false))
+                continue;
+            auto js = script.get_array("js"sv);
+            if (!js.has_value() || js->is_empty())
+                continue;
+            if (!script.get_bool("all_frames"sv).value_or(false) && !is_top_level)
+                continue;
+            auto matched_url = url_for_content_script_match(
+                document_url,
+                document_origin,
+                initiator_origin,
+                script.get_bool("match_about_blank"sv).value_or(false),
+                script.get_bool("match_origin_as_fallback"sv).value_or(false),
+                false);
+            if (!matched_url.has_value())
+                continue;
+            auto matches = script.get_array("matches"sv);
+            if (!matches.has_value() || !string_array_matches(*matches, [&](String const& pattern) { return Web::Extensions::match_pattern_matches(pattern, *matched_url); }))
+                continue;
+            if (auto exclude_matches = script.get_array("exclude_matches"sv); exclude_matches.has_value()
+                && string_array_matches(*exclude_matches, [&](String const& pattern) { return Web::Extensions::match_pattern_matches(pattern, *matched_url); }))
+                continue;
+            auto serialized_url = matched_url->serialize();
+            if (auto include_globs = script.get_array("include_globs"sv); include_globs.has_value() && !include_globs->is_empty()
+                && !string_array_matches(*include_globs, [&](String const& glob) { return Web::Extensions::glob_matches(glob, serialized_url); }))
+                continue;
+            if (auto exclude_globs = script.get_array("exclude_globs"sv); exclude_globs.has_value()
+                && string_array_matches(*exclude_globs, [&](String const& glob) { return Web::Extensions::glob_matches(glob, serialized_url); }))
+                continue;
+            return true;
+        }
+    }
+
+    if (auto registered = m_registered_content_scripts.get(extension_id); registered.has_value()) {
+        auto host_permissions = base_data->get_array("host_permissions"sv);
+        if (!host_permissions.has_value() || host_permissions->is_empty())
+            return false;
+        for (auto const& script : *registered) {
+            if (script.world == "MAIN"sv || script.js.is_empty())
+                continue;
+            if (!script.all_frames && !is_top_level)
+                continue;
+            auto matched_url = url_for_content_script_match(
+                document_url,
+                document_origin,
+                initiator_origin,
+                false,
+                script.match_origin_as_fallback,
+                true);
+            if (!matched_url.has_value())
+                continue;
+            if (!string_array_matches(*host_permissions, [&](String const& pattern) { return Web::Extensions::host_permission_matches(pattern, *matched_url); }))
+                continue;
+            if (!any_of(script.matches, [&](String const& pattern) { return Web::Extensions::match_pattern_matches(pattern, *matched_url); }))
+                continue;
+            if (any_of(script.exclude_matches, [&](String const& pattern) { return Web::Extensions::match_pattern_matches(pattern, *matched_url); }))
+                continue;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void ExtensionManager::load_content_scripts()
 {
     auto file = Core::File::open(m_content_scripts_path, Core::File::OpenMode::Read);
@@ -1275,6 +1390,7 @@ ErrorOr<void, String> ExtensionManager::commit_content_scripts(StringView extens
     m_registered_content_scripts = move(next_registered);
     m_persisted_content_scripts = move(next_persisted);
     m_extensions_buffer = move(next_buffer);
+    ++m_generation;
     return {};
 }
 

@@ -44,11 +44,18 @@ ExtensionRegistry& ExtensionRegistry::the()
 
 Extension const* ExtensionRegistry::extension(StringView id) const
 {
-    for (auto const& extension : m_extensions->extensions) {
+    for (auto const& extension : m_extensions) {
         if (extension.id == id)
             return &extension;
     }
     return nullptr;
+}
+
+bool ExtensionRegistry::has_extensions_for_document(DOM::Document const& document) const
+{
+    if (auto snapshot = m_document_extension_snapshots.get(&document); snapshot.has_value())
+        return snapshot->generation && !snapshot->generation->extensions.is_empty();
+    return !m_current_injection_generation->extensions.is_empty();
 }
 
 static Vector<String> string_array(JsonObject const& object, StringView key)
@@ -107,9 +114,13 @@ static RunAt run_at_from_string(StringView run_at)
     return RunAt::DocumentIdle;
 }
 
-ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
+static constexpr size_t MAX_PORT_MESSAGE_BYTES = 4 * MiB;
+
+ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes, u64 generation, u64 min_retained_generation)
 {
     Vector<Extension> extensions;
+    auto injection_generation = adopt_ref(*new InjectionGeneration);
+    injection_generation->generation = generation;
     bool has_network_rules = false;
 
     if (!bytes.is_empty()) {
@@ -132,10 +143,13 @@ ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
 
             Extension extension;
             extension.id = *id;
-            extension.manifest_json = object.get_object("manifest"sv).map([](auto const& manifest) { return manifest.serialized(); }).value_or("{}"_string);
-            extension.messages_json = object.get_object("messages"sv).map([](auto const& messages) { return messages.serialized(); }).value_or("{}"_string);
-            extension.ui_language = object.get_string("ui_language"sv).value_or("en-US"_string);
-            extension.host_permissions = string_array(object, "host_permissions"sv);
+
+            InjectionExtension injection_extension;
+            injection_extension.id = *id;
+            injection_extension.manifest_json = object.get_object("manifest"sv).map([](auto const& manifest) { return manifest.serialized(); }).value_or("{}"_string);
+            injection_extension.messages_json = object.get_object("messages"sv).map([](auto const& messages) { return messages.serialized(); }).value_or("{}"_string);
+            injection_extension.ui_language = object.get_string("ui_language"sv).value_or("en-US"_string);
+            injection_extension.host_permissions = string_array(object, "host_permissions"sv);
             // https://developer.chrome.com/docs/extensions/reference/manifest/sandbox
             auto const& manifest = *object.get_object("manifest"sv);
             if (auto sandbox = manifest.get_object("sandbox"sv); sandbox.has_value()) {
@@ -188,7 +202,7 @@ ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
                     if (auto css = content_script_object.get_string("css"sv); css.has_value())
                         content_script.css = Utf16String::from_utf8(*css);
 
-                    extension.content_scripts.append(move(content_script));
+                    injection_extension.content_scripts.append(move(content_script));
                 });
             }
 
@@ -207,13 +221,21 @@ ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
 
             has_network_rules |= object.get_bool("network_rules"sv).value_or(false);
             extensions.append(move(extension));
+            injection_generation->extensions.append(move(injection_extension));
             return {};
         }));
     }
 
-    auto list = adopt_ref(*new ExtensionList);
-    list->extensions = move(extensions);
-    m_extensions = move(list);
+    m_extensions = move(extensions);
+    m_current_injection_generation = injection_generation;
+    m_recent_injection_generations.set(generation, move(injection_generation));
+    Vector<u64> expired_generations;
+    for (auto const& [stored_generation, _] : m_recent_injection_generations) {
+        if (stored_generation < min_retained_generation && stored_generation != generation)
+            expired_generations.append(stored_generation);
+    }
+    for (auto expired : expired_generations)
+        m_recent_injection_generations.remove(expired);
     m_has_network_rules = has_network_rules;
     return {};
 }
@@ -402,9 +424,10 @@ static Optional<URL::URL> origin_to_match_url(URL::Origin const& origin)
     return URL::Parser::basic_parse(ByteString::formatted("{}/", origin.serialize()));
 }
 
-static Optional<URL::URL> url_for_matching(ContentScript const& content_script, DOM::Document const& document)
+Optional<URL::URL> ExtensionRegistry::url_for_matching(ContentScript const& content_script, DOM::Document const& document, bool use_live_document_url) const
 {
-    auto const& url = document.url();
+    auto snapshot = use_live_document_url ? Optional<DocumentExtensionSnapshot const&> {} : m_document_extension_snapshots.get(&document);
+    auto const& url = snapshot.has_value() ? snapshot->creation_url : document.url();
     if (!url.scheme().is_one_of("about"sv, "blob"sv, "data"sv))
         return url;
 
@@ -436,7 +459,7 @@ static Optional<URL::URL> url_for_matching(ContentScript const& content_script, 
     return {};
 }
 
-bool ExtensionRegistry::content_script_matches(Extension const& extension, ContentScript const& content_script, DOM::Document const& document) const
+bool ExtensionRegistry::content_script_matches(InjectionExtension const& extension, ContentScript const& content_script, DOM::Document const& document, bool use_live_document_url) const
 {
     if (!content_script.all_frames) {
         auto navigable = document.navigable();
@@ -444,7 +467,7 @@ bool ExtensionRegistry::content_script_matches(Extension const& extension, Conte
             return false;
     }
 
-    auto url = url_for_matching(content_script, document);
+    auto url = url_for_matching(content_script, document, use_live_document_url);
     if (!url.has_value())
         return false;
 
@@ -467,15 +490,25 @@ bool ExtensionRegistry::content_script_matches(Extension const& extension, Conte
 
 Utf16String ExtensionRegistry::style_sheet_for_document(DOM::Document const& document, ContentScriptKind kind) const
 {
-    auto snapshot = m_extensions;
-    if (snapshot->extensions.is_empty() || document.is_decoded_svg() || !document.browsing_context())
+    if (document.is_decoded_svg() || !document.browsing_context())
+        return {};
+
+    // Static CSS uses the live registry so installing or updating an extension updates open pages on user style invalidation.
+    // Dynamic CSS uses the document's snapshotted generation so it matches the dynamic scripts selected for the document.
+    NonnullRefPtr<InjectionGeneration> generation = m_current_injection_generation;
+    if (kind == ContentScriptKind::Dynamic) {
+        if (auto snapshot = m_document_extension_snapshots.get(&document); snapshot.has_value() && snapshot->generation)
+            generation = *snapshot->generation;
+    }
+    if (generation->extensions.is_empty())
         return {};
 
     bool want_dynamic = kind == ContentScriptKind::Dynamic;
+    bool use_live_document_url = kind == ContentScriptKind::Static;
     Utf16StringBuilder builder;
-    for (auto const& extension : snapshot->extensions) {
+    for (auto const& extension : generation->extensions) {
         for (auto const& content_script : extension.content_scripts) {
-            if (content_script.is_dynamic != want_dynamic || content_script.css.is_empty() || !content_script_matches(extension, content_script, document))
+            if (content_script.is_dynamic != want_dynamic || content_script.css.is_empty() || !content_script_matches(extension, content_script, document, use_live_document_url))
                 continue;
             if (!builder.is_empty())
                 builder.append_ascii('\n');
@@ -527,7 +560,72 @@ static JS::ThrowCompletionOr<JS::Value> api_respond(JS::VM& vm)
     return JS::js_undefined();
 }
 
-static void install_api(ExtensionContext& context, Extension const& extension)
+static constexpr double MAX_SAFE_JS_INTEGER = 9007199254740991.0;
+
+static Optional<u64> safe_u64_from_value(JS::Value value)
+{
+    if (!value.is_number())
+        return {};
+    auto number = value.as_double();
+    if (!isfinite(number) || number < 0.0 || number > MAX_SAFE_JS_INTEGER || trunc(number) != number)
+        return {};
+    return static_cast<u64>(number);
+}
+
+static JS::ThrowCompletionOr<JS::Value> api_port_connect(JS::VM& vm)
+{
+    auto context_id = safe_u64_from_value(vm.argument(0));
+    if (!context_id.has_value())
+        return JS::Value(0);
+    auto name = TRY(string_argument(vm, 1));
+    Optional<u64> target_tab_id;
+    if (!vm.argument(2).is_nullish()) {
+        target_tab_id = safe_u64_from_value(vm.argument(2));
+        if (!target_tab_id.has_value())
+            return JS::Value(0);
+    }
+    Optional<u64> target_frame_id;
+    if (!vm.argument(3).is_nullish()) {
+        target_frame_id = safe_u64_from_value(vm.argument(3));
+        if (!target_frame_id.has_value())
+            return JS::Value(0);
+    }
+    Optional<String> target_document_id;
+    if (!vm.argument(4).is_nullish()) {
+        target_document_id = TRY(string_argument(vm, 4));
+        if (target_document_id->is_empty())
+            return JS::Value(0);
+    }
+    auto local_port_id = ExtensionRegistry::the().connect_port(*context_id, name, target_tab_id, target_frame_id, move(target_document_id));
+    return JS::Value(static_cast<double>(local_port_id));
+}
+
+static JS::ThrowCompletionOr<JS::Value> api_port_post_message(JS::VM& vm)
+{
+    auto context_id = safe_u64_from_value(vm.argument(0));
+    auto local_port_id = safe_u64_from_value(vm.argument(1));
+    if (!context_id.has_value() || !local_port_id.has_value())
+        return JS::js_undefined();
+    if (ExtensionRegistry::the().is_port_deactivated(*context_id, *local_port_id))
+        return JS::throw_completion(JS::Error::create(*vm.current_realm(), "Attempting to use a disconnected port object"_utf16));
+    auto message = TRY(string_argument(vm, 2));
+    if (message.bytes().size() > MAX_PORT_MESSAGE_BYTES)
+        return JS::throw_completion(JS::Error::create(*vm.current_realm(), "Message exceeded maximum allowed size of 4MiB."_utf16));
+    ExtensionRegistry::the().post_port_message(*context_id, *local_port_id, message);
+    return JS::js_undefined();
+}
+
+static JS::ThrowCompletionOr<JS::Value> api_port_disconnect(JS::VM& vm)
+{
+    auto context_id = safe_u64_from_value(vm.argument(0));
+    auto local_port_id = safe_u64_from_value(vm.argument(1));
+    if (!context_id.has_value() || !local_port_id.has_value())
+        return JS::js_undefined();
+    ExtensionRegistry::the().disconnect_port(*context_id, *local_port_id);
+    return JS::js_undefined();
+}
+
+static void install_api(ExtensionContext& context, String const& extension_id, String const& manifest_json, String const& messages_json, String const& ui_language)
 {
     auto& realm = context.realm();
     auto& vm = realm.vm();
@@ -536,7 +634,7 @@ static void install_api(ExtensionContext& context, Extension const& extension)
     auto factory_script = HTML::ClassicScript::create_in_realm("chrome-extension-api.js", Utf16String::from_utf8(extension_api_source), settings, realm, settings.api_base_url());
     auto factory = factory_script->run();
     if (factory.is_abrupt() || !factory.value().is_function()) {
-        dbgln("Unable to create the extension API for {}", extension.id);
+        dbgln("Unable to create the extension API for {}", extension_id);
         return;
     }
 
@@ -547,14 +645,17 @@ static void install_api(ExtensionContext& context, Extension const& extension)
     native->define_native_function(realm, "storageApply"_utf16_fly_string, storage_apply, 3, JS::default_attributes);
     native->define_native_function(realm, "call"_utf16_fly_string, api_call, 3, JS::default_attributes);
     native->define_native_function(realm, "respond"_utf16_fly_string, api_respond, 2, JS::default_attributes);
+    native->define_native_function(realm, "portConnect"_utf16_fly_string, api_port_connect, 5, JS::default_attributes);
+    native->define_native_function(realm, "portPostMessage"_utf16_fly_string, api_port_post_message, 3, JS::default_attributes);
+    native->define_native_function(realm, "portDisconnect"_utf16_fly_string, api_port_disconnect, 2, JS::default_attributes);
 
     auto kind = context.kind() == ExtensionContext::Kind::ContentScript ? "content"_utf16 : "page"_utf16;
     auto result = JS::call(vm, factory.value(), JS::js_undefined(),
         native,
-        JS::PrimitiveString::create(vm, Utf16String::from_utf8(extension.id)),
-        JS::PrimitiveString::create(vm, Utf16String::from_utf8(extension.manifest_json)),
-        JS::PrimitiveString::create(vm, Utf16String::from_utf8(extension.messages_json)),
-        JS::PrimitiveString::create(vm, Utf16String::from_utf8(extension.ui_language)),
+        JS::PrimitiveString::create(vm, Utf16String::from_utf8(extension_id)),
+        JS::PrimitiveString::create(vm, Utf16String::from_utf8(manifest_json)),
+        JS::PrimitiveString::create(vm, Utf16String::from_utf8(messages_json)),
+        JS::PrimitiveString::create(vm, Utf16String::from_utf8(ui_language)),
         JS::PrimitiveString::create(vm, kind),
         JS::Value(static_cast<double>(context.id())));
     if (result.is_error()) {
@@ -570,7 +671,7 @@ static void install_api(ExtensionContext& context, Extension const& extension)
     realm.global_object().define_direct_property("chrome"_utf16_fly_string, api, JS::Attribute::Writable | JS::Attribute::Configurable);
 }
 
-void ExtensionRegistry::inject(DOM::Document& document, Extension const& extension, Vector<ContentScript const*> const& content_scripts)
+void ExtensionRegistry::inject(DOM::Document& document, InjectionExtension const& extension, Vector<ContentScript const*> const& content_scripts)
 {
     for (auto const* content_script : content_scripts) {
         GC::Ptr<ExtensionContext> context;
@@ -579,7 +680,7 @@ void ExtensionRegistry::inject(DOM::Document& document, Extension const& extensi
             if (!context) {
                 context = ExtensionContext::create_for_content_scripts(document, extension.id);
                 document.add_extension_context(*context);
-                install_api(*context, extension);
+                install_api(*context, extension.id, extension.manifest_json, extension.messages_json, extension.ui_language);
             }
         }
 
@@ -725,27 +826,248 @@ ExtensionRegistry::MessageDeliveryResult ExtensionRegistry::deliver_message(u64 
     return result;
 }
 
-void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_at)
+u64 ExtensionRegistry::connect_port(u64 context_id, StringView name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id)
+{
+    auto context = this->context(context_id);
+    if (!context || !on_connect_port || !context->document().is_fully_active() || !context->document().has_id())
+        return 0;
+    if (target_tab_id.has_value() && context->kind() != ExtensionContext::Kind::ExtensionPage)
+        return 0;
+
+    auto local_port_id = ++m_next_port_id;
+    m_context_active_ports.ensure(context_id).set(local_port_id);
+    on_connect_port(context->document().page().client().id(), context->document().id(), context_id, local_port_id, context->extension_id(), MUST(String::from_utf8(name)), target_tab_id, target_frame_id, move(target_document_id));
+    return local_port_id;
+}
+
+bool ExtensionRegistry::is_port_deactivated(u64 context_id, u64 local_port_id) const
+{
+    auto deactivated = m_context_deactivated_ports.get(context_id);
+    return deactivated.has_value() && deactivated->contains(local_port_id);
+}
+
+void ExtensionRegistry::post_port_message(u64 context_id, u64 local_port_id, StringView message_json)
+{
+    auto context = this->context(context_id);
+    if (!context || !on_post_port_message || is_port_deactivated(context_id, local_port_id))
+        return;
+    on_post_port_message(context_id, local_port_id, MUST(String::from_utf8(message_json)));
+}
+
+void ExtensionRegistry::disconnect_port(u64 context_id, u64 local_port_id)
+{
+    if (auto active = m_context_active_ports.find(context_id); active != m_context_active_ports.end()) {
+        active->value.remove(local_port_id);
+        if (active->value.is_empty())
+            m_context_active_ports.remove(active);
+    }
+    if (auto deactivated = m_context_deactivated_ports.find(context_id); deactivated != m_context_deactivated_ports.end()) {
+        deactivated->value.remove(local_port_id);
+        if (deactivated->value.is_empty())
+            m_context_deactivated_ports.remove(deactivated);
+    }
+    if (!on_disconnect_port)
+        return;
+    on_disconnect_port(context_id, local_port_id);
+}
+
+void ExtensionRegistry::disconnect_ports_of_context(u64 context_id, NotifyLocalPorts notify_local_ports)
+{
+    if (on_disconnect_context_ports)
+        on_disconnect_context_ports(context_id);
+    if (notify_local_ports != NotifyLocalPorts::Yes) {
+        m_context_active_ports.remove(context_id);
+        m_context_deactivated_ports.remove(context_id);
+        return;
+    }
+
+    // Invalidate all currently active ports in C++ without entering JS so inactive-document deactivation never runs
+    // callbacks or microtasks, earlier queued messages for these ports are dropped, and replacement ports opened after
+    // BFCache restoration remain unaffected.
+    auto active_ports = m_context_active_ports.take(context_id);
+    if (!active_ports.has_value() || active_ports->is_empty())
+        return;
+
+    Vector<u64> deactivated_port_ids;
+    deactivated_port_ids.ensure_capacity(active_ports->size());
+    auto& deactivated_set = m_context_deactivated_ports.ensure(context_id);
+    for (auto port_id : *active_ports) {
+        deactivated_set.set(port_id);
+        deactivated_port_ids.append(port_id);
+    }
+
+    auto context = this->context(context_id);
+    if (!context)
+        return;
+
+    HTML::queue_global_task(HTML::Task::Source::Unspecified, HTML::relevant_global_object(context->document()),
+        GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *context }, context_id, move(deactivated_port_ids)), [](auto& context, auto context_id, auto& deactivated_port_ids) {
+            auto& registry = ExtensionRegistry::the();
+            auto& vm = context->realm().vm();
+            for (auto port_id : deactivated_port_ids) {
+                if (auto it = registry.m_context_deactivated_ports.find(context_id); it != registry.m_context_deactivated_ports.end()) {
+                    it->value.remove(port_id);
+                    if (it->value.is_empty())
+                        registry.m_context_deactivated_ports.remove(it);
+                }
+                JS::Value arguments[] = {
+                    JS::PrimitiveString::create(vm, "port-disconnect"_utf16),
+                    JS::Value(static_cast<double>(port_id)),
+                    JS::PrimitiveString::create(vm, Utf16String {}),
+                };
+                (void)context->dispatch(arguments);
+            }
+        }));
+}
+
+void ExtensionRegistry::open_port(u64 channel_id, StringView extension_id, PageId page_id, HTML::CrossProcessId document_id, bool target_extension_page, u64 excluded_context_id, StringView name, StringView sender_json)
+{
+    auto expected_kind = target_extension_page ? ExtensionContext::Kind::ExtensionPage : ExtensionContext::Kind::ContentScript;
+    Vector<GC::Ref<ExtensionContext>> targets;
+    for_each_context([&](ExtensionContext& context) {
+        if (context.extension_id() != extension_id || context.id() == excluded_context_id || context.kind() != expected_kind)
+            return;
+        auto const& document = context.document();
+        if (!document.is_fully_active() || !document.has_id() || document.id() != document_id || document.page().client().id() != page_id)
+            return;
+        targets.append(context);
+    });
+
+    for (auto& context : targets) {
+        if (context->is_detached() || !context->document().is_fully_active())
+            continue;
+        auto& vm = context->realm().vm();
+        JS::Value check_arguments[] = {
+            JS::PrimitiveString::create(vm, "port-has-connect-listeners"_utf16),
+        };
+        auto has_listeners = context->dispatch(check_arguments);
+        if (!has_listeners.has_value() || !has_listeners->is_boolean() || !has_listeners->as_bool())
+            continue;
+
+        auto local_port_id = ++m_next_port_id;
+        m_context_active_ports.ensure(context->id()).set(local_port_id);
+        if (on_accept_port)
+            on_accept_port(channel_id, document_id, context->id(), local_port_id);
+
+        JS::Value connect_arguments[] = {
+            JS::PrimitiveString::create(vm, "port-connect"_utf16),
+            JS::Value(static_cast<double>(local_port_id)),
+            JS::PrimitiveString::create(vm, Utf16String::from_utf8(name)),
+            JS::PrimitiveString::create(vm, Utf16String::from_utf8(sender_json)),
+        };
+        (void)context->dispatch(connect_arguments);
+    }
+
+    if (on_finish_open_port)
+        on_finish_open_port(channel_id);
+}
+
+void ExtensionRegistry::deliver_port_message(u64 context_id, u64 local_port_id, StringView message_json)
+{
+    auto context = this->context(context_id);
+    if (!context || !context->document().is_fully_active() || is_port_deactivated(context_id, local_port_id))
+        return;
+
+    HTML::queue_global_task(HTML::Task::Source::Unspecified, HTML::relevant_global_object(context->document()),
+        GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *context }, context_id, local_port_id, MUST(String::from_utf8(message_json))), [](auto& context, auto context_id, auto local_port_id, auto& message_json) {
+            if (ExtensionRegistry::the().is_port_deactivated(context_id, local_port_id))
+                return;
+            auto& vm = context->realm().vm();
+            JS::Value arguments[] = {
+                JS::PrimitiveString::create(vm, "port-message"_utf16),
+                JS::Value(static_cast<double>(local_port_id)),
+                JS::PrimitiveString::create(vm, Utf16String::from_utf8(message_json)),
+            };
+            (void)context->dispatch(arguments);
+        }));
+}
+
+void ExtensionRegistry::disconnect_port_endpoint(u64 context_id, u64 local_port_id, StringView error, bool notify)
+{
+    auto context = this->context(context_id);
+    if (!context || is_port_deactivated(context_id, local_port_id))
+        return;
+
+    HTML::queue_global_task(HTML::Task::Source::Unspecified, HTML::relevant_global_object(context->document()),
+        GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *context }, context_id, local_port_id, MUST(String::from_utf8(error)), notify), [](auto& context, auto context_id, auto local_port_id, auto& error, auto notify) {
+            auto& registry = ExtensionRegistry::the();
+            if (registry.is_port_deactivated(context_id, local_port_id))
+                return;
+            if (auto active = registry.m_context_active_ports.find(context_id); active != registry.m_context_active_ports.end()) {
+                active->value.remove(local_port_id);
+                if (active->value.is_empty())
+                    registry.m_context_active_ports.remove(active);
+            }
+            auto& vm = context->realm().vm();
+            JS::Value arguments[] = {
+                JS::PrimitiveString::create(vm, "port-disconnect"_utf16),
+                JS::Value(static_cast<double>(local_port_id)),
+                JS::PrimitiveString::create(vm, Utf16String::from_utf8(error)),
+                JS::Value(notify),
+            };
+            (void)context->dispatch(arguments);
+        }));
+}
+
+void ExtensionRegistry::snapshot_extensions_for_document(DOM::Document const& document, Optional<u64> generation)
 {
     if (document.is_decoded_svg() || !document.browsing_context())
         return;
+    m_document_extension_snapshots.ensure(&document, [&] {
+        NonnullRefPtr<InjectionGeneration> selected = m_current_injection_generation;
+        if (generation.has_value()) {
+            if (auto found = m_recent_injection_generations.get(*generation); found.has_value())
+                selected = **found;
+        }
+        return DocumentExtensionSnapshot { move(selected), document.url() };
+    });
+}
 
-    // Snapshot matching registered CSS once the document has an active navigable so later register/unregister updates
-    // do not retroactively alter styles on already-loaded documents.
-    if (document.extension_content_script_stage() == 0 && document.navigable())
-        document.snapshot_dynamic_extension_style_sheet();
+void ExtensionRegistry::did_destroy_document(DOM::Document const& document)
+{
+    m_document_extension_snapshots.remove(&document);
+}
 
-    auto snapshot = m_extensions;
-    if (snapshot->extensions.is_empty())
+void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_at)
+{
+    if (document.is_decoded_svg() || !document.browsing_context())
         return;
 
     auto target_stage = to_underlying(run_at) + 1;
     if (document.extension_content_script_stage() >= target_stage)
         return;
 
-    auto window = document.window();
-    if (!window || &window->associated_document() != &document || !document.is_fully_active() || document.is_scripting_disabled())
+    auto& snapshot_entry = m_document_extension_snapshots.ensure(&document, [&] {
+        return DocumentExtensionSnapshot { m_current_injection_generation, document.url() };
+    });
+
+    // Snapshot matching registered CSS once the document has an active navigable so later register/unregister updates
+    // do not retroactively alter styles on already-loaded documents.
+    if (document.extension_content_script_stage() == 0 && document.navigable())
+        document.snapshot_dynamic_extension_style_sheet();
+
+    auto release_snapshot_if_finished = [&] {
+        if (document.extension_content_script_stage() > to_underlying(RunAt::DocumentIdle)) {
+            if (auto entry = m_document_extension_snapshots.get(&document); entry.has_value())
+                entry->generation = nullptr;
+        }
+    };
+
+    RefPtr<InjectionGeneration> generation = snapshot_entry.generation;
+    if (!generation || generation->extensions.is_empty()) {
+        document.set_extension_content_script_stage(target_stage);
+        release_snapshot_if_finished();
         return;
+    }
+
+    auto window = document.window();
+    if (!window || &window->associated_document() != &document || !document.is_fully_active())
+        return;
+    if (document.is_scripting_disabled()) {
+        document.set_extension_content_script_stage(to_underlying(RunAt::DocumentIdle) + 1);
+        release_snapshot_if_finished();
+        return;
+    }
 
     while (document.extension_content_script_stage() < target_stage) {
         auto stage = static_cast<RunAt>(document.extension_content_script_stage());
@@ -756,8 +1078,8 @@ void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_a
         if (stage == RunAt::DocumentStart && document.url().scheme() == "chrome-extension"sv) {
             // NB: A sandboxed page of the extension has an opaque origin, and no API, as in Chrome.
             auto extension_id = document.url().serialized_host();
-            Extension const* extension = nullptr;
-            for (auto const& candidate : snapshot->extensions) {
+            InjectionExtension const* extension = nullptr;
+            for (auto const& candidate : generation->extensions) {
                 if (candidate.id == extension_id) {
                     extension = &candidate;
                     break;
@@ -766,11 +1088,11 @@ void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_a
             if (extension && !document.extension_context(extension->id) && document.origin().is_same_origin(document.url().origin())) {
                 auto context = ExtensionContext::create_for_extension_page(document, extension->id);
                 document.add_extension_context(context);
-                install_api(context, *extension);
+                install_api(context, extension->id, extension->manifest_json, extension->messages_json, extension->ui_language);
             }
         }
 
-        for (auto const& extension : snapshot->extensions) {
+        for (auto const& extension : generation->extensions) {
             Vector<ContentScript const*> content_scripts;
             for (auto const& content_script : extension.content_scripts) {
                 if (content_script.run_at == stage && !content_script.js.is_empty() && content_script_matches(extension, content_script, document))
@@ -780,10 +1102,14 @@ void ExtensionRegistry::run_content_scripts(DOM::Document& document, RunAt run_a
                 continue;
 
             inject(document, extension, content_scripts);
-            if (!document.is_fully_active())
+            if (!document.is_fully_active()) {
+                release_snapshot_if_finished();
                 return;
+            }
         }
     }
+
+    release_snapshot_if_finished();
 }
 
 }

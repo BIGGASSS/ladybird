@@ -1021,6 +1021,7 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
     output->navigation_same_site_status = result.navigation_same_site_status;
     output->inline_content_origin = move(result.inline_content_origin);
     output->document_id = result.document_id;
+    output->extension_generation = result.extension_generation;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
     // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
@@ -3397,8 +3398,10 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
         stop_response_body_delivery(navigation_params);
         return;
     }
-    if (auto* params = navigation_params.get_pointer<GC::Ref<NavigationParams>>())
+    if (auto* params = navigation_params.get_pointer<GC::Ref<NavigationParams>>()) {
         (*params)->document_id = output->document_id;
+        (*params)->extension_generation = output->extension_generation;
+    }
 
     // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run these steps:
     queue_global_task(Task::Source::NavigationAndTraversal, HTML::relevant_global_object(*active_window()), GC::create_function<void()>(heap(), GC::captures(*this, url, source_allows_downloading, source_interface_origin, user_involvement, navigation_id, navigation_params, csp_navigation_type, navigation_timing_type, output, completion_steps), [](LocalNavigable& self, auto& url, auto& source_allows_downloading, auto& source_interface_origin, auto& user_involvement, auto& navigation_id, NavigationParamsVariant& navigation_params, auto& csp_navigation_type, auto& navigation_timing_type, auto& output, auto& completion_steps) {

@@ -26,6 +26,7 @@
 #include <LibURL/URL.h>
 #include <LibWebCommon/Extensions/MessageDeliveryStatus.h>
 #include <LibWebCommon/Extensions/NetworkRequestOutcome.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/Page/PageId.h>
 
 namespace Web::Extensions {
@@ -68,11 +69,6 @@ struct WebAccessibleResource {
 
 struct Extension {
     String id;
-    String manifest_json;
-    String messages_json;
-    String ui_language;
-    Vector<String> host_permissions;
-    Vector<ContentScript> content_scripts;
     HashMap<String, WebAccessibleResource> resources;
     Vector<String> sandboxed_pages;
     String sandbox_policy;
@@ -87,11 +83,12 @@ class WEB_API ExtensionRegistry {
 public:
     static ExtensionRegistry& the();
 
-    bool has_extensions() const { return !m_extensions->extensions.is_empty(); }
-    Vector<Extension> const& extensions() const { return m_extensions->extensions; }
+    bool has_extensions() const { return !m_extensions.is_empty(); }
+    bool has_extensions_for_document(DOM::Document const&) const;
+    Vector<Extension> const& extensions() const { return m_extensions; }
     Extension const* extension(StringView id) const;
 
-    ErrorOr<void> set_extensions_from_bytes(ReadonlyBytes);
+    ErrorOr<void> set_extensions_from_bytes(ReadonlyBytes, u64 generation = 0, u64 min_retained_generation = 0);
     void set_storage(JsonObject);
 
     // The contents of an extension's storage area ("local" or "sync"), serialized as JSON.
@@ -126,6 +123,8 @@ public:
 
     // Runs the content scripts of every stage up to and including the given one that have not yet run in the document.
     // A page of an extension gets the extension's API first.
+    void snapshot_extensions_for_document(DOM::Document const&, Optional<u64> generation = {});
+    void did_destroy_document(DOM::Document const&);
     void run_content_scripts(DOM::Document&, RunAt);
 
     // What the API of an extension asks the browser process to do, such as querying tabs or sending a message, goes to
@@ -165,22 +164,63 @@ public:
     MessageDeliveryResult deliver_message(u64 delivery_id, StringView extension_id, Optional<PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, StringView message_json, StringView sender_json);
     Function<void(u64 delivery_id, bool responded, String const& response_json)> on_message_response;
 
+    // Long-lived message ports (chrome.runtime.connect / chrome.tabs.connect / chrome.runtime.onConnect).
+    enum class NotifyLocalPorts : u8 {
+        No,
+        Yes,
+    };
+    u64 connect_port(u64 context_id, StringView name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id);
+    bool is_port_deactivated(u64 context_id, u64 local_port_id) const;
+    void post_port_message(u64 context_id, u64 local_port_id, StringView message_json);
+    void disconnect_port(u64 context_id, u64 local_port_id);
+    void disconnect_ports_of_context(u64 context_id, NotifyLocalPorts);
+    void open_port(u64 channel_id, StringView extension_id, PageId page_id, HTML::CrossProcessId document_id, bool target_extension_page, u64 excluded_context_id, StringView name, StringView sender_json);
+    void deliver_port_message(u64 context_id, u64 local_port_id, StringView message_json);
+    void disconnect_port_endpoint(u64 context_id, u64 local_port_id, StringView error, bool notify = true);
+
+    Function<void(PageId, HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id, String const& extension_id, String const& name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id)> on_connect_port;
+    Function<void(u64 channel_id, HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id)> on_accept_port;
+    Function<void(u64 channel_id)> on_finish_open_port;
+    Function<void(u64 context_id, u64 local_port_id, String const& message_json)> on_post_port_message;
+    Function<void(u64 context_id, u64 local_port_id)> on_disconnect_port;
+    Function<void(u64 context_id)> on_disconnect_context_ports;
+
 private:
-    struct ExtensionList : public RefCounted<ExtensionList> {
-        Vector<Extension> extensions;
+    struct InjectionExtension {
+        String id;
+        String manifest_json;
+        String messages_json;
+        String ui_language;
+        Vector<String> host_permissions;
+        Vector<ContentScript> content_scripts;
+    };
+    struct InjectionGeneration : public RefCounted<InjectionGeneration> {
+        u64 generation { 0 };
+        Vector<InjectionExtension> extensions;
+    };
+    struct DocumentExtensionSnapshot {
+        RefPtr<InjectionGeneration> generation;
+        URL::URL creation_url;
     };
 
     ExtensionRegistry() = default;
 
-    bool content_script_matches(Extension const&, ContentScript const&, DOM::Document const&) const;
+    Optional<URL::URL> url_for_matching(ContentScript const&, DOM::Document const&, bool use_live_document_url = false) const;
+    bool content_script_matches(InjectionExtension const&, ContentScript const&, DOM::Document const&, bool use_live_document_url = false) const;
     void for_each_context(Function<void(ExtensionContext&)>) const;
     GC::Ptr<ExtensionContext> context(u64 context_id) const;
-    void inject(DOM::Document&, Extension const&, Vector<ContentScript const*> const&);
+    void inject(DOM::Document&, InjectionExtension const&, Vector<ContentScript const*> const&);
 
-    NonnullRefPtr<ExtensionList> m_extensions { adopt_ref(*new ExtensionList) };
+    Vector<Extension> m_extensions;
+    NonnullRefPtr<InjectionGeneration> m_current_injection_generation { adopt_ref(*new InjectionGeneration) };
+    OrderedHashMap<u64, NonnullRefPtr<InjectionGeneration>> m_recent_injection_generations;
+    HashMap<DOM::Document const*, DocumentExtensionSnapshot> m_document_extension_snapshots;
     HashMap<u64, GC::Root<GC::Function<void(Optional<ReadonlyBytes>, StringView)>>> m_pending_resource_loads;
     u64 m_next_resource_request_id { 0 };
     u64 m_next_call_id { 0 };
+    u64 m_next_port_id { 0 };
+    HashMap<u64, HashTable<u64>> m_context_active_ports;
+    HashMap<u64, HashTable<u64>> m_context_deactivated_ports;
     bool m_has_network_rules { false };
     HashMap<u64, GC::Root<GC::Function<void(NetworkRequestOutcome, Optional<URL::URL>)>>> m_pending_network_requests;
     u64 m_next_network_request_id { 0 };

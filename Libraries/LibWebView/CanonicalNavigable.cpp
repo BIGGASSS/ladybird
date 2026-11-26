@@ -23,6 +23,7 @@
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
+#include <LibWebView/ExtensionHost.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -30,9 +31,23 @@
 
 namespace WebView {
 
+static u64 s_next_extension_frame_id = 0;
+
 CanonicalNavigable::CanonicalNavigable(Web::HTML::CrossProcessId id)
     : m_id(id)
+    , m_extension_frame_id(++s_next_extension_frame_id)
 {
+}
+
+void CanonicalNavigable::set_active_session_history_entry(RefPtr<CanonicalSessionHistoryEntry> entry)
+{
+    m_active_session_history_entry = move(entry);
+    if (m_active_session_history_entry && m_active_session_history_entry->document_state->document) {
+        if (Application::is_initialized()) {
+            if (auto* host = Application::the().extension_host())
+                host->snapshot_content_script_authorization(*this, *m_active_session_history_entry->document_state->document, m_active_session_history_entry->document_state->initiator_origin);
+        }
+    }
 }
 
 RefPtr<WebContentPage> CanonicalNavigable::reporting_page() const
@@ -1095,8 +1110,8 @@ ErrorOr<CanonicalNavigable::PageToPopulateDocument> CanonicalNavigable::obtain_p
     NonnullRefPtr document_state = entry.document_state;
     response_document->document_id = Application::the().allocate_ui_process_cross_process_id();
     auto document = create_and_initialize_a_document(*response_document);
-    loader.set_document(*document, *this);
     populate_document(document_state, document, loader.result().inline_content_origin);
+    loader.set_document(*document, *this);
 
     // A document created for inline content stands in for the resource the process that fetched it could not load; that
     // process hosts it.
@@ -1137,6 +1152,10 @@ void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState>
     document->determine_whether_it_is_local_file_content(blob_url_store());
     if (document->is_local_file_content())
         document_state->held_local_file_content = true;
+    if (Application::is_initialized()) {
+        if (auto* host = Application::the().extension_host())
+            host->snapshot_content_script_authorization(*this, *document, document_state->initiator_origin, ExtensionHost::RetainPendingGeneration::Yes);
+    }
     abandon_populated_document(document_state);
     auto is_for_navigation = any_of(m_navigations, [&](auto const& navigation) {
         return navigation->history_entry && navigation->history_entry->document_state == document_state;
@@ -1220,6 +1239,7 @@ void CanonicalNavigable::abandon_populated_document(NonnullRefPtr<CanonicalDocum
     if (!document_state->populated_document.has_value())
         return;
     NonnullRefPtr document = document_state->populated_document->document;
+    document->release_pending_extension_generation();
     RefPtr<WebContentPage> host = document->host();
     document_state->populated_document.clear();
     if (!host || top_level_traversable().hosts(*this, *host) || pending_host_matches(*host))
@@ -1626,7 +1646,7 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
     if (m_active_session_history_entry->document_state != entry.document_state)
         m_active_session_history_entry->document_state->document = nullptr;
     entry.document_state->document = document;
-    m_active_session_history_entry = entry;
+    set_active_session_history_entry(entry);
 
     if (document != previous_document) {
         document->make_active();

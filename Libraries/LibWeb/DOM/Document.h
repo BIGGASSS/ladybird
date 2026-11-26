@@ -1177,6 +1177,7 @@ public:
     bool mute_iframe_load() const { return m_mute_iframe_load; }
     void set_mute_iframe_load(bool value) { m_mute_iframe_load = value; }
 
+    bool has_id() const { return m_id.has_value(); }
     HTML::CrossProcessId id() const { return m_id.value(); }
     void set_id(HTML::CrossProcessId);
 

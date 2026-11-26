@@ -881,7 +881,8 @@ void Application::send_extensions_to_web_content(WebContentClient& client) const
 {
     if (!m_extension_manager || client.is_private() == IsPrivate::Yes)
         return;
-    client.async_set_extensions(m_extension_manager->extensions_buffer());
+    auto min_retained = m_extension_host ? m_extension_host->minimum_retained_extension_generation() : m_extension_manager->generation();
+    client.async_set_extensions(m_extension_manager->extensions_buffer(), m_extension_manager->generation(), min_retained);
     client.async_set_extension_storage(m_extension_manager->storage_json());
 }
 

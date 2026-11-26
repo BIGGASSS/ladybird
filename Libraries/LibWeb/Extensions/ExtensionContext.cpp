@@ -14,6 +14,7 @@
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Extensions/ExtensionContext.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
@@ -121,7 +122,10 @@ Optional<JS::Value> ExtensionContext::dispatch(ReadonlySpan<JS::Value> arguments
 
 void ExtensionContext::detach()
 {
+    if (m_detached)
+        return;
     m_detached = true;
+    ExtensionRegistry::the().disconnect_ports_of_context(m_id, ExtensionRegistry::NotifyLocalPorts::No);
     m_api = nullptr;
     m_dispatch = nullptr;
     if (m_wrapper_world)

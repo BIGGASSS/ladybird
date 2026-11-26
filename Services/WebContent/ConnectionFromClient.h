@@ -153,8 +153,8 @@ private:
     virtual void run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, bool needs_population) override;
     virtual void create_history_navigation_params(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::NavigationPopulationRequest request, bool allow_POST) override;
     virtual void clear_ongoing_history_traversal(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name) override;
-    virtual void unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name) override;
+    virtual void apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation) override;
+    virtual void unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation) override;
     virtual void run_descendant_unload_task(Web::PageId page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction, Web::HTML::StopHostingAfterUnload) override;
     virtual void continue_child_navigable_destruction(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void abort_navigable_document(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -254,7 +254,7 @@ private:
 
     virtual void set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) override;
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
-    virtual void set_extensions(Core::AnonymousBuffer extensions) override;
+    virtual void set_extensions(Core::AnonymousBuffer extensions, u64 generation, u64 min_retained_generation) override;
     virtual void set_extension_storage(String storage) override;
     virtual void extension_storage_changed(String extension_id, String area, String changes) override;
     virtual void did_load_extension_resource(u64 request_id, bool found, Core::AnonymousBuffer data, String mime_type) override;
@@ -262,6 +262,9 @@ private:
     virtual void extension_api_call_completed(u64 call_id, u64 context_id, bool succeeded, String result) override;
     virtual void deliver_extension_event(String extension_id, String name, String arguments) override;
     virtual void deliver_extension_message(u64 delivery_id, String extension_id, Optional<Web::PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, String message, String sender) override;
+    virtual void open_extension_port(u64 channel_id, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool target_extension_page, u64 excluded_context_id, String name, String sender) override;
+    virtual void deliver_extension_port_message(u64 context_id, u64 local_port_id, String message) override;
+    virtual void disconnect_extension_port_endpoint(u64 context_id, u64 local_port_id, String error, bool notify) override;
 
     virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
     virtual void set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) override;

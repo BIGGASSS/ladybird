@@ -50,6 +50,7 @@ public:
     ErrorOr<InstalledExtension> install(StringView path, ReadonlySpan<String> preferred_languages);
 
     Core::AnonymousBuffer const& extensions_buffer() const { return m_extensions_buffer; }
+    u64 generation() const { return m_generation; }
 
     struct Resource {
         Core::AnonymousBuffer data;
@@ -79,6 +80,7 @@ public:
 
     // https://developer.chrome.com/docs/extensions/reference/api/scripting
     bool extension_has_scripting_permission(StringView extension_id) const;
+    bool extension_can_run_content_script(StringView extension_id, URL::URL const& document_url, URL::Origin const& document_origin, Optional<URL::Origin> const& initiator_origin, bool is_top_level) const;
     ErrorOr<void, String> register_content_scripts(StringView extension_id, JsonArray const& scripts);
     ErrorOr<void, String> update_content_scripts(StringView extension_id, JsonArray const& scripts);
     ErrorOr<JsonArray, String> registered_content_scripts(StringView extension_id, Optional<JsonObject const&> filter) const;
@@ -137,6 +139,7 @@ private:
     HashMap<String, InstallEvent> m_pending_install_events;
     ExtensionNetworkRules m_network_rules;
     Core::AnonymousBuffer m_extensions_buffer;
+    u64 m_generation { 0 };
     JsonObject m_storage;
     RefPtr<Core::Timer> m_storage_save_timer;
 };

@@ -121,7 +121,7 @@
     // runtime
 
     const [onMessage, , messageListeners] = createEvent();
-    const [onConnect] = createEvent();
+    const [onConnect, dispatchConnect, connectListeners] = createEvent();
     const [onInstalled, dispatchInstalled] = createEvent();
     const [onStartup, dispatchStartup] = createEvent();
     if (isPage) {
@@ -129,18 +129,83 @@
         browserEvents["runtime.onStartup"] = dispatchStartup;
     }
 
-    function createDisconnectedPort(name) {
-        const [onPortMessage] = createEvent();
+    const activePorts = new Map();
+
+    function serializePortMessage(message) {
+        const serialized = JSON.stringify(message === undefined ? null : message);
+        if (typeof serialized !== "string")
+            throw new TypeError("Could not serialize message.");
+        return serialized;
+    }
+
+    function createPortObject(portId, name, sender) {
+        const [onPortMessage, dispatchPortMessage] = createEvent();
         const [onDisconnect, dispatchDisconnect] = createEvent();
+        let disconnected = false;
         const port = {
             name,
             onMessage: onPortMessage,
             onDisconnect,
-            postMessage() {},
-            disconnect() {},
+            postMessage(message) {
+                if (disconnected) throw new Error("Attempting to use a disconnected port object");
+                const serialized = serializePortMessage(message);
+                native.portPostMessage(contextId, portId, serialized);
+            },
+            disconnect() {
+                if (disconnected) return;
+                disconnected = true;
+                activePorts.delete(portId);
+                native.portDisconnect(contextId, portId);
+            },
         };
-        Promise.resolve().then(() => {
-            lastError = { message: noReceiverError };
+        if (sender !== undefined) port.sender = sender;
+        activePorts.set(portId, {
+            deliverMessage(messageJSON) {
+                if (disconnected) return;
+                dispatchPortMessage(JSON.parse(messageJSON), port);
+            },
+            deliverDisconnect(errorMessage, notify = true) {
+                if (disconnected) return;
+                disconnected = true;
+                activePorts.delete(portId);
+                if (!notify) return;
+                if (errorMessage) {
+                    port.error = { message: errorMessage };
+                    lastError = { message: errorMessage };
+                    try {
+                        dispatchDisconnect(port);
+                    } finally {
+                        lastError = undefined;
+                    }
+                } else {
+                    dispatchDisconnect(port);
+                }
+            },
+        });
+        return port;
+    }
+
+    function createDisconnectedPort(name, errorMessage = noReceiverError) {
+        const [onPortMessage] = createEvent();
+        const [onDisconnect, dispatchDisconnect] = createEvent();
+        let disconnected = false;
+        const port = {
+            name,
+            onMessage: onPortMessage,
+            onDisconnect,
+            postMessage(message) {
+                if (disconnected) throw new Error("Attempting to use a disconnected port object");
+                serializePortMessage(message);
+            },
+            disconnect() {
+                disconnected = true;
+            },
+        };
+        queueMicrotask(() => {
+            if (disconnected) return;
+            disconnected = true;
+            port.error = { message: errorMessage };
+            lastError = { message: errorMessage };
             try {
                 dispatchDisconnect(port);
             } finally {
@@ -189,8 +254,28 @@
             return sendMessage({ tabId: null }, args[0], callback);
         },
         connect(...args) {
-            const info = args.find(arg => arg && typeof arg === "object");
-            return createDisconnectedPort(info && info.name !== undefined ? String(info.name) : "");
+            let targetExtensionId;
+            let connectInfo;
+            if (args.length === 0) {
+                connectInfo = undefined;
+            } else if (typeof args[0] === "string") {
+                targetExtensionId = args[0];
+                connectInfo = args[1];
+            } else if (args[0] === null || args[0] === undefined) {
+                connectInfo = args[1];
+            } else if (typeof args[0] === "object") {
+                connectInfo = args[0];
+            } else {
+                throw new TypeError("Invalid arguments to runtime.connect");
+            }
+            if (connectInfo !== undefined && connectInfo !== null && typeof connectInfo !== "object")
+                throw new TypeError("Invalid connectInfo");
+            const name = connectInfo && connectInfo.name !== undefined ? String(connectInfo.name) : "";
+            if (targetExtensionId !== undefined && targetExtensionId !== extensionId)
+                return createDisconnectedPort(name, noReceiverError);
+            const portId = native.portConnect(contextId, name, null, null, null);
+            if (!portId) return createDisconnectedPort(name, noReceiverError);
+            return createPortObject(portId, name);
         },
         getPlatformInfo: noop({ os: "linux", arch: "x86-64", nacl_arch: "x86-64" }),
         onMessage,
@@ -396,6 +481,32 @@
                 return finish(callback, callBrowser("tabs.reload", tabId));
             },
             remove: browserFunction("tabs.remove", 1),
+            connect(tabId, connectInfo) {
+                if (typeof tabId !== "number" || !Number.isSafeInteger(tabId) || tabId < 0)
+                    throw new TypeError("Invalid tabId");
+                if (connectInfo !== undefined && connectInfo !== null && typeof connectInfo !== "object")
+                    throw new TypeError("Invalid connectInfo");
+                const name = connectInfo && connectInfo.name !== undefined ? String(connectInfo.name) : "";
+                const frameId = connectInfo ? connectInfo.frameId : undefined;
+                if (frameId !== undefined) {
+                    if (typeof frameId !== "number" || !Number.isSafeInteger(frameId) || frameId < 0)
+                        throw new TypeError("Invalid frameId");
+                }
+                const documentId = connectInfo ? connectInfo.documentId : undefined;
+                if (documentId !== undefined) {
+                    if (typeof documentId !== "string" || documentId.length === 0)
+                        throw new TypeError("Invalid documentId");
+                }
+                const portId = native.portConnect(
+                    contextId,
+                    name,
+                    tabId,
+                    frameId === undefined ? null : frameId,
+                    documentId === undefined ? null : documentId
+                );
+                if (!portId) return createDisconnectedPort(name, noReceiverError);
+                return createPortObject(portId, name);
+            },
             sendMessage(tabId, message, ...rest) {
                 const callback = popCallback(rest);
                 const options = rest[0] || {};
@@ -694,6 +805,31 @@
             if (responded) return "r" + (response ?? "");
             if (willRespond) return "async";
             return messageListeners.length ? "none" : "nolistener";
+        }
+
+        if (type === "port-has-connect-listeners") {
+            return connectListeners.length > 0;
+        }
+
+        if (type === "port-connect") {
+            const [portId, name, senderJSON] = args;
+            const port = createPortObject(portId, name, JSON.parse(senderJSON));
+            dispatchConnect(port);
+            return;
+        }
+
+        if (type === "port-message") {
+            const [portId, messageJSON] = args;
+            const entry = activePorts.get(portId);
+            if (entry) entry.deliverMessage(messageJSON);
+            return;
+        }
+
+        if (type === "port-disconnect") {
+            const [portId, errorMessage, notify] = args;
+            const entry = activePorts.get(portId);
+            if (entry) entry.deliverDisconnect(errorMessage, notify !== false);
+            return;
         }
     }
 

@@ -765,7 +765,7 @@ void ConnectionFromClient::clear_ongoing_history_traversal(Web::PageId page_id, 
         page->page().history_executor().clear_ui_changing_navigable_ongoing_traversal(operation_id, navigable_id);
 }
 
-void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name)
+void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
@@ -773,14 +773,14 @@ void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId pag
         return;
     }
 
-    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, extension_generation, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
         if (!connection)
             return;
         connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
     }));
 }
 
-void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name)
+void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
@@ -788,7 +788,7 @@ void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigabl
         return;
     }
 
-    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, extension_generation, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
         if (!connection)
             return;
         connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
@@ -3478,7 +3478,7 @@ void ConnectionFromClient::set_content_blockers(Core::AnonymousBuffer patterns_b
         m_page_host->invalidate_user_style();
 }
 
-void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffer)
+void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffer, u64 generation, u64 min_retained_generation)
 {
     if (auto result = extensions_buffer.validate_backing_size(); result.is_error()) {
         dbgln("Failed to set extensions: {}", result.error());
@@ -3486,7 +3486,7 @@ void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffe
     }
 
     auto& registry = Web::Extensions::ExtensionRegistry::the();
-    if (auto result = registry.set_extensions_from_bytes(extensions_buffer.bytes()); result.is_error()) {
+    if (auto result = registry.set_extensions_from_bytes(extensions_buffer.bytes(), generation, min_retained_generation); result.is_error()) {
         dbgln("Failed to set extensions: {}", result.error());
         return;
     }
@@ -3515,6 +3515,24 @@ void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffe
     };
     registry.on_message_response = [this](u64 delivery_id, bool, String const& response) {
         async_did_handle_extension_message(delivery_id, to_underlying(Web::Extensions::MessageDeliveryStatus::RespondedLater), response);
+    };
+    registry.on_connect_port = [this](Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id, String const& extension_id, String const& name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id) {
+        async_connect_extension_port(page_id, document_id, context_id, local_port_id, extension_id, name, target_tab_id, target_frame_id, move(target_document_id));
+    };
+    registry.on_accept_port = [this](u64 channel_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id) {
+        async_accept_extension_port(channel_id, document_id, context_id, local_port_id);
+    };
+    registry.on_finish_open_port = [this](u64 channel_id) {
+        async_finish_open_extension_port(channel_id);
+    };
+    registry.on_post_port_message = [this](u64 context_id, u64 local_port_id, String const& message) {
+        async_post_extension_port_message(context_id, local_port_id, message);
+    };
+    registry.on_disconnect_port = [this](u64 context_id, u64 local_port_id) {
+        async_disconnect_extension_port(context_id, local_port_id);
+    };
+    registry.on_disconnect_context_ports = [this](u64 context_id) {
+        async_disconnect_extension_context_ports(context_id);
     };
 
     // The CSS of content scripts is part of each document's user style sheet.
@@ -3559,6 +3577,21 @@ void ConnectionFromClient::deliver_extension_message(u64 delivery_id, String ext
 {
     auto result = Web::Extensions::ExtensionRegistry::the().deliver_message(delivery_id, extension_id, content_scripts_of_page, only_top_level_frame, excluded_context_id, message, sender);
     async_did_handle_extension_message(delivery_id, to_underlying(result.status), result.response);
+}
+
+void ConnectionFromClient::open_extension_port(u64 channel_id, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool target_extension_page, u64 excluded_context_id, String name, String sender)
+{
+    Web::Extensions::ExtensionRegistry::the().open_port(channel_id, extension_id, page_id, document_id, target_extension_page, excluded_context_id, name, sender);
+}
+
+void ConnectionFromClient::deliver_extension_port_message(u64 context_id, u64 local_port_id, String message)
+{
+    Web::Extensions::ExtensionRegistry::the().deliver_port_message(context_id, local_port_id, message);
+}
+
+void ConnectionFromClient::disconnect_extension_port_endpoint(u64 context_id, u64 local_port_id, String error, bool notify)
+{
+    Web::Extensions::ExtensionRegistry::the().disconnect_port_endpoint(context_id, local_port_id, error, notify);
 }
 
 void ConnectionFromClient::extension_storage_changed(String extension_id, String area, String changes)

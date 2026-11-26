@@ -16,7 +16,9 @@
 #include <AK/Utf16String.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
+#include <LibCore/Forward.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/ExtensionNetworkRules.h>
 #include <LibWebView/Export.h>
@@ -43,6 +45,22 @@ public:
 
     void handle_api_call(WebContentClient&, Web::PageId, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json);
     void did_handle_message(WebContentClient&, u64 delivery_id, u8 status, String const& response_json);
+
+    void connect_port(WebContentClient&, Web::PageId, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id, String const& extension_id, String const& name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id);
+    void accept_port(WebContentClient&, u64 channel_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id);
+    void finish_open_port(WebContentClient&, u64 channel_id);
+    void post_port_message(WebContentClient&, u64 context_id, u64 local_port_id, String const& message_json);
+    void disconnect_port(WebContentClient&, u64 context_id, u64 local_port_id);
+    void disconnect_context_ports(WebContentClient&, u64 context_id);
+    void on_client_disconnected(WebContentClient&);
+    enum class RetainPendingGeneration : u8 {
+        No,
+        Yes,
+    };
+    void snapshot_content_script_authorization(CanonicalNavigable const&, CanonicalDocument&, Optional<URL::Origin> const& initiator_origin, RetainPendingGeneration = RetainPendingGeneration::No);
+    void retain_pending_extension_generation(u64 generation);
+    void release_pending_extension_generation(u64 generation);
+    u64 minimum_retained_extension_generation() const;
 
     // An extension's popup acts for the tab of the window it was opened from.
     void set_tab_of_popup(u64 popup_view_id, u64 tab_view_id);
@@ -75,8 +93,18 @@ private:
     JsonObject describe_tab(ViewImplementation&, String const& extension_id) const;
     void deliver_event(String const& extension_id, String const& name, JsonArray const& arguments) const;
 
+    enum class PortDisconnectReason : u8 {
+        Explicit,
+        Passive,
+    };
     void send_message(WebContentClient&, Optional<ViewImplementation&> caller, u64 context_id, u64 call_id, String const& extension_id, JsonArray const& arguments);
     void finish_message(u64 delivery_id);
+    bool document_is_authorized_for_content_script(CanonicalNavigable const&, CanonicalDocument&, StringView extension_id);
+    JsonObject build_message_sender(Optional<ViewImplementation&> caller, String const& extension_id, String const& sender_url, bool sender_is_top_level) const;
+    JsonObject build_port_sender(ViewImplementation&, CanonicalNavigable const&, CanonicalDocument const&, String const& extension_id) const;
+    void maybe_finish_port_channel(u64 channel_id);
+    void expire_port_open(u64 channel_id);
+    void disconnect_port_endpoint_internal(WebContentClient const&, u64 local_port_id, Optional<u64> required_context_id, PortDisconnectReason);
     void finish_tab_remove(u64 remove_id);
     void fail_pending_tab_removes_for(u64 tab_id, StringView error_message);
 
@@ -109,6 +137,53 @@ private:
     };
     HashMap<u64, PendingTabRemove> m_pending_tab_removes;
     u64 m_next_tab_remove_id { 0 };
+
+    struct PortEndpointKey {
+        WebContentClient const* client { nullptr };
+        u64 local_port_id { 0 };
+        bool operator==(PortEndpointKey const&) const = default;
+    };
+    struct PortEndpointKeyTraits : public AK::Traits<PortEndpointKey> {
+        static unsigned hash(PortEndpointKey const& key)
+        {
+            return pair_int_hash(ptr_hash(key.client), u64_hash(key.local_port_id));
+        }
+    };
+    struct AuthorizedPortReceiver {
+        WebContentClient const* client { nullptr };
+        Web::HTML::CrossProcessId document_id {};
+        bool operator==(AuthorizedPortReceiver const&) const = default;
+    };
+    struct AuthorizedPortReceiverTraits : public AK::Traits<AuthorizedPortReceiver> {
+        static unsigned hash(AuthorizedPortReceiver const& key)
+        {
+            return pair_int_hash(ptr_hash(key.client), Traits<Web::HTML::CrossProcessId>::hash(key.document_id));
+        }
+    };
+    struct PortEndpoint {
+        WeakPtr<WebContentClient> client;
+        WebContentClient const* client_key { nullptr };
+        u64 context_id { 0 };
+        u64 local_port_id { 0 };
+    };
+    struct PortChannel {
+        u64 id { 0 };
+        String extension_id;
+        PortEndpoint opener;
+        bool opener_disconnected { false };
+        bool closed { false };
+        bool ever_accepted { false };
+        Vector<PortEndpoint> receivers {};
+        HashMap<WebContentClient const*, size_t> pending_open_replies {};
+        HashTable<AuthorizedPortReceiver, AuthorizedPortReceiverTraits> authorized_receivers {};
+        Vector<String> queued_messages {};
+        size_t queued_message_bytes { 0 };
+        RefPtr<Core::Timer> open_timeout_timer {};
+    };
+    HashMap<u64, PortChannel> m_port_channels;
+    HashMap<PortEndpointKey, u64, PortEndpointKeyTraits> m_endpoint_to_channel;
+    u64 m_next_port_channel_id { 0 };
+    HashMap<u64, size_t> m_pending_document_generations;
 };
 
 }
