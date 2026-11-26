@@ -477,7 +477,11 @@ style_boundary! {
             //     exists, so a move of it is a style input of the element like a container query answer. The type
             //     facts are fixed from the element's arrival on, and whether it has animations is no input of its
             //     style.
-            if moved & super::bridge::element_adjustment_fact::RENDERED_IN_TOP_LAYER != 0 {
+            if moved
+                & (super::bridge::element_adjustment_fact::RENDERED_IN_TOP_LAYER
+                    | super::bridge::element_adjustment_fact::HIDE_AUDIO_WITHOUT_CONTROLS)
+                != 0
+            {
                 host.publish_element_writes();
                 host.queue_change(ArenaChange::Engine(EngineWrite::TopLayerMove { node }));
             }

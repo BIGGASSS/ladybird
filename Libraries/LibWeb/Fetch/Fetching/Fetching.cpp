@@ -787,9 +787,12 @@ static GC::Ptr<PendingResponse> apply_extension_network_rules(JS::Realm& realm, 
 
         auto request = fetch_params->request();
         switch (outcome) {
-        case Extensions::NetworkRequestOutcome::Block:
-            pending_response->resolve(Infrastructure::Response::network_error("Request was blocked by an extension"_string));
+        case Extensions::NetworkRequestOutcome::Block: {
+            auto blocked_response = Infrastructure::Response::network_error("Request was blocked by an extension"_string);
+            blocked_response->set_should_collapse_initiator(true);
+            pending_response->resolve(move(blocked_response));
             return;
+        }
         case Extensions::NetworkRequestOutcome::Redirect:
         case Extensions::NetworkRequestOutcome::UpgradeScheme: {
             if (!redirect_url.has_value()

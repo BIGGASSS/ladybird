@@ -188,6 +188,7 @@ void RemoteNavigable::set_replicated_state(ReplicatedNavigableState state)
     }
     if (was_delaying_the_load_event_of_its_container != m_replicated_state.delays_the_load_event_of_its_container)
         container->document().schedule_html_parser_end_check();
+    container->set_collapsed_by_content_navigable(m_replicated_state.is_collapsed_by_extension);
 }
 
 ReplicatedContainerState RemoteNavigable::container_state() const

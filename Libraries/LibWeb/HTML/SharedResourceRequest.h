@@ -81,6 +81,7 @@ public:
 
     bool is_fetching() const;
     bool needs_fetching() const;
+    [[nodiscard]] bool should_collapse_initiator() const { return m_should_collapse_initiator; }
 
 private:
     [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, Key);
@@ -130,6 +131,7 @@ private:
 
     Key m_key;
     bool m_can_be_shared { true };
+    bool m_should_collapse_initiator { false };
     GC::Ptr<DecodedImageData> m_image_data;
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
     u64 m_cache_touch_serial { 0 };

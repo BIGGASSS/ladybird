@@ -3131,6 +3131,16 @@ void Element::set_rendered_in_top_layer(bool rendered_in_top_layer)
     }
 }
 
+void Element::set_collapsed_by_extension(bool collapsed)
+{
+    if (m_is_collapsed_by_extension == collapsed)
+        return;
+    m_is_collapsed_by_extension = collapsed;
+    CSS::record_element_adjustment_facts(*this);
+    if (document().is_active())
+        document().page().client().request_frame_for(document());
+}
+
 Layout::NodeWithStyle* Element::pseudo_element_layout_node(Layout::BegunRead const& read, CSS::PseudoElement pseudo_element) const
 {
     if (CSS::is_synthetic_pseudo_element(pseudo_element))

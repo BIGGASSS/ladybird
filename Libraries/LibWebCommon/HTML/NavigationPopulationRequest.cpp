@@ -251,6 +251,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::NavigationPopulationResult con
     TRY(encoder.encode(result.inline_content_origin));
     TRY(encoder.encode(result.document_id));
     TRY(encoder.encode(result.extension_generation));
+    TRY(encoder.encode(result.blocked_by_extension));
     return {};
 }
 
@@ -268,6 +269,7 @@ ErrorOr<Web::HTML::NavigationPopulationResult> decode(Decoder& decoder)
         .inline_content_origin = TRY(decoder.decode<Optional<URL::Origin>>()),
         .document_id = TRY(decoder.decode<Optional<Web::HTML::CrossProcessId>>()),
         .extension_generation = TRY(decoder.decode<Optional<u64>>()),
+        .blocked_by_extension = TRY(decoder.decode<bool>()),
     };
 }
 

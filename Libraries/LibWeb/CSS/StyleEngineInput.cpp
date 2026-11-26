@@ -1726,7 +1726,7 @@ static u32 open_box_type_adjustment_facts(DOM::Element const& element, ElementOp
         }
     }
 
-    set(has_flag(open_facts, ElementOpenFacts::Audio) && !element.has_attribute(HTML::AttributeNames::controls), ElementStyleAdjustmentFact::HideAudioWithoutControls);
+    set((has_flag(open_facts, ElementOpenFacts::Audio) && !element.has_attribute(HTML::AttributeNames::controls)) || element.is_collapsed_by_extension(), ElementStyleAdjustmentFact::HideAudioWithoutControls);
     set(element.is_document_element(), ElementStyleAdjustmentFact::IsDocumentElement);
     return facts;
 }

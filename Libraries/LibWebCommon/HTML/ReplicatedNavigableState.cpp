@@ -80,6 +80,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::HostedNavigableState const& st
     TRY(encoder.encode(state.is_closing));
     TRY(encoder.encode(state.container));
     TRY(encoder.encode(state.delays_the_load_event_of_its_container));
+    TRY(encoder.encode(state.is_collapsed_by_extension));
     TRY(encoder.encode(state.compositor_context_id));
     return {};
 }
@@ -92,6 +93,7 @@ ErrorOr<Web::HTML::HostedNavigableState> decode(Decoder& decoder)
         .is_closing = TRY(decoder.decode<bool>()),
         .container = TRY(decoder.decode<Web::HTML::ReplicatedContainerState>()),
         .delays_the_load_event_of_its_container = TRY(decoder.decode<bool>()),
+        .is_collapsed_by_extension = TRY(decoder.decode<bool>()),
         .compositor_context_id = TRY(decoder.decode<Optional<Web::CompositorContextId>>()),
     };
 }
@@ -119,6 +121,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::ReplicatedNavigableState const
     TRY(encoder.encode(state.is_closing));
     TRY(encoder.encode(state.container));
     TRY(encoder.encode(state.delays_the_load_event_of_its_container));
+    TRY(encoder.encode(state.is_collapsed_by_extension));
     TRY(encoder.encode(state.has_session_history_entry_and_ready_for_navigation));
     TRY(encoder.encode(state.compositor_context_id));
     return {};
@@ -148,6 +151,7 @@ ErrorOr<Web::HTML::ReplicatedNavigableState> decode(Decoder& decoder)
         .is_closing = TRY(decoder.decode<bool>()),
         .container = TRY(decoder.decode<Web::HTML::ReplicatedContainerState>()),
         .delays_the_load_event_of_its_container = TRY(decoder.decode<bool>()),
+        .is_collapsed_by_extension = TRY(decoder.decode<bool>()),
         .has_session_history_entry_and_ready_for_navigation = TRY(decoder.decode<bool>()),
         .compositor_context_id = TRY(decoder.decode<Optional<Web::CompositorContextId>>()),
     };

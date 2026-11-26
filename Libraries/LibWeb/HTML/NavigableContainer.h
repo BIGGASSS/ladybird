@@ -64,6 +64,9 @@ public:
     void report_content_navigable_viewport_rect(Layout::BegunRead const& read);
     bool stats_displayed() const { return m_reported_stats_displayed.value_or(false); }
 
+    void set_collapsed_by_own_request(bool collapsed);
+    void set_collapsed_by_content_navigable(bool collapsed);
+
 protected:
     NavigableContainer(DOM::Document&, DOM::QualifiedName);
 
@@ -82,6 +85,7 @@ protected:
     GC::Ptr<Navigable> m_content_navigable { nullptr };
 
     void set_potentially_delays_the_load_event(bool value);
+    void update_collapsed_by_extension();
 
 private:
     virtual bool is_navigable_container() const override { return true; }
@@ -105,6 +109,9 @@ private:
 
     void report_used_color_scheme(CSS::PreferredColorScheme);
     CSS::PreferredColorScheme m_used_color_scheme { CSS::PreferredColorScheme::Light };
+
+    bool m_collapsed_by_own_request { false };
+    bool m_collapsed_by_content_navigable { false };
 };
 
 }

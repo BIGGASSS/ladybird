@@ -261,6 +261,17 @@ static Optional<URL::URL> url_for_extension(String const& extension_id, Optional
     return result;
 }
 
+static bool web_navigation_url_is_eligible(URL::URL const& url)
+{
+    if (url.scheme().is_one_of("http"sv, "https"sv, "file"sv, "data"sv, "blob"sv))
+        return true;
+    if (url.scheme() == "about"sv) {
+        auto path = url.serialize_path();
+        return path == "blank"sv || path == "srcdoc"sv;
+    }
+    return false;
+}
+
 void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments_json)
 {
     auto respond = [&](bool succeeded, Optional<JsonValue> result) {
@@ -504,7 +515,106 @@ void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_i
     }
 
     if (method == "runtime.sendMessage"sv)
-        return send_message(client, caller, context_id, call_id, extension_id, arguments);
+        return send_message(client, page_id, document_id, context_id, call_id, extension_id, arguments);
+
+    auto caller_is_extension_page = [&]() {
+        auto* page = client.page(page_id);
+        if (!page || !page->is_open() || !page->has_traversable())
+            return false;
+        bool authorized = false;
+        page->view().traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
+            auto& document = navigable.active_document();
+            auto const& url = navigable.active_document_url();
+            if (document.id() == document_id && document.host().ptr() == page
+                && url.scheme() == "chrome-extension"sv
+                && url.serialized_host() == extension_id
+                && !document.origin().is_opaque()
+                && document.origin().scheme() == "chrome-extension"sv
+                && document.origin().host().serialize() == extension_id) {
+                authorized = true;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+        return authorized;
+    };
+
+    // https://developer.chrome.com/docs/extensions/reference/api/webNavigation
+    if (method.starts_with_bytes("webNavigation."sv)) {
+        if (!caller_is_extension_page())
+            return fail("Extension context is not authorized"sv);
+        if (!extension_has_permission(extension_id, "webNavigation"sv))
+            return fail("Extension does not have webNavigation permission"sv);
+
+        auto describe_frame = [](CanonicalNavigable const& navigable) {
+            auto const* parent = navigable.parent();
+            JsonObject frame;
+            frame.set("frameId"sv, navigable.extension_frame_id());
+            frame.set("parentFrameId"sv, parent ? static_cast<i64>(parent->extension_frame_id()) : -1);
+            frame.set("url"sv, navigable.active_document_url().serialize());
+            frame.set("documentId"sv, MUST(String::formatted("{}", navigable.active_document().id())));
+            if (parent)
+                frame.set("parentDocumentId"sv, MUST(String::formatted("{}", parent->active_document().id())));
+            frame.set("documentLifecycle"sv, "active"sv);
+            frame.set("frameType"sv, parent ? "sub_frame"sv : "outermost_frame"sv);
+            frame.set("errorOccurred"sv, navigable.active_document().creation_url() == URL::about_error());
+            frame.set("processId"sv, 0);
+            return frame;
+        };
+
+        auto details = argument_object(0);
+        if (method == "webNavigation.getAllFrames"sv) {
+            auto tab_id = details.get_u64("tabId"sv);
+            if (!tab_id.has_value())
+                return fail("Invalid tabId"sv);
+            auto view = tab(*tab_id);
+            if (!view.has_value())
+                return respond(true, JsonValue {});
+            JsonArray frames;
+            view->traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
+                if (!web_navigation_url_is_eligible(navigable.active_document_url()))
+                    return IterationDecision::Continue;
+                frames.must_append(describe_frame(navigable));
+                return IterationDecision::Continue;
+            });
+            return respond(true, move(frames));
+        }
+
+        if (method == "webNavigation.getFrame"sv) {
+            auto tab_id = details.get_u64("tabId"sv);
+            auto requested_frame_id = details.get_u64("frameId"sv);
+            auto requested_document_id = details.get_string("documentId"sv);
+            if (!requested_document_id.has_value() && (!tab_id.has_value() || !requested_frame_id.has_value()))
+                return fail("Invalid frame details"sv);
+
+            Optional<JsonObject> found;
+            auto search_view = [&](ViewImplementation& view) {
+                view.traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
+                    if (!web_navigation_url_is_eligible(navigable.active_document_url()))
+                        return IterationDecision::Continue;
+                    if (requested_document_id.has_value() && MUST(String::formatted("{}", navigable.active_document().id())) != *requested_document_id)
+                        return IterationDecision::Continue;
+                    if (requested_frame_id.has_value() && navigable.extension_frame_id() != *requested_frame_id)
+                        return IterationDecision::Continue;
+                    found = describe_frame(navigable);
+                    return IterationDecision::Break;
+                });
+            };
+            if (tab_id.has_value()) {
+                if (auto view = tab(*tab_id); view.has_value())
+                    search_view(*view);
+            } else {
+                for (auto& view : tabs()) {
+                    search_view(view);
+                    if (found.has_value())
+                        break;
+                }
+            }
+            if (!found.has_value())
+                return respond(true, JsonValue {});
+            return respond(true, move(*found));
+        }
+    }
 
     // https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest
     if (method.starts_with_bytes("declarativeNetRequest."sv)) {
@@ -564,25 +674,7 @@ void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_i
 
     // https://developer.chrome.com/docs/extensions/reference/api/scripting
     if (method.starts_with_bytes("scripting."sv)) {
-        auto* page = client.page(page_id);
-        bool caller_is_extension_page = false;
-        if (page && page->is_open() && page->has_traversable()) {
-            page->view().traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
-                auto& document = navigable.active_document();
-                auto const& url = navigable.active_document_url();
-                if (document.id() == document_id && document.host().ptr() == page
-                    && url.scheme() == "chrome-extension"sv
-                    && url.serialized_host() == extension_id
-                    && !document.origin().is_opaque()
-                    && document.origin().scheme() == "chrome-extension"sv
-                    && document.origin().host().serialize() == extension_id) {
-                    caller_is_extension_page = true;
-                    return IterationDecision::Break;
-                }
-                return IterationDecision::Continue;
-            });
-        }
-        if (!caller_is_extension_page)
+        if (!caller_is_extension_page())
             return fail("Extension context is not authorized"sv);
         if (!m_manager.extension_has_scripting_permission(extension_id))
             return fail("Extension does not have scripting permission"sv);
@@ -741,11 +833,139 @@ void ExtensionHost::on_tab_created(ViewImplementation& view)
     }
 }
 
+bool ExtensionHost::extension_has_permission(String const& extension_id, StringView permission) const
+{
+    auto manifest = m_manager.manifest(extension_id);
+    if (!manifest.has_value())
+        return false;
+    auto permissions = manifest->get_array("permissions"sv);
+    if (!permissions.has_value())
+        return false;
+    bool found = false;
+    permissions->for_each([&](JsonValue const& value) {
+        if (value.is_string() && value.as_string() == permission)
+            found = true;
+    });
+    return found;
+}
+
+static JsonObject build_web_navigation_event_details(ViewImplementation const& view, CanonicalNavigable const& navigable, double timestamp)
+{
+    auto const* parent = navigable.parent();
+    JsonObject details;
+    details.set("tabId"sv, view.view_id());
+    details.set("url"sv, navigable.active_document_url().serialize());
+    details.set("frameId"sv, navigable.extension_frame_id());
+    details.set("parentFrameId"sv, parent ? static_cast<i64>(parent->extension_frame_id()) : -1);
+    details.set("documentId"sv, MUST(String::formatted("{}", navigable.active_document().id())));
+    if (parent)
+        details.set("parentDocumentId"sv, MUST(String::formatted("{}", parent->active_document().id())));
+    details.set("documentLifecycle"sv, "active"sv);
+    details.set("frameType"sv, parent ? "sub_frame"sv : "outermost_frame"sv);
+    details.set("processId"sv, 0);
+    details.set("timeStamp"sv, timestamp);
+    return details;
+}
+
 void ExtensionHost::on_tab_document_committed(ViewImplementation& view)
 {
     if (!is_tab(view))
         return;
     revoke_active_tab_grants_for_tab(view.view_id(), view.traversable().active_document().origin());
+}
+
+void ExtensionHost::on_frame_committed(ViewImplementation& view, CanonicalNavigable const& navigable)
+{
+    flush_deferred_messages_for_document(navigable.active_document().id());
+
+    if (!is_tab(view))
+        return;
+    if (!web_navigation_url_is_eligible(navigable.active_document_url()))
+        return;
+
+    auto timestamp = static_cast<double>(UnixDateTime::now().milliseconds_since_epoch());
+    bool is_error_page = navigable.active_document().creation_url() == URL::about_error();
+    for (auto const& extension : m_manager.extensions()) {
+        if (!extension_has_permission(extension.id, "webNavigation"sv))
+            continue;
+        auto details = build_web_navigation_event_details(view, navigable, timestamp);
+        JsonArray arguments;
+        if (is_error_page) {
+            details.set("error"sv, "net::ERR_FAILED"sv);
+            arguments.must_append(move(details));
+            deliver_event(extension.id, "webNavigation.onErrorOccurred"_string, arguments);
+        } else {
+            details.set("transitionType"sv, "link"sv);
+            details.set("transitionQualifiers"sv, JsonArray {});
+            arguments.must_append(move(details));
+            deliver_event(extension.id, "webNavigation.onCommitted"_string, arguments);
+        }
+    }
+}
+
+void ExtensionHost::on_frame_completed(ViewImplementation& view, CanonicalNavigable const& navigable)
+{
+    if (!is_tab(view))
+        return;
+    if (!web_navigation_url_is_eligible(navigable.active_document_url()))
+        return;
+    if (navigable.active_document().creation_url() == URL::about_error())
+        return;
+
+    auto timestamp = static_cast<double>(UnixDateTime::now().milliseconds_since_epoch());
+    for (auto const& extension : m_manager.extensions()) {
+        if (!extension_has_permission(extension.id, "webNavigation"sv))
+            continue;
+        auto details = build_web_navigation_event_details(view, navigable, timestamp);
+        JsonArray arguments;
+        arguments.must_append(move(details));
+        deliver_event(extension.id, "webNavigation.onCompleted"_string, arguments);
+    }
+}
+
+void ExtensionHost::on_frame_error_occurred(ViewImplementation& view, CanonicalNavigable const& navigable, URL::URL const& url, StringView error)
+{
+    if (!is_tab(view))
+        return;
+    if (!web_navigation_url_is_eligible(url))
+        return;
+
+    auto timestamp = static_cast<double>(UnixDateTime::now().milliseconds_since_epoch());
+    auto const* parent = navigable.parent();
+    for (auto const& extension : m_manager.extensions()) {
+        if (!extension_has_permission(extension.id, "webNavigation"sv))
+            continue;
+        JsonObject details;
+        details.set("tabId"sv, view.view_id());
+        details.set("url"sv, url.serialize());
+        details.set("frameId"sv, navigable.extension_frame_id());
+        details.set("parentFrameId"sv, parent ? static_cast<i64>(parent->extension_frame_id()) : -1);
+        if (parent)
+            details.set("parentDocumentId"sv, MUST(String::formatted("{}", parent->active_document().id())));
+        details.set("documentLifecycle"sv, "active"sv);
+        details.set("frameType"sv, parent ? "sub_frame"sv : "outermost_frame"sv);
+        details.set("processId"sv, 0);
+        details.set("error"sv, error);
+        details.set("timeStamp"sv, timestamp);
+        JsonArray arguments;
+        arguments.must_append(move(details));
+        deliver_event(extension.id, "webNavigation.onErrorOccurred"_string, arguments);
+    }
+}
+
+void ExtensionHost::on_populated_document_abandoned(Web::HTML::CrossProcessId document_id)
+{
+    Vector<DeferredMessage> abandoned;
+    m_deferred_messages.remove_all_matching([&](DeferredMessage& entry) {
+        if (entry.document_id != document_id)
+            return false;
+        abandoned.append(move(entry));
+        return true;
+    });
+    for (auto& entry : abandoned) {
+        if (auto sender = entry.sender.strong_ref(); sender && sender->is_open())
+            sender->async_extension_api_call_completed(entry.call_id, entry.context_id, false, "\"Extension context is not authorized\""_string);
+    }
 }
 
 void ExtensionHost::on_tab_updated(ViewImplementation& view, TabUpdate const& update)
@@ -866,34 +1086,95 @@ void ExtensionHost::on_tab_crashed(u64 view_id)
     });
 }
 
-JsonObject ExtensionHost::build_message_sender(Optional<ViewImplementation&> caller, String const& extension_id, String const& sender_url, bool sender_is_top_level) const
+static bool is_canonical_extension_page(CanonicalNavigable const& navigable, CanonicalDocument const& document, StringView extension_id)
 {
-    JsonObject sender;
-    sender.set("id"sv, extension_id);
-    sender.set("url"sv, sender_url);
-    if (auto url = URL::Parser::basic_parse(sender_url); url.has_value() && !url->origin().is_opaque())
-        sender.set("origin"sv, url->origin().serialize());
-    if (caller.has_value() && is_tab(*caller)) {
-        sender.set("tab"sv, describe_tab(*caller, extension_id));
-        sender.set("frameId"sv, sender_is_top_level ? 0 : 1);
-    }
-    return sender;
+    auto const& url = navigable.active_document_url();
+    return url.scheme() == "chrome-extension"sv
+        && url.serialized_host() == extension_id
+        && !document.origin().is_opaque()
+        && document.origin().scheme() == "chrome-extension"sv
+        && document.origin().host().serialize() == extension_id;
 }
 
 // https://developer.chrome.com/docs/extensions/develop/concepts/messaging
-void ExtensionHost::send_message(WebContentClient& client, Optional<ViewImplementation&> caller, u64 context_id, u64 call_id, String const& extension_id, JsonArray const& arguments)
+void ExtensionHost::send_message(WebContentClient& client, Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, JsonArray const& arguments)
 {
-    // The arguments are where the message goes ({tabId}), the message as JSON, the sender's URL, and whether the sender
-    // is a top-level document.
-    if (arguments.size() < 4 || !arguments.at(0).is_object() || !arguments.at(1).is_string() || !arguments.at(2).is_string()) {
-        client.async_extension_api_call_completed(call_id, context_id, false, "\"Invalid arguments\""_string);
-        return;
-    }
+    auto fail = [&](StringView error) {
+        if (client.is_open())
+            client.async_extension_api_call_completed(call_id, context_id, false, JsonValue { MUST(String::from_utf8(error)) }.serialized());
+    };
+
+    // The arguments are where the message goes ({tabId}) and the message as JSON.
+    if (arguments.size() < 2 || !arguments.at(0).is_object() || !arguments.at(1).is_string())
+        return fail("Invalid arguments"sv);
+
+    if (client.is_private() == IsPrivate::Yes || !m_manager.manifest(extension_id).has_value())
+        return fail("Extension context is not authorized"sv);
 
     auto target_tab_id = arguments.at(0).as_object().get_u64("tabId"sv);
     auto only_top_level_frame = arguments.at(0).as_object().get_u64("frameId"sv) == 0u;
     auto const& message = arguments.at(1).as_string();
-    auto sender_json = build_message_sender(caller, extension_id, arguments.at(2).as_string(), arguments.at(3).as_bool()).serialized();
+
+    auto* page = client.page(page_id);
+    if (!page || !page->is_open() || !page->has_traversable())
+        return fail("Extension context is not authorized"sv);
+
+    auto& caller_view = page->view();
+    CanonicalNavigable* caller_navigable = nullptr;
+    bool has_pending_populated_document = false;
+    caller_view.traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
+        auto& active_doc = navigable.active_document();
+        if (active_doc.id() == document_id && active_doc.host().ptr() == page) {
+            caller_navigable = &navigable;
+            return IterationDecision::Break;
+        }
+        if (auto pending_doc = navigable.document_with_id(document_id); pending_doc && pending_doc->host().ptr() == page)
+            has_pending_populated_document = true;
+        return IterationDecision::Continue;
+    });
+
+    if (caller_navigable) {
+        deliver_send_message(client, caller_view, *caller_navigable, caller_navigable->active_document(), context_id, call_id, extension_id, target_tab_id, only_top_level_frame, message);
+        return;
+    }
+
+    if (has_pending_populated_document) {
+        m_deferred_messages.append({
+            .sender = client,
+            .sender_key = &client,
+            .page_id = page_id,
+            .document_id = document_id,
+            .context_id = context_id,
+            .call_id = call_id,
+            .extension_id = extension_id,
+            .target_tab_id = target_tab_id,
+            .only_top_level_frame = only_top_level_frame,
+            .message = message,
+        });
+        return;
+    }
+
+    fail("Extension context is not authorized"sv);
+}
+
+void ExtensionHost::deliver_send_message(WebContentClient& client, ViewImplementation& caller_view, CanonicalNavigable const& caller_navigable, CanonicalDocument& caller_document, u64 context_id, u64 call_id, String const& extension_id, Optional<u64> target_tab_id, bool only_top_level_frame, String const& message)
+{
+    auto fail = [&](StringView error) {
+        if (client.is_open())
+            client.async_extension_api_call_completed(call_id, context_id, false, JsonValue { MUST(String::from_utf8(error)) }.serialized());
+    };
+
+    bool caller_is_extension_page = is_canonical_extension_page(caller_navigable, caller_document, extension_id);
+    bool caller_is_content_script = !caller_is_extension_page && is_tab(caller_view)
+        && document_is_authorized_for_content_script(caller_navigable, caller_document, extension_id);
+    if (!caller_is_extension_page && !caller_is_content_script)
+        return fail("Extension context is not authorized"sv);
+    if (target_tab_id.has_value() && !caller_is_extension_page)
+        return fail("Extension context is not authorized"sv);
+
+    auto sender = build_port_sender(caller_view, caller_navigable, caller_document, extension_id);
+    sender.set("documentLifecycle"sv, "active"sv);
+    auto sender_json = sender.serialized();
 
     auto delivery_id = ++m_next_delivery_id;
     PendingMessage pending { .sender = client, .call_id = call_id, .context_id = context_id };
@@ -901,10 +1182,8 @@ void ExtensionHost::send_message(WebContentClient& client, Optional<ViewImplemen
     if (target_tab_id.has_value()) {
         // A message to a tab goes to the extension's content scripts in each of the pages that make up the tab.
         auto view = tab(*target_tab_id);
-        if (!view.has_value()) {
-            client.async_extension_api_call_completed(call_id, context_id, false, "\"No tab with that ID\""_string);
-            return;
-        }
+        if (!view.has_value())
+            return fail("No tab with that ID"sv);
         WebContentClient::for_each_client([&](WebContentClient& target) {
             target.for_each_page([&](WebContentPage& page) {
                 if (page.has_traversable() && &page.view() == &view.value()) {
@@ -928,6 +1207,42 @@ void ExtensionHost::send_message(WebContentClient& client, Optional<ViewImplemen
 
     m_pending_messages.set(delivery_id, move(pending));
     finish_message(delivery_id);
+}
+
+void ExtensionHost::flush_deferred_messages_for_document(Web::HTML::CrossProcessId document_id)
+{
+    Vector<DeferredMessage> ready;
+    m_deferred_messages.remove_all_matching([&](DeferredMessage& entry) {
+        if (entry.document_id != document_id)
+            return false;
+        ready.append(move(entry));
+        return true;
+    });
+    for (auto& entry : ready) {
+        auto sender = entry.sender.strong_ref();
+        if (!sender || !sender->is_open())
+            continue;
+        auto* page = sender->page(entry.page_id);
+        if (!page || !page->is_open() || !page->has_traversable()) {
+            sender->async_extension_api_call_completed(entry.call_id, entry.context_id, false, "\"Extension context is not authorized\""_string);
+            continue;
+        }
+        auto& caller_view = page->view();
+        CanonicalNavigable* caller_navigable = nullptr;
+        caller_view.traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable& navigable) {
+            auto& active_doc = navigable.active_document();
+            if (active_doc.id() == entry.document_id && active_doc.host().ptr() == page) {
+                caller_navigable = &navigable;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+        if (!caller_navigable) {
+            sender->async_extension_api_call_completed(entry.call_id, entry.context_id, false, "\"Extension context is not authorized\""_string);
+            continue;
+        }
+        deliver_send_message(*sender, caller_view, *caller_navigable, caller_navigable->active_document(), entry.context_id, entry.call_id, entry.extension_id, entry.target_tab_id, entry.only_top_level_frame, entry.message);
+    }
 }
 
 void ExtensionHost::did_handle_message(WebContentClient&, u64 delivery_id, u8 status_value, String const& response_json)
@@ -1492,6 +1807,10 @@ void ExtensionHost::on_client_disconnected(WebContentClient& client)
         m_pending_scripting_injections.remove(injection_id);
     for (auto injection_id : completed_injections)
         finish_scripting_injection(injection_id);
+
+    m_deferred_messages.remove_all_matching([&](DeferredMessage const& entry) {
+        return entry.sender_key == &client;
+    });
 }
 
 void ExtensionHost::execute_scripting_injection(WebContentClient& caller_client, u64 context_id, u64 call_id, String const& extension_id, StringView method, JsonObject const& injection)

@@ -280,9 +280,13 @@ private:
     RefPtr<CanonicalDocumentState> m_document_state_populated_by_history_job;
     RefPtr<CanonicalSessionHistoryEntry> m_current_session_history_entry;
     RefPtr<CanonicalSessionHistoryEntry> m_active_session_history_entry;
+    enum class NavigationEndReason : u8 {
+        Finished,
+        Canceled,
+    };
     void set_the_ongoing_navigation(OngoingNavigation);
     void notify_view_of_ongoing_navigation() const;
-    void end_navigation(CanonicalNavigation&);
+    void end_navigation(CanonicalNavigation&, NavigationEndReason);
     OngoingNavigation m_ongoing_navigation;
     Vector<NonnullRefPtr<CanonicalNavigation>> m_navigations;
 

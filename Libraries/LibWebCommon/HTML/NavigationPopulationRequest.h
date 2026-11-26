@@ -74,6 +74,7 @@ struct NavigationPopulationResult {
     Optional<URL::Origin> inline_content_origin {};
     Optional<CrossProcessId> document_id {};
     Optional<u64> extension_generation {};
+    bool blocked_by_extension { false };
 };
 
 struct HistoryNavigationPopulation {

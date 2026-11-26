@@ -244,6 +244,7 @@ public:
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
     Optional<HTTP::Cookie::SameSiteStatus> navigation_same_site_status;
+    bool blocked_by_extension { false };
 
 private:
     virtual void visit_edges(Cell::Visitor& visitor) override
@@ -1022,6 +1023,7 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
     output->inline_content_origin = move(result.inline_content_origin);
     output->document_id = result.document_id;
     output->extension_generation = result.extension_generation;
+    output->blocked_by_extension = result.blocked_by_extension;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
     // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
@@ -1228,11 +1230,15 @@ void LocalNavigable::inherit_page_state_from(LocalNavigable const& parent)
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#activate-history-entry
 void LocalNavigable::activate_history_entry(NonnullRefPtr<SessionHistoryEntry> entry, GC::Ref<DOM::Document> document)
 {
+    auto collapsed_by_extension = !is_top_level_traversable() && document->was_blocked_by_extension();
+
     // AD-HOC: The document a provisional navigable populated activates: the navigable takes its container over first,
     //         so that the document is the content navigable's active document, and the WindowProxy's [[Window]], from
     //         its activation.
-    if (is_provisional())
+    if (is_provisional()) {
+        m_is_collapsed_by_extension = collapsed_by_extension;
         page().adopt_hosted(*this);
+    }
 
     // 1. Save persisted state to the navigable's active session history entry.
     save_persisted_state_to_active_session_history_entry();
@@ -1250,6 +1256,7 @@ void LocalNavigable::activate_history_entry(NonnullRefPtr<SessionHistoryEntry> e
     //     a reconstructed entry only knows by ID.
     m_active_session_history_entry = entry;
     set_active_document(new_document);
+    set_collapsed_by_extension(collapsed_by_extension);
 
     // 5. Make active newDocument.
     new_document->make_active();
@@ -1610,6 +1617,7 @@ ReplicatedNavigableState LocalNavigable::replicated_state() const
         .is_closing = m_closing,
         .container = container_state(),
         .delays_the_load_event_of_its_container = delays_the_load_event_of_its_container(),
+        .is_collapsed_by_extension = m_is_collapsed_by_extension,
         .has_session_history_entry_and_ready_for_navigation = m_has_session_history_entry_and_ready_for_navigation,
         .compositor_context_id = has_compositor_context() ? Optional<Web::CompositorContextId> { compositor_context().id() } : Optional<Web::CompositorContextId> {},
     };
@@ -1682,8 +1690,19 @@ HostedNavigableState LocalNavigable::hosted_state() const
         .is_closing = m_closing,
         .container = container_state(),
         .delays_the_load_event_of_its_container = delays_the_load_event_of_its_container(),
+        .is_collapsed_by_extension = m_is_collapsed_by_extension,
         .compositor_context_id = has_compositor_context() ? Optional<Web::CompositorContextId> { compositor_context().id() } : Optional<Web::CompositorContextId> {},
     };
+}
+
+void LocalNavigable::set_collapsed_by_extension(bool value)
+{
+    if (m_is_collapsed_by_extension == value)
+        return;
+    m_is_collapsed_by_extension = value;
+    if (auto container = this->container())
+        container->set_collapsed_by_content_navigable(value);
+    report_state_to_remote_container();
 }
 
 void LocalNavigable::report_hosted_state()
@@ -2947,6 +2966,7 @@ static void create_navigation_params_by_fetching(
             result->navigation_params = state_holder->response->network_error_message().map([](auto const& error_message) {
                 return Utf16String::from_utf8(error_message);
             });
+            result->blocked_by_extension = state_holder->response->should_collapse_initiator();
             completion_steps->function()(*result);
             return;
         }
@@ -3114,6 +3134,7 @@ static void create_navigation_population_result(Window& window, GC::Ref<Internal
             .replacement_document_state = move(replacement_document_state),
             .resource_cleared = result->resource_cleared,
             .navigation_same_site_status = result->navigation_same_site_status,
+            .blocked_by_extension = result->blocked_by_extension,
         });
     }));
 }
@@ -3222,6 +3243,7 @@ bool DocumentToCreate::takes_over_window_of(DOM::Document const& document) const
 GC::Ref<DOM::Document> DocumentToCreate::create_document()
 {
     auto document = m_load_steps->function()(*m_navigation_params);
+    document->set_was_blocked_by_extension(m_blocked_by_extension);
     if (m_navigation_params->response->network_transport().has_value())
         m_navigation_params->response->resume_body_delivery(*surrounding_agent().fetch_executor);
     m_navigation_params = nullptr;
@@ -3460,6 +3482,8 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
             //         any — rather than the URL it started at.
             auto error_url = output->redirected_url.value_or(url);
             output->document_to_create = navigation_error_document(self, navigation_id, navigation_timing_type, user_involvement, output->inline_content_origin.value(), output->document_id, error_url, error_message);
+            if (output->blocked_by_extension)
+                output->document_to_create->set_blocked_by_extension(true);
 
             // 2. Make document unsalvageable given entry's document state's document and "navigation-failure".
             // AD-HOC: That happens when the document is created.

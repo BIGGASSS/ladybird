@@ -80,6 +80,10 @@ public:
     };
     void on_tab_created(ViewImplementation&);
     void on_tab_document_committed(ViewImplementation&);
+    void on_frame_committed(ViewImplementation&, CanonicalNavigable const&);
+    void on_frame_completed(ViewImplementation&, CanonicalNavigable const&);
+    void on_frame_error_occurred(ViewImplementation&, CanonicalNavigable const&, URL::URL const& url, StringView error);
+    void on_populated_document_abandoned(Web::HTML::CrossProcessId document_id);
     void on_tab_updated(ViewImplementation&, TabUpdate const&);
     void on_tab_activated(ViewImplementation&);
     void on_tab_removed(u64 view_id);
@@ -100,10 +104,12 @@ private:
         Explicit,
         Passive,
     };
-    void send_message(WebContentClient&, Optional<ViewImplementation&> caller, u64 context_id, u64 call_id, String const& extension_id, JsonArray const& arguments);
+    void send_message(WebContentClient&, Web::PageId, Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, JsonArray const& arguments);
+    void deliver_send_message(WebContentClient&, ViewImplementation&, CanonicalNavigable const&, CanonicalDocument&, u64 context_id, u64 call_id, String const& extension_id, Optional<u64> target_tab_id, bool only_top_level_frame, String const& message);
+    void flush_deferred_messages_for_document(Web::HTML::CrossProcessId document_id);
     void finish_message(u64 delivery_id);
     bool document_is_authorized_for_content_script(CanonicalNavigable const&, CanonicalDocument&, StringView extension_id);
-    JsonObject build_message_sender(Optional<ViewImplementation&> caller, String const& extension_id, String const& sender_url, bool sender_is_top_level) const;
+    bool extension_has_permission(String const& extension_id, StringView permission) const;
     JsonObject build_port_sender(ViewImplementation&, CanonicalNavigable const&, CanonicalDocument const&, String const& extension_id) const;
     void maybe_finish_port_channel(u64 channel_id);
     void expire_port_open(u64 channel_id);
@@ -132,6 +138,19 @@ private:
         bool will_respond { false };
         bool has_responded { false };
     };
+    struct DeferredMessage {
+        WeakPtr<WebContentClient> sender;
+        WebContentClient const* sender_key { nullptr };
+        Web::PageId page_id {};
+        Web::HTML::CrossProcessId document_id {};
+        u64 context_id { 0 };
+        u64 call_id { 0 };
+        String extension_id;
+        Optional<u64> target_tab_id {};
+        bool only_top_level_frame { false };
+        String message;
+    };
+    Vector<DeferredMessage> m_deferred_messages;
     HashMap<u64, PendingMessage> m_pending_messages;
     u64 m_next_delivery_id { 0 };
 

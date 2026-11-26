@@ -819,6 +819,7 @@ CanonicalTraversable& CanonicalTraversable::create_a_new_top_level_traversable(W
         .is_closing = false,
         .container = {},
         .delays_the_load_event_of_its_container = false,
+        .is_collapsed_by_extension = false,
         // The process hosting the traversable reports the compositor context it paints through.
         .compositor_context_id = {},
     });

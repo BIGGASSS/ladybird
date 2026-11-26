@@ -45,6 +45,7 @@ public:
 
     [[nodiscard]] bool is_aborted_network_error() const { return m_record->is_aborted_network_error(); }
     [[nodiscard]] bool is_network_error() const { return m_record->is_network_error(); }
+    [[nodiscard]] bool should_collapse_initiator() const { return m_record->should_collapse_initiator(); }
     [[nodiscard]] Optional<URL::URL const&> url() const { return m_record->url(); }
     [[nodiscard]] ErrorOr<Optional<URL::URL>> location_url(Optional<StringView> request_fragment) const { return m_record->location_url(request_fragment); }
     [[nodiscard]] bool is_cors_same_origin() const { return m_record->is_cors_same_origin(); }

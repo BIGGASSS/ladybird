@@ -871,6 +871,9 @@ public:
     void set_rendered_in_top_layer(bool rendered_in_top_layer);
     bool rendered_in_top_layer() const { return m_rendered_in_top_layer; }
 
+    void set_collapsed_by_extension(bool collapsed);
+    bool is_collapsed_by_extension() const { return m_is_collapsed_by_extension; }
+
     ProximityToTheViewport proximity_to_the_viewport() const;
     void determine_proximity_to_the_viewport(Layout::BegunRead const& read);
 
@@ -1117,6 +1120,7 @@ private:
     bool m_is_marked_on_focus_within_chain : 1 { false };
     bool m_in_top_layer : 1 { false };
     bool m_rendered_in_top_layer : 1 { false };
+    bool m_is_collapsed_by_extension : 1 { false };
     // Authoritative dependency marks left by this element's latest style computation.
     bool m_style_uses_attr_css_function : 1 { false };
     bool m_style_uses_if_css_function : 1 { false };

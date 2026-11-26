@@ -226,8 +226,20 @@ void HTMLEmbedElement::run_setup_steps(u64 generation)
 {
     // NB: Step 1 is done by the task that runs these steps. And since the steps are queued whenever the element may
     //     have become potentially active, they check here that it is, and unload what it shows if it isn't.
-    if (!is_potentially_active()) {
+    // AD-HOC: Temporarily suspend extension collapsing while checking whether author CSS renders the element, then
+    //         restore it until the replacement fetch produces a response (or setup unloads the element).
+    bool potentially_active = false;
+    {
+        bool was_collapsed = is_collapsed_by_extension();
+        if (was_collapsed)
+            set_collapsed_by_extension(false);
+        potentially_active = is_potentially_active();
+        if (was_collapsed)
+            update_collapsed_by_extension();
+    }
+    if (!potentially_active) {
         stop_loading();
+        set_collapsed_by_own_request(false);
         return;
     }
 
@@ -236,6 +248,7 @@ void HTMLEmbedElement::run_setup_steps(u64 generation)
     if (!src.has_value()) {
         // 3. Otherwise, display no plugin for element.
         stop_loading();
+        set_collapsed_by_own_request(false);
         return;
     }
 
@@ -248,6 +261,7 @@ void HTMLEmbedElement::run_setup_steps(u64 generation)
     //         longer names anything to show.
     if (!url.has_value()) {
         stop_loading();
+        set_collapsed_by_own_request(false);
         return;
     }
 
@@ -306,9 +320,12 @@ void HTMLEmbedElement::handle_response(Fetch::Infrastructure::ResponseView& resp
     };
     // NB: A response without a URL has nothing to navigate to, so it's handled as a network error.
     if (response.is_network_error() || !response.url().has_value()) {
+        auto should_collapse = response.is_network_error() && response.should_collapse_initiator();
         handle_network_error();
+        set_collapsed_by_own_request(should_collapse);
         return;
     }
+    set_collapsed_by_own_request(false);
 
     // 3. Let type be the result of determining the type of content given element and response.
     // AD-HOC: The spec determines the type of the content only for a plugin, and otherwise returns null, so that the
@@ -412,10 +429,10 @@ void HTMLEmbedElement::handle_response(Fetch::Infrastructure::ResponseView& resp
 
 void HTMLEmbedElement::rendering_changed()
 {
-    if (!has_attribute(AttributeNames::src) || !is_connected())
+    if (is_collapsed_by_extension() || !has_attribute(AttributeNames::src) || !is_connected())
         return;
     queue_an_element_task(Task::Source::Embed, GC::create_function(heap(), GC::captures(*this), [](auto& self) {
-        if (self.has_layout_box() != self.m_was_rendered)
+        if (!self.is_collapsed_by_extension() && self.has_layout_box() != self.m_was_rendered)
             self.queue_setup_steps();
     }));
 }

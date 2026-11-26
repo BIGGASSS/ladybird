@@ -425,6 +425,7 @@
     };
     if (isPage) {
         storage.session = createStorageArea("session", 10485760);
+        storage.session.setAccessLevel = noop();
         storage.managed = createStorageArea("managed", 0, true);
     }
 
@@ -454,6 +455,7 @@
         runtime.reload = () => location.reload();
         runtime.setUninstallURL = noop();
         runtime.requestUpdateCheck = noop("no_update");
+        runtime.onUpdateAvailable = createEvent()[0];
 
         // tabs and windows
 
@@ -521,6 +523,7 @@
             onActivated: onTabActivated,
             onRemoved: onTabRemoved,
             onCreated: onTabCreated,
+            onReplaced: createEvent()[0],
         };
         chrome.windows = {
             WINDOW_ID_NONE: -1,
@@ -610,11 +613,47 @@
             MAX_NUMBER_OF_DYNAMIC_RULES: 30000,
             MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES: 30000,
             MAX_NUMBER_OF_SESSION_RULES: 5000,
+            MAX_NUMBER_OF_UNSAFE_DYNAMIC_RULES: 5000,
+            MAX_NUMBER_OF_UNSAFE_SESSION_RULES: 5000,
             MAX_NUMBER_OF_ENABLED_STATIC_RULESETS: 50,
             MAX_NUMBER_OF_REGEX_RULES: 1000,
             GUARANTEED_MINIMUM_STATIC_RULES: 30000,
             DYNAMIC_RULESET_ID: "_dynamic",
             SESSION_RULESET_ID: "_session",
+            DomainType: {
+                FIRST_PARTY: "firstParty",
+                THIRD_PARTY: "thirdParty",
+            },
+            HeaderOperation: {
+                APPEND: "append",
+                SET: "set",
+                REMOVE: "remove",
+            },
+            ResourceType: {
+                MAIN_FRAME: "main_frame",
+                SUB_FRAME: "sub_frame",
+                STYLESHEET: "stylesheet",
+                SCRIPT: "script",
+                IMAGE: "image",
+                FONT: "font",
+                OBJECT: "object",
+                XMLHTTPREQUEST: "xmlhttprequest",
+                PING: "ping",
+                CSP_REPORT: "csp_report",
+                MEDIA: "media",
+                WEBSOCKET: "websocket",
+                WEBTRANSPORT: "webtransport",
+                WEBBUNDLE: "webbundle",
+                OTHER: "other",
+            },
+            RuleActionType: {
+                BLOCK: "block",
+                REDIRECT: "redirect",
+                ALLOW: "allow",
+                UPGRADE_SCHEME: "upgradeScheme",
+                MODIFY_HEADERS: "modifyHeaders",
+                ALLOW_ALL_REQUESTS: "allowAllRequests",
+            },
             getDynamicRules: browserFunction("declarativeNetRequest.getDynamicRules", 1),
             getSessionRules: browserFunction("declarativeNetRequest.getSessionRules", 1),
             updateDynamicRules: browserFunction("declarativeNetRequest.updateDynamicRules", 1),
@@ -885,6 +924,175 @@
             remove: noop(),
             removeAll: noop(),
             onClicked: createEvent()[0],
+        };
+
+        function matchesUrlFilter(urlString, filter) {
+            if (!filter || typeof filter !== "object") return true;
+            let parsed;
+            try {
+                parsed = new URL(urlString);
+            } catch {
+                return false;
+            }
+            const scheme = parsed.protocol.endsWith(":") ? parsed.protocol.slice(0, -1).toLowerCase() : parsed.protocol.toLowerCase();
+            const host = parsed.hostname;
+            const path = parsed.pathname;
+            const query = parsed.search.startsWith("?") ? parsed.search.slice(1) : parsed.search;
+            const urlWithoutFragment = parsed.href.split("#")[0];
+            const originAndPath = parsed.origin + parsed.pathname;
+
+            const dottedHost = "." + host;
+            if (filter.hostContains !== undefined && !dottedHost.includes(filter.hostContains)) return false;
+            if (filter.hostEquals !== undefined && host !== filter.hostEquals) return false;
+            if (filter.hostPrefix !== undefined && !host.startsWith(filter.hostPrefix)) return false;
+            if (filter.hostSuffix !== undefined && !dottedHost.endsWith(filter.hostSuffix)) return false;
+
+            if (filter.pathContains !== undefined && !path.includes(filter.pathContains)) return false;
+            if (filter.pathEquals !== undefined && path !== filter.pathEquals) return false;
+            if (filter.pathPrefix !== undefined && !path.startsWith(filter.pathPrefix)) return false;
+            if (filter.pathSuffix !== undefined && !path.endsWith(filter.pathSuffix)) return false;
+
+            if (filter.queryContains !== undefined && !query.includes(filter.queryContains)) return false;
+            if (filter.queryEquals !== undefined && query !== filter.queryEquals) return false;
+            if (filter.queryPrefix !== undefined && !query.startsWith(filter.queryPrefix)) return false;
+            if (filter.querySuffix !== undefined && !query.endsWith(filter.querySuffix)) return false;
+
+            if (filter.urlContains !== undefined && !urlWithoutFragment.includes(filter.urlContains)) return false;
+            if (filter.urlEquals !== undefined && urlWithoutFragment !== filter.urlEquals) return false;
+            if (filter.urlPrefix !== undefined && !urlWithoutFragment.startsWith(filter.urlPrefix)) return false;
+            if (filter.urlSuffix !== undefined && !urlWithoutFragment.endsWith(filter.urlSuffix)) return false;
+            if (filter.urlMatches !== undefined && !new RegExp(filter.urlMatches).test(urlWithoutFragment)) return false;
+            if (filter.originAndPathMatches !== undefined && !new RegExp(filter.originAndPathMatches).test(originAndPath)) return false;
+
+            if (Array.isArray(filter.schemes) && !filter.schemes.some(s => String(s).toLowerCase() === scheme)) return false;
+            if (Array.isArray(filter.ports)) {
+                const defaultPort = scheme === "https" ? 443 : scheme === "http" ? 80 : NaN;
+                const port = parsed.port ? Number(parsed.port) : defaultPort;
+                const portMatches = filter.ports.some(p => {
+                    if (Array.isArray(p) && p.length === 2) return port >= p[0] && port <= p[1];
+                    return port === p;
+                });
+                if (!portMatches) return false;
+            }
+            return true;
+        }
+
+        function createFilteredNavigationEvent() {
+            const entries = [];
+            const event = {
+                addListener(listener, filters) {
+                    if (typeof listener !== "function") return;
+                    const existing = entries.find(e => e.listener === listener);
+                    if (existing) {
+                        existing.filters = filters;
+                        return;
+                    }
+                    entries.push({ listener, filters });
+                },
+                removeListener(listener) {
+                    const index = entries.findIndex(e => e.listener === listener);
+                    if (index !== -1) entries.splice(index, 1);
+                },
+                hasListener(listener) {
+                    return entries.some(e => e.listener === listener);
+                },
+                hasListeners() {
+                    return entries.length > 0;
+                },
+            };
+            const dispatch = details => {
+                for (const entry of entries.slice()) {
+                    try {
+                        if (entry.filters && Array.isArray(entry.filters.url)) {
+                            const url = details && typeof details.url === "string" ? details.url : "";
+                            if (!entry.filters.url.some(filter => matchesUrlFilter(url, filter))) continue;
+                        }
+                        entry.listener(details);
+                    } catch (error) {
+                        reportError(error);
+                    }
+                }
+            };
+            return [event, dispatch];
+        }
+
+        const [onBeforeNavigate, dispatchBeforeNavigate] = createFilteredNavigationEvent();
+        const [onCommitted, dispatchCommitted] = createFilteredNavigationEvent();
+        const [onCompleted, dispatchCompleted] = createFilteredNavigationEvent();
+        const [onErrorOccurred, dispatchErrorOccurred] = createFilteredNavigationEvent();
+        browserEvents["webNavigation.onBeforeNavigate"] = dispatchBeforeNavigate;
+        browserEvents["webNavigation.onCommitted"] = dispatchCommitted;
+        browserEvents["webNavigation.onCompleted"] = dispatchCompleted;
+        browserEvents["webNavigation.onErrorOccurred"] = dispatchErrorOccurred;
+        chrome.webNavigation = {
+            getAllFrames: browserFunction("webNavigation.getAllFrames", 1),
+            getFrame: browserFunction("webNavigation.getFrame", 1),
+            onBeforeNavigate,
+            onCommitted,
+            onCompleted,
+            onDOMContentLoaded: createFilteredNavigationEvent()[0],
+            onErrorOccurred,
+            onHistoryStateUpdated: createFilteredNavigationEvent()[0],
+            onReferenceFragmentUpdated: createFilteredNavigationEvent()[0],
+            onTabReplaced: createEvent()[0],
+        };
+
+        chrome.webRequest = {
+            OnBeforeRequestOptions: {
+                BLOCKING: "blocking",
+                REQUEST_BODY: "requestBody",
+                EXTRA_HEADERS: "extraHeaders",
+            },
+            OnBeforeSendHeadersOptions: {
+                REQUEST_HEADERS: "requestHeaders",
+                BLOCKING: "blocking",
+                EXTRA_HEADERS: "extraHeaders",
+            },
+            OnHeadersReceivedOptions: {
+                BLOCKING: "blocking",
+                RESPONSE_HEADERS: "responseHeaders",
+                EXTRA_HEADERS: "extraHeaders",
+            },
+            handlerBehaviorChanged: noop(),
+            onBeforeRequest: createEvent()[0],
+            onBeforeSendHeaders: createEvent()[0],
+            onSendHeaders: createEvent()[0],
+            onHeadersReceived: createEvent()[0],
+            onResponseStarted: createEvent()[0],
+            onBeforeRedirect: createEvent()[0],
+            onCompleted: createEvent()[0],
+            onErrorOccurred: createEvent()[0],
+        };
+
+        chrome.management = {
+            getSelf(callback) {
+                return settle(callback, () => ({
+                    id: extensionId,
+                    name: manifest.name || "",
+                    shortName: manifest.short_name || manifest.name || "",
+                    description: manifest.description || "",
+                    version: manifest.version || "",
+                    enabled: true,
+                    mayDisable: true,
+                    installType: "normal",
+                    type: "extension",
+                    homepageUrl: manifest.homepage_url || "",
+                    updateUrl: manifest.update_url || "",
+                }));
+            },
+        };
+
+        chrome.cookies = {
+            get: noop(null),
+            getAll(...args) {
+                return settle(popCallback(args), () => []);
+            },
+            getAllCookieStores(...args) {
+                return settle(popCallback(args), () => [{ id: "0", tabIds: [] }]);
+            },
+            set: noop(null),
+            remove: noop(null),
+            onChanged: createEvent()[0],
         };
     }
 

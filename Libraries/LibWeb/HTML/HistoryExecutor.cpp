@@ -350,6 +350,7 @@ GC::Ref<GC::Function<void(HistoryNavigationPopulation)>> HistoryExecutor::popula
         output->inline_content_origin = move(result.inline_content_origin);
         output->document_id = result.document_id;
         output->extension_generation = result.extension_generation;
+        output->blocked_by_extension = result.blocked_by_extension;
         if (result.replacement_document_state.has_value()) {
             output->replacement_document_state = DocumentState::create(result.replacement_document_state->id);
             apply_session_history_document_state_descriptor_from_ui_process(*output->replacement_document_state, *result.replacement_document_state);

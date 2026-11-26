@@ -82,6 +82,7 @@ public:
 
     virtual bool has_session_history_entry_and_ready_for_navigation() const override;
     virtual bool delays_the_load_event_of_its_container() const override;
+    bool is_collapsed_by_extension() const { return m_replicated_state.is_collapsed_by_extension; }
 
     virtual GC::Ptr<DOM::Node> currently_focused_area() override;
 

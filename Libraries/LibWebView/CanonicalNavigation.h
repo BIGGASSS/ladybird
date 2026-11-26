@@ -98,6 +98,8 @@ public:
     BlobURLHandle blob_url;
     // The page hosting the source document, as checked when another page requested the navigation.
     RefPtr<WebContentPage> source_page {};
+    bool committed { false };
+    bool reported_extension_error { false };
 
     RefPtr<WebContentPage> worker() const;
     RefPtr<WebContentPage> host() const;

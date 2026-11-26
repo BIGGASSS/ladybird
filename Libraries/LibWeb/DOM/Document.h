@@ -1177,6 +1177,9 @@ public:
     bool mute_iframe_load() const { return m_mute_iframe_load; }
     void set_mute_iframe_load(bool value) { m_mute_iframe_load = value; }
 
+    bool was_blocked_by_extension() const { return m_was_blocked_by_extension; }
+    void set_was_blocked_by_extension(bool value) { m_was_blocked_by_extension = value; }
+
     bool has_id() const { return m_id.has_value(); }
     HTML::CrossProcessId id() const { return m_id.value(); }
     void set_id(HTML::CrossProcessId);
@@ -2707,6 +2710,8 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-ancestor-origins-list
     GC::Ptr<HTML::DOMStringList> m_ancestor_origins_list;
+
+    bool m_was_blocked_by_extension { false };
 };
 
 template<>
