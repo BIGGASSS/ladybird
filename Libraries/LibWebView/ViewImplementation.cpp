@@ -33,6 +33,7 @@
 #include <LibWebView/CanonicalSessionHistoryEntry.h>
 #include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportReview.h>
+#include <LibWebView/ExtensionHost.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryDebug.h>
 #include <LibWebView/PageTranslation.h>
@@ -163,6 +164,8 @@ ViewImplementation::~ViewImplementation()
     // Leave the views before the permission manager hears: a one-time grant that ends with this view has it revoke
     // location in every view that shows the site, and this one is on its way out.
     all_views().remove(m_view_id);
+    if (auto* host = Application::the().extension_host())
+        host->on_tab_removed(m_view_id);
     session().permission_manager->remove_view(view_id());
     if (m_top_level_traversable) {
         m_top_level_traversable->clear_ongoing_navigation();
@@ -260,6 +263,13 @@ void ViewImplementation::did_update_url()
     if (auto page = traversable().display_page(); page && page->routed_connection())
         page->routed_connection()->update_audio_capture_permission();
     update_displayed_url();
+
+    auto committed_url = this->url();
+    if (m_last_committed_url != committed_url) {
+        m_last_committed_url = committed_url;
+        if (auto* host = Application::the().extension_host())
+            host->on_tab_updated(*this, { .url = committed_url });
+    }
 }
 
 void ViewImplementation::request_permission_prompt(PermissionPromptRequest request, PermissionPromptCallback on_outcome)
@@ -444,6 +454,8 @@ void ViewImplementation::set_title(Utf16String title)
 
     if (on_title_change)
         on_title_change(m_title);
+    if (auto* host = Application::the().extension_host())
+        host->on_tab_updated(*this, { .title = m_title });
 }
 
 // A page sets its title and favicon as it starts up, often from script after it loaded, or once its favicon arrived.
@@ -653,7 +665,8 @@ void ViewImplementation::start_being_hidden()
 void ViewImplementation::set_current_tab_of_window(bool current_tab_of_window)
 {
     static u64 s_became_current_tab_of_window_order = 0;
-    if (current_tab_of_window && !m_current_tab_of_window)
+    bool became_current = current_tab_of_window && !m_current_tab_of_window;
+    if (became_current)
         m_became_current_tab_of_window_order = ++s_became_current_tab_of_window_order;
     m_current_tab_of_window = current_tab_of_window;
     if (current_tab_of_window) {
@@ -661,6 +674,10 @@ void ViewImplementation::set_current_tab_of_window(bool current_tab_of_window)
         m_discard_requested = false;
     } else if (m_top_level_traversable && traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden && !m_hidden_since.has_value()) {
         start_being_hidden();
+    }
+    if (became_current) {
+        if (auto* host = Application::the().extension_host())
+            host->on_tab_activated(*this);
     }
 }
 
@@ -833,6 +850,12 @@ void ViewImplementation::did_decline_discard()
         m_hidden_since = MonotonicTime::now();
         TabDiscarder::did_hide_a_tab();
     }
+}
+
+void ViewImplementation::did_decline_close()
+{
+    if (auto* host = Application::the().extension_host())
+        host->on_tab_close_declined(view_id());
 }
 
 void ViewImplementation::finish_discard_request()
@@ -3773,6 +3796,8 @@ void ViewImplementation::initialize_tab(Web::HTML::VisibilityState system_visibi
     }
     prepare_page_for_tab(page());
     display_page_changed({});
+    if (auto* host = Application::the().extension_host())
+        host->on_tab_created(*this);
 
     languages_changed();
     content_settings_changed();
@@ -3997,6 +4022,8 @@ void ViewImplementation::set_loading_state(bool is_loading)
         m_finished_loading_time = MonotonicTime::now();
     if (on_loading_state_change)
         on_loading_state_change(is_loading);
+    if (auto* host = Application::the().extension_host())
+        host->on_tab_updated(*this, { .status = is_loading ? "loading"sv : "complete"sv });
 }
 
 void ViewImplementation::run_webdriver_content_command(u64 command_id, Web::WebDriver::SessionBrowsingContext browsing_context, String const& name, JsonValue payload, Vector<String> arguments)
@@ -4552,6 +4579,8 @@ void ViewImplementation::did_close_browsing_context(Badge<WebContentPage>)
     // Headless views retain their closed children. Remove the view from routing immediately so a command racing
     // with the close cannot reach the closed page.
     all_views().remove(m_view_id);
+    if (auto* host = Application::the().extension_host())
+        host->on_tab_removed(m_view_id);
     traversable().discard_pending_host();
     traversable().discard_representing_pages();
 
@@ -6069,12 +6098,17 @@ void ViewImplementation::remove_navigation_listener(u64 listener_id)
     m_navigation_listeners.remove(listener_id);
 }
 
-void ViewImplementation::request_close()
+void ViewImplementation::resume_debugger_if_paused()
 {
     if (m_debugger_paused) {
         resume_debugger(DebuggerResumeMode::Continue);
         set_debugger_paused(false);
     }
+}
+
+void ViewImplementation::request_close()
+{
+    resume_debugger_if_paused();
 
     if (needs_beforeunload_check()) {
         page().async_request_close();

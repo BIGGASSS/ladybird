@@ -742,6 +742,8 @@ void WebContentClient::did_lose_process()
                 view->handle_web_content_process_crash(crash_reason);
             if (view->on_web_content_crashed)
                 view->on_web_content_crashed(crash_reason);
+            if (auto* host = Application::the().extension_host())
+                host->on_tab_crashed(view_id);
         });
     }
 }

@@ -314,6 +314,7 @@ ExtensionManager::ExtensionManager(ByteString extensions_directory, ByteString s
     : m_extensions_directory(move(extensions_directory))
     , m_storage_path(move(storage_path))
     , m_content_scripts_path(LexicalPath::join(LexicalPath { m_storage_path }.parent().string(), "ExtensionContentScripts.json"sv).string())
+    , m_versions_path(LexicalPath::join(LexicalPath { m_storage_path }.parent().string(), "ExtensionVersions.json"sv).string())
     , m_network_rules(LexicalPath::join(LexicalPath { m_storage_path }.parent().string(), "ExtensionNetworkRules.json"sv).string(), [this](StringView extension_id, StringView path) -> Optional<ByteBuffer> {
         auto package = m_packages.get(extension_id);
         if (!package.has_value())
@@ -327,6 +328,7 @@ ExtensionManager::ExtensionManager(ByteString extensions_directory, ByteString s
 {
     load_storage();
     load_content_scripts();
+    load_known_versions();
 }
 
 ExtensionManager::~ExtensionManager()
@@ -629,6 +631,9 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
     HashMap<String, Vector<RegisteredContentScript>> registered_content_scripts;
     JsonObject next_persisted = m_persisted_content_scripts;
     bool persisted_dirty = false;
+    HashMap<String, PersistedPendingInstallEvent> next_persisted_pending = m_persisted_pending_install_events;
+    bool persisted_pending_dirty = false;
+    HashMap<String, InstallEvent> pending_install_events = m_pending_install_events;
     HashTable<String> ids;
 
     for (auto const& path : paths) {
@@ -722,6 +727,33 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
         if (!scripts.is_empty())
             registered_content_scripts.set(extension.id, move(scripts));
 
+        Optional<InstallEvent> install_event;
+        if (auto existing_pending = m_pending_install_events.get(extension.id); existing_pending.has_value() && extension_version(extension.id) == extension.version) {
+            install_event = *existing_pending;
+        } else if (auto persisted_pending = m_persisted_pending_install_events.get(extension.id); persisted_pending.has_value()) {
+            if (persisted_pending->target_version == extension.version)
+                install_event = persisted_pending->event;
+            else if (auto known_version = m_known_versions.get(extension.id); known_version.has_value())
+                install_event = { "update"_string, *known_version };
+            else
+                install_event = { "update"_string, persisted_pending->target_version };
+        } else if (auto known_version = m_known_versions.get(extension.id); !known_version.has_value()) {
+            install_event = { "install"_string, {} };
+        } else if (*known_version != extension.version) {
+            install_event = { "update"_string, *known_version };
+        }
+        if (install_event.has_value()) {
+            pending_install_events.set(extension.id, *install_event);
+            auto existing_persisted = next_persisted_pending.get(extension.id);
+            if (!existing_persisted.has_value()
+                || existing_persisted->target_version != extension.version
+                || existing_persisted->event.reason != install_event->reason
+                || existing_persisted->event.previous_version != install_event->previous_version) {
+                next_persisted_pending.set(extension.id, { extension.version, *install_event });
+                persisted_pending_dirty = true;
+            }
+        }
+
         packages.set(extension.id, package.release_value());
         manifests.set(extension.id, manifest);
         messages.set(extension.id, *data.value().get_object("messages"sv));
@@ -737,6 +769,10 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
         if (auto saved = save_content_scripts(next_persisted); saved.is_error())
             warnln("Unable to save registered content scripts to {}: {}", m_content_scripts_path, saved.error());
     }
+    if (persisted_pending_dirty) {
+        if (auto saved = save_known_versions(m_known_versions, next_persisted_pending); saved.is_error())
+            warnln("Unable to save extension versions to {}: {}", m_versions_path, saved.error());
+    }
 
     m_extensions = move(extensions);
     m_packages = move(packages);
@@ -745,6 +781,8 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
     m_base_extension_data = move(base_extension_data);
     m_registered_content_scripts = move(registered_content_scripts);
     m_persisted_content_scripts = move(next_persisted);
+    m_persisted_pending_install_events = move(next_persisted_pending);
+    m_pending_install_events = move(pending_install_events);
 
     Vector<String> extension_ids;
     for (auto const& extension : m_extensions)
@@ -778,8 +816,25 @@ ErrorOr<InstalledExtension> ExtensionManager::install(StringView path, ReadonlyS
         TRY(destination_file->write_until_depleted(bytes));
     }
 
+    auto previous_version = extension_version(package.id);
+    if (!previous_version.has_value())
+        previous_version = m_known_versions.get(package.id).copy();
     TRY(load(preferred_languages));
     m_network_rules.mark_installed(package.id);
+
+    // Explicitly installing over an existing extension always triggers runtime.onInstalled with reason "update",
+    // even if the previous version's first background load had not yet delivered its install event or had the same version.
+    if (previous_version.has_value())
+        m_pending_install_events.set(package.id, { "update"_string, *previous_version });
+    if (auto pending = m_pending_install_events.get(package.id); pending.has_value()) {
+        if (auto current_version = extension_version(package.id); current_version.has_value()) {
+            auto next_persisted_pending = m_persisted_pending_install_events;
+            next_persisted_pending.set(package.id, { *current_version, *pending });
+            if (auto saved = save_known_versions(m_known_versions, next_persisted_pending); saved.is_error())
+                warnln("Unable to save extension versions to {}: {}", m_versions_path, saved.error());
+            m_persisted_pending_install_events = move(next_persisted_pending);
+        }
+    }
 
     // Reinstalling or updating an extension clears its previously registered dynamic content scripts.
     if (m_registered_content_scripts.contains(package.id) || m_persisted_content_scripts.has(package.id)) {
@@ -1022,6 +1077,116 @@ Optional<String> ExtensionManager::extension_version(StringView extension_id) co
     for (auto const& extension : m_extensions) {
         if (extension.id == extension_id)
             return extension.version;
+    }
+    return {};
+}
+
+Optional<ExtensionManager::InstallEvent> ExtensionManager::pending_install_event(StringView extension_id) const
+{
+    return m_pending_install_events.get(extension_id).copy();
+}
+
+void ExtensionManager::mark_install_event_delivered(StringView extension_id, StringView delivered_version)
+{
+    auto current_version = extension_version(extension_id);
+    if (!current_version.has_value() || *current_version != delivered_version)
+        return;
+    m_pending_install_events.remove(extension_id);
+    bool has_persisted_pending = m_persisted_pending_install_events.contains(extension_id);
+    auto known = m_known_versions.get(extension_id);
+    if (!has_persisted_pending && known.has_value() && *known == *current_version)
+        return;
+    auto next_known_versions = m_known_versions;
+    next_known_versions.set(MUST(String::from_utf8(extension_id)), *current_version);
+    auto next_persisted_pending = m_persisted_pending_install_events;
+    next_persisted_pending.remove(extension_id);
+    if (auto saved = save_known_versions(next_known_versions, next_persisted_pending); saved.is_error())
+        warnln("Unable to save extension versions to {}: {}", m_versions_path, saved.error());
+    m_known_versions = move(next_known_versions);
+    m_persisted_pending_install_events = move(next_persisted_pending);
+}
+
+void ExtensionManager::load_known_versions()
+{
+    auto file = Core::File::open(m_versions_path, Core::File::OpenMode::Read);
+    if (file.is_error())
+        return;
+
+    auto bytes = file.value()->read_until_eof();
+    if (bytes.is_error())
+        return;
+
+    auto stored = parse_json_object(bytes.value());
+    if (stored.is_error()) {
+        warnln("Unable to read extension versions from {}: {}", m_versions_path, stored.error());
+        return;
+    }
+
+    stored.value().for_each_member([&](String const& extension_id, JsonValue const& value) {
+        if (value.is_string()) {
+            m_known_versions.set(extension_id, value.as_string());
+            return;
+        }
+        if (!value.is_object())
+            return;
+        auto const& entry = value.as_object();
+        if (auto version = entry.get_string("version"sv); version.has_value())
+            m_known_versions.set(extension_id, *version);
+        if (auto pending = entry.get_object("pending"sv); pending.has_value()) {
+            auto target_version = pending->get_string("targetVersion"sv);
+            auto reason = pending->get_string("reason"sv);
+            if (target_version.has_value() && reason.has_value()) {
+                m_persisted_pending_install_events.set(extension_id, {
+                    .target_version = *target_version,
+                    .event = { *reason, pending->get_string("previousVersion"sv).copy() },
+                });
+            }
+        }
+    });
+}
+
+ErrorOr<void> ExtensionManager::save_known_versions(HashMap<String, String> const& versions, HashMap<String, PersistedPendingInstallEvent> const& pending) const
+{
+    TRY(Core::Directory::create(LexicalPath { m_versions_path }.parent(), Core::Directory::CreateDirectories::Yes));
+    auto temp_path = ByteString::formatted("{}.tmp", m_versions_path);
+    JsonObject object;
+    HashTable<String> all_ids;
+    for (auto const& [extension_id, _] : versions)
+        all_ids.set(extension_id);
+    for (auto const& [extension_id, _] : pending)
+        all_ids.set(extension_id);
+    for (auto const& extension_id : all_ids) {
+        auto version = versions.get(extension_id);
+        auto pending_entry = pending.get(extension_id);
+        if (pending_entry.has_value()) {
+            JsonObject entry;
+            if (version.has_value())
+                entry.set("version"sv, *version);
+            JsonObject pending_object;
+            pending_object.set("targetVersion"sv, pending_entry->target_version);
+            pending_object.set("reason"sv, pending_entry->event.reason);
+            if (pending_entry->event.previous_version.has_value())
+                pending_object.set("previousVersion"sv, *pending_entry->event.previous_version);
+            entry.set("pending"sv, move(pending_object));
+            object.set(extension_id, move(entry));
+        } else if (version.has_value()) {
+            object.set(extension_id, *version);
+        }
+    }
+    auto write_result = [&]() -> ErrorOr<void> {
+        auto file = TRY(Core::File::open(temp_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+        auto serialized = object.serialized();
+        TRY(file->write_until_depleted(serialized.bytes()));
+        return {};
+    }();
+    if (write_result.is_error()) {
+        (void)FileSystem::remove(temp_path, FileSystem::RecursionMode::Disallowed);
+        return write_result.release_error();
+    }
+    auto rename_result = FileSystem::move_file(m_versions_path, temp_path);
+    if (rename_result.is_error()) {
+        (void)FileSystem::remove(temp_path, FileSystem::RecursionMode::Disallowed);
+        return rename_result.release_error();
     }
     return {};
 }

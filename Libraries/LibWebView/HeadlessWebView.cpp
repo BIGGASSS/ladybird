@@ -54,9 +54,9 @@ NonnullOwnPtr<PictureInPictureWindow> HeadlessWebView::create_picture_in_picture
     return make<HeadlessPictureInPictureWindow>(size, move(view));
 }
 
-NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate is_private)
+NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate is_private, IsTab is_tab)
 {
-    auto view = adopt_own(*new HeadlessWebView(move(theme), window_size, is_private));
+    auto view = adopt_own(*new HeadlessWebView(move(theme), window_size, is_private, is_tab));
     view->initialize_tab(Web::HTML::VisibilityState::Visible);
 
     return view;
@@ -73,10 +73,11 @@ NonnullOwnPtr<HeadlessWebView> HeadlessWebView::create_child(HeadlessWebView& pa
     return view;
 }
 
-HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, IsPrivate is_private)
+HeadlessWebView::HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, IsPrivate is_private, IsTab is_tab)
     : ViewImplementation(is_private)
     , m_theme(move(theme))
     , m_viewport_size(viewport_size)
+    , m_is_tab(is_tab)
 {
     // A headless window is exactly its viewport, so every page gets the viewport as its window size.
     m_window_size = viewport_size.to_type<int>();

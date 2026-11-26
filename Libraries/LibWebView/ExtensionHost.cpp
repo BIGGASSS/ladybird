@@ -7,11 +7,13 @@
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/LexicalPath.h>
+#include <LibCore/EventLoop.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibURL/Parser.h>
 #include <LibWebCommon/Extensions/MatchPattern.h>
 #include <LibWebCommon/Extensions/MessageDeliveryStatus.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/ExtensionHost.h>
 #include <LibWebView/ExtensionManager.h>
 #include <LibWebView/HeadlessWebView.h>
@@ -29,12 +31,15 @@ static constexpr auto NO_RECEIVER_ERROR = "Could not establish connection. Recei
 ExtensionHost::ExtensionHost(ExtensionManager& manager)
     : m_manager(manager)
 {
+    for (auto& view : tabs())
+        m_known_tab_ids.set(view.view_id());
 }
 
 ExtensionHost::~ExtensionHost() = default;
 
 void ExtensionHost::start_background_pages(Optional<StringView> only_extension_id)
 {
+    bool is_browser_startup = !only_extension_id.has_value();
     if (only_extension_id.has_value())
         m_background_pages.remove(*only_extension_id);
     else
@@ -50,11 +55,36 @@ void ExtensionHost::start_background_pages(Optional<StringView> only_extension_i
     for (auto const& extension : m_manager.extensions()) {
         if (only_extension_id.has_value() && extension.id != *only_extension_id)
             continue;
+        auto install_event = m_manager.pending_install_event(extension.id);
         auto url = m_manager.background_page_url(extension.id);
-        if (!url.has_value())
+        if (!url.has_value()) {
+            if (install_event.has_value())
+                m_manager.mark_install_event_delivered(extension.id, extension.version);
             continue;
+        }
 
-        auto view = HeadlessWebView::create(theme.value(), { 800, 600 });
+        bool should_fire_startup = is_browser_startup && (!install_event.has_value() || install_event->reason != "install"sv);
+        auto view = HeadlessWebView::create(theme.value(), { 800, 600 }, IsPrivate::No, HeadlessWebView::IsTab::No);
+        auto* view_ptr = view.ptr();
+        view->on_load_finish = [this, view_ptr, extension_id = extension.id, version = extension.version, expected_url = *url, install_event = move(install_event), should_fire_startup, fired = false](URL::URL const& loaded_url) mutable {
+            if (fired || loaded_url != expected_url)
+                return;
+            if (!view_ptr->has_traversable() || view_ptr->traversable().active_document().creation_url() == URL::about_error())
+                return;
+            fired = true;
+            if (install_event.has_value()) {
+                JsonObject details;
+                details.set("reason"sv, install_event->reason);
+                if (install_event->previous_version.has_value())
+                    details.set("previousVersion"sv, *install_event->previous_version);
+                JsonArray arguments;
+                arguments.must_append(move(details));
+                deliver_event(extension_id, "runtime.onInstalled"_string, arguments);
+                m_manager.mark_install_event_delivered(extension_id, version);
+            }
+            if (should_fire_startup)
+                deliver_event(extension_id, "runtime.onStartup"_string, {});
+        };
         view->load_from_browser_ui(*url);
         m_background_pages.set(extension.id, move(view));
     }
@@ -122,7 +152,7 @@ Optional<ViewImplementation&> ExtensionHost::current_tab(Optional<ViewImplementa
 // https://developer.chrome.com/docs/extensions/reference/api/tabs#type-Tab
 // An extension may see the URL and title of a tab if it has the "tabs" permission, or host permissions for the tab's
 // URL, as in Chrome.
-bool ExtensionHost::may_see_url_of(String const& extension_id, ViewImplementation& view) const
+bool ExtensionHost::may_see_url_of(String const& extension_id, URL::URL const& url) const
 {
     auto manifest = m_manager.manifest(extension_id);
     if (!manifest.has_value())
@@ -140,7 +170,6 @@ bool ExtensionHost::may_see_url_of(String const& extension_id, ViewImplementatio
     collect("permissions"sv);
     collect("host_permissions"sv);
 
-    auto url = view.url();
     // The extension's own pages are its own to see.
     if (url.scheme() == "chrome-extension"sv && url.serialized_host() == extension_id)
         return true;
@@ -158,6 +187,11 @@ bool ExtensionHost::may_see_url_of(String const& extension_id, ViewImplementatio
         auto any_path = ByteString::formatted("{}/*", pattern.bytes_as_string_view().substring_view(0, *path_start));
         return Web::Extensions::match_pattern_matches(any_path, url);
     });
+}
+
+bool ExtensionHost::may_see_url_of(String const& extension_id, ViewImplementation& view) const
+{
+    return may_see_url_of(extension_id, view.url());
 }
 
 JsonObject ExtensionHost::describe_tab(ViewImplementation& view, String const& extension_id) const
@@ -332,6 +366,96 @@ void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_i
         return respond(true, {});
     }
 
+    if (method == "tabs.remove"sv) {
+        if (arguments.is_empty())
+            return fail("Invalid tab ID"sv);
+        Vector<u64> tab_ids;
+        HashTable<u64> seen_ids;
+        auto add_id = [&](JsonValue const& value) -> ErrorOr<void, String> {
+            auto id = value.get_integer<u64>();
+            if (!id.has_value())
+                return "Invalid tab ID"_string;
+            if (!tab(*id).has_value())
+                return MUST(String::formatted("No tab with id: {}", *id));
+            if (seen_ids.set(*id) == HashSetResult::InsertedNewEntry)
+                tab_ids.append(*id);
+            return {};
+        };
+        if (arguments.at(0).is_array()) {
+            for (auto const& item : arguments.at(0).as_array().values()) {
+                if (auto result = add_id(item); result.is_error())
+                    return fail(result.error());
+            }
+        } else {
+            if (auto result = add_id(arguments.at(0)); result.is_error())
+                return fail(result.error());
+        }
+        if (tab_ids.is_empty())
+            return respond(true, {});
+
+        auto remove_id = ++m_next_tab_remove_id;
+        PendingTabRemove pending { .sender = client, .call_id = call_id, .context_id = context_id, .remaining_tab_ids = move(seen_ids) };
+        m_pending_tab_removes.set(remove_id, move(pending));
+
+        for (auto tab_id : tab_ids) {
+            // Coalesce overlapping remove calls for the same tab so only one unload check/close runs per tab.
+            if (m_closing_tab_ids.set(tab_id) != HashSetResult::InsertedNewEntry)
+                continue;
+
+            auto view = tab(tab_id);
+            if (!view.has_value()) {
+                m_closing_tab_ids.remove(tab_id);
+                if (auto it = m_pending_tab_removes.find(remove_id); it != m_pending_tab_removes.end())
+                    it->value.remaining_tab_ids.remove(tab_id);
+                continue;
+            }
+            if (!view->page().is_open() || !view->has_traversable()) {
+                if (view->on_close) {
+                    m_awaiting_close_tab_ids.set(tab_id);
+                    view->on_close();
+                } else if (m_known_tab_ids.contains(tab_id)) {
+                    m_closing_tab_ids.remove(tab_id);
+                    fail_pending_tab_removes_for(tab_id, "Unable to close tab"sv);
+                }
+                continue;
+            }
+            view->resume_debugger_if_paused();
+            Vector<Web::HTML::CrossProcessId> inclusive_descendants;
+            view->traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& descendant) {
+                inclusive_descendants.append(descendant.id());
+                return IterationDecision::Continue;
+            });
+            (void)view->traversable().check_if_unloading_is_canceled(
+                move(inclusive_descendants), {}, {}, {}, Web::HTML::UnloadPromptShown::No,
+                [weak_this = make_weak_ptr(), tab_id](Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown) {
+                    if (!weak_this || !weak_this->m_closing_tab_ids.contains(tab_id))
+                        return;
+                    if (result != Web::HTML::CheckIfUnloadingIsCanceledResult::Continue) {
+                        weak_this->m_closing_tab_ids.remove(tab_id);
+                        weak_this->fail_pending_tab_removes_for(tab_id, "Tab close was canceled"sv);
+                        return;
+                    }
+                    auto current = weak_this->tab(tab_id);
+                    if (!current.has_value()) {
+                        weak_this->m_closing_tab_ids.remove(tab_id);
+                        return;
+                    }
+                    if (current->on_close) {
+                        weak_this->m_awaiting_close_tab_ids.set(tab_id);
+                        current->on_close();
+                    } else if (current->page().is_open()) {
+                        auto close = current->prepare_for_close_without_prompting();
+                        close();
+                    } else if (weak_this->m_known_tab_ids.contains(tab_id)) {
+                        weak_this->m_closing_tab_ids.remove(tab_id);
+                        weak_this->fail_pending_tab_removes_for(tab_id, "Unable to close tab"sv);
+                    }
+                });
+        }
+        finish_tab_remove(remove_id);
+        return;
+    }
+
     // https://developer.chrome.com/docs/extensions/reference/api/runtime#method-openOptionsPage
     if (method == "runtime.openOptionsPage"sv) {
         auto const& manifest = *m_manager.manifest(extension_id);
@@ -484,6 +608,16 @@ void ExtensionHost::evaluate_network_request(WebContentClient& client, u64 reque
     client.async_did_evaluate_extension_network_request(request_id, to_underlying(outcome.outcome), move(outcome.redirect_url));
 }
 
+void ExtensionHost::deliver_event(String const& extension_id, String const& name, JsonArray const& arguments) const
+{
+    auto arguments_json = arguments.serialized();
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        if (client.is_private() == IsPrivate::No)
+            client.async_deliver_extension_event(extension_id, name, arguments_json);
+        return IterationDecision::Continue;
+    });
+}
+
 // https://developer.chrome.com/docs/extensions/reference/api/action#event-onClicked
 void ExtensionHost::click_action(String const& extension_id, u64 tab_view_id)
 {
@@ -493,11 +627,133 @@ void ExtensionHost::click_action(String const& extension_id, u64 tab_view_id)
 
     JsonArray arguments;
     arguments.must_append(describe_tab(*view, extension_id));
-    auto arguments_json = arguments.serialized();
-    WebContentClient::for_each_client([&](WebContentClient& client) {
-        if (client.is_private() == IsPrivate::No)
-            client.async_deliver_extension_event(extension_id, "action.onClicked"_string, arguments_json);
-        return IterationDecision::Continue;
+    deliver_event(extension_id, "action.onClicked"_string, arguments);
+}
+
+void ExtensionHost::on_tab_created(ViewImplementation& view)
+{
+    if (!is_tab(view))
+        return;
+    if (m_known_tab_ids.set(view.view_id()) != HashSetResult::InsertedNewEntry)
+        return;
+    for (auto const& extension : m_manager.extensions()) {
+        JsonArray arguments;
+        arguments.must_append(describe_tab(view, extension.id));
+        deliver_event(extension.id, "tabs.onCreated"_string, arguments);
+    }
+}
+
+void ExtensionHost::on_tab_updated(ViewImplementation& view, TabUpdate const& update)
+{
+    if (!is_tab(view) || !m_known_tab_ids.contains(view.view_id()))
+        return;
+    for (auto const& extension : m_manager.extensions()) {
+        JsonObject change_info;
+        if (update.status.has_value())
+            change_info.set("status"sv, *update.status);
+        if (update.url.has_value() && may_see_url_of(extension.id, *update.url))
+            change_info.set("url"sv, update.url->serialize());
+        if (update.title.has_value() && may_see_url_of(extension.id, view))
+            change_info.set("title"sv, update.title->to_well_formed_utf8());
+        if (change_info.is_empty())
+            continue;
+
+        JsonArray arguments;
+        arguments.must_append(view.view_id());
+        arguments.must_append(move(change_info));
+        arguments.must_append(describe_tab(view, extension.id));
+        deliver_event(extension.id, "tabs.onUpdated"_string, arguments);
+    }
+}
+
+void ExtensionHost::on_tab_activated(ViewImplementation& view)
+{
+    if (!is_tab(view) || !m_known_tab_ids.contains(view.view_id()))
+        return;
+    JsonObject active_info;
+    active_info.set("tabId"sv, view.view_id());
+    active_info.set("windowId"sv, 1);
+    JsonArray arguments;
+    arguments.must_append(move(active_info));
+    for (auto const& extension : m_manager.extensions())
+        deliver_event(extension.id, "tabs.onActivated"_string, arguments);
+}
+
+void ExtensionHost::finish_tab_remove(u64 remove_id)
+{
+    auto it = m_pending_tab_removes.find(remove_id);
+    if (it == m_pending_tab_removes.end() || !it->value.remaining_tab_ids.is_empty())
+        return;
+    auto pending = move(it->value);
+    m_pending_tab_removes.remove(it);
+    if (auto sender = pending.sender.strong_ref()) {
+        if (pending.failed)
+            sender->async_extension_api_call_completed(pending.call_id, pending.context_id, false, JsonValue { pending.error_message }.serialized());
+        else
+            sender->async_extension_api_call_completed(pending.call_id, pending.context_id, true, String {});
+    }
+}
+
+void ExtensionHost::fail_pending_tab_removes_for(u64 tab_id, StringView error_message)
+{
+    Vector<u64> completed_removes;
+    for (auto& [remove_id, pending] : m_pending_tab_removes) {
+        if (!pending.remaining_tab_ids.remove(tab_id))
+            continue;
+        if (!pending.failed) {
+            pending.failed = true;
+            pending.error_message = MUST(String::from_utf8(error_message));
+        }
+        if (pending.remaining_tab_ids.is_empty())
+            completed_removes.append(remove_id);
+    }
+    for (auto remove_id : completed_removes)
+        finish_tab_remove(remove_id);
+}
+
+void ExtensionHost::on_tab_removed(u64 view_id)
+{
+    m_closing_tab_ids.remove(view_id);
+    m_awaiting_close_tab_ids.remove(view_id);
+    if (!m_known_tab_ids.remove(view_id))
+        return;
+    JsonObject remove_info;
+    remove_info.set("windowId"sv, 1);
+    remove_info.set("isWindowClosing"sv, false);
+    JsonArray arguments;
+    arguments.must_append(view_id);
+    arguments.must_append(move(remove_info));
+    for (auto const& extension : m_manager.extensions())
+        deliver_event(extension.id, "tabs.onRemoved"_string, arguments);
+
+    Vector<u64> completed_removes;
+    for (auto& [remove_id, pending] : m_pending_tab_removes) {
+        if (pending.remaining_tab_ids.remove(view_id) && pending.remaining_tab_ids.is_empty())
+            completed_removes.append(remove_id);
+    }
+    for (auto remove_id : completed_removes)
+        finish_tab_remove(remove_id);
+}
+
+void ExtensionHost::on_tab_close_declined(u64 view_id)
+{
+    m_awaiting_close_tab_ids.remove(view_id);
+    if (!m_closing_tab_ids.remove(view_id))
+        return;
+    fail_pending_tab_removes_for(view_id, "Tab close was canceled"sv);
+}
+
+void ExtensionHost::on_tab_crashed(u64 view_id)
+{
+    if (!m_closing_tab_ids.contains(view_id))
+        return;
+    // Defer so crash handlers that schedule tab removal (e.g. headless child tabs) settle via on_tab_removed() first.
+    Core::deferred_invoke([weak_this = make_weak_ptr(), view_id] {
+        if (!weak_this || weak_this->m_awaiting_close_tab_ids.contains(view_id))
+            return;
+        if (!weak_this->m_closing_tab_ids.remove(view_id))
+            return;
+        weak_this->fail_pending_tab_removes_for(view_id, "Tab renderer exited before closing"sv);
     });
 }
 

@@ -70,6 +70,13 @@ public:
 
     ExtensionNetworkRules& network_rules() { return m_network_rules; }
 
+    struct InstallEvent {
+        String reason;
+        Optional<String> previous_version;
+    };
+    Optional<InstallEvent> pending_install_event(StringView extension_id) const;
+    void mark_install_event_delivered(StringView extension_id, StringView delivered_version);
+
     // https://developer.chrome.com/docs/extensions/reference/api/scripting
     bool extension_has_scripting_permission(StringView extension_id) const;
     ErrorOr<void, String> register_content_scripts(StringView extension_id, JsonArray const& scripts);
@@ -98,11 +105,18 @@ private:
         String world { "ISOLATED"_string };
     };
 
+    struct PersistedPendingInstallEvent {
+        String target_version;
+        InstallEvent event;
+    };
+
     void load_storage();
     void schedule_storage_save();
     void save_storage();
     void load_content_scripts();
     ErrorOr<void, String> save_content_scripts(JsonObject const&) const;
+    void load_known_versions();
+    ErrorOr<void> save_known_versions(HashMap<String, String> const&, HashMap<String, PersistedPendingInstallEvent> const&) const;
     ErrorOr<Core::AnonymousBuffer, String> build_extensions_buffer(HashMap<String, Vector<RegisteredContentScript>> const&) const;
     ErrorOr<void, String> commit_content_scripts(StringView extension_id, Vector<RegisteredContentScript> next_scripts);
     Optional<String> extension_version(StringView extension_id) const;
@@ -110,6 +124,7 @@ private:
     ByteString m_extensions_directory;
     ByteString m_storage_path;
     ByteString m_content_scripts_path;
+    ByteString m_versions_path;
     Vector<InstalledExtension> m_extensions;
     HashMap<String, ExtensionPackage> m_packages;
     HashMap<String, JsonObject> m_manifests;
@@ -117,6 +132,9 @@ private:
     HashMap<String, JsonObject> m_base_extension_data;
     HashMap<String, Vector<RegisteredContentScript>> m_registered_content_scripts;
     JsonObject m_persisted_content_scripts;
+    HashMap<String, String> m_known_versions;
+    HashMap<String, PersistedPendingInstallEvent> m_persisted_pending_install_events;
+    HashMap<String, InstallEvent> m_pending_install_events;
     ExtensionNetworkRules m_network_rules;
     Core::AnonymousBuffer m_extensions_buffer;
     JsonObject m_storage;

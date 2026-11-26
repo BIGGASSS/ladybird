@@ -257,6 +257,8 @@ public:
     void request_discard(DiscardReason);
     // The UI may keep a tab that the Hub asked it to discard, such as one with an unfinished edit of its address.
     void did_decline_discard();
+    // The UI may keep a tab that the Hub asked it to close, such as when active downloads would be interrupted.
+    void did_decline_close();
     void did_save_session_history_entry_states(Badge<WebContentPage>, WebContentPage&);
 
     // Whether the view shows its frames from CPU memory for now, so that the Compositor shares them there rather than
@@ -506,6 +508,7 @@ public:
     void detach_debugger();
     void interrupt_debugger();
     void resume_debugger(DebuggerResumeMode);
+    void resume_debugger_if_paused();
     void did_pause_debugger(Badge<WebContentPage>);
     void did_resume_debugger(Badge<WebContentPage>);
     void update_debugger_blackboxing(Utf16String, Vector<DebuggerBlackboxRange>, DebuggerBlackboxingOperation);
@@ -1012,6 +1015,7 @@ protected:
     };
     Optional<BrowserUILoad> m_browser_ui_load;
     URL::URL m_displayed_url { URL::about_blank() };
+    URL::URL m_last_committed_url { URL::about_blank() };
     bool m_text_fragment_indication_is_visible { false };
     Utf16String m_title;
 

@@ -122,8 +122,12 @@
 
     const [onMessage, , messageListeners] = createEvent();
     const [onConnect] = createEvent();
-    const [onInstalled] = createEvent();
-    const [onStartup] = createEvent();
+    const [onInstalled, dispatchInstalled] = createEvent();
+    const [onStartup, dispatchStartup] = createEvent();
+    if (isPage) {
+        browserEvents["runtime.onInstalled"] = dispatchInstalled;
+        browserEvents["runtime.onStartup"] = dispatchStartup;
+    }
 
     function createDisconnectedPort(name) {
         const [onPortMessage] = createEvent();
@@ -368,10 +372,14 @@
 
         // tabs and windows
 
-        const [onTabUpdated] = createEvent();
-        const [onTabActivated] = createEvent();
-        const [onTabRemoved] = createEvent();
-        const [onTabCreated] = createEvent();
+        const [onTabUpdated, dispatchTabUpdated] = createEvent();
+        const [onTabActivated, dispatchTabActivated] = createEvent();
+        const [onTabRemoved, dispatchTabRemoved] = createEvent();
+        const [onTabCreated, dispatchTabCreated] = createEvent();
+        browserEvents["tabs.onUpdated"] = dispatchTabUpdated;
+        browserEvents["tabs.onActivated"] = dispatchTabActivated;
+        browserEvents["tabs.onRemoved"] = dispatchTabRemoved;
+        browserEvents["tabs.onCreated"] = dispatchTabCreated;
         chrome.tabs = {
             TAB_ID_NONE: -1,
             query: browserFunction("tabs.query", 1),

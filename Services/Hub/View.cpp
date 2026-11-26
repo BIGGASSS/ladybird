@@ -329,6 +329,8 @@ void View::forward_callbacks_to_ui(bool is_tab)
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
             ui->async_view_close(view_id());
+        } else {
+            did_decline_close();
         }
     };
 

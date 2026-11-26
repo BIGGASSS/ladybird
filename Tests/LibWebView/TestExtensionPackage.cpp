@@ -481,3 +481,181 @@ TEST_CASE(extension_manager_registered_content_scripts)
         EXPECT_EQ(up_manager.registered_content_scripts(id, {}).release_value().size(), 0u);
     }
 }
+
+TEST_CASE(extension_manager_tracks_install_and_update_lifecycle_events)
+{
+    Test::TemporaryDirectory directory { "TestExtensionLifecycle"sv };
+    auto extensions_directory = directory.path().append("Extensions"sv).string();
+    auto storage_path = directory.path().append("Storage.json"sv).string();
+    MUST(Core::Directory::create(extensions_directory, Core::Directory::CreateDirectories::Yes));
+
+    Array<u8, 16> fixed_id { 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 1, 2, 3, 4, 5, 6, 7, 8 };
+    auto v1_zip = stored_zip({
+        Array<StringView, 2> { "manifest.json"sv, R"({ "manifest_version": 3, "name": "Lifecycle", "version": "1.0" })"sv },
+    });
+    auto v2_zip = stored_zip({
+        Array<StringView, 2> { "manifest.json"sv, R"({ "manifest_version": 3, "name": "Lifecycle", "version": "2.0" })"sv },
+    });
+    auto v1_crx = crx3(fixed_id, v1_zip);
+    auto v2_crx = crx3(fixed_id, v2_zip);
+
+    auto write_crx = [&](ReadonlyBytes bytes) {
+        auto file = MUST(Core::File::open(LexicalPath::join(extensions_directory, "ext.crx"sv).string(), Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+        MUST(file->write_until_depleted(bytes));
+    };
+
+    // First load: "install" event is retained until delivery is recorded.
+    write_crx(v1_crx);
+    String extension_id;
+    {
+        WebView::ExtensionManager manager { extensions_directory, storage_path };
+        TRY_OR_FAIL(manager.load({}));
+        extension_id = manager.extensions()[0].id;
+        auto event = manager.pending_install_event(extension_id);
+        VERIFY(event.has_value());
+        EXPECT_EQ(event->reason, "install"sv);
+        EXPECT(!event->previous_version.has_value());
+    }
+    // Restart before delivery was recorded: install event is still pending; reloading another extension before
+    // delivery does not leave a stale pending record once delivered.
+    {
+        WebView::ExtensionManager manager { extensions_directory, storage_path };
+        TRY_OR_FAIL(manager.load({}));
+        auto event = manager.pending_install_event(extension_id);
+        VERIFY(event.has_value());
+        EXPECT_EQ(event->reason, "install"sv);
+        TRY_OR_FAIL(manager.load({}));
+        manager.mark_install_event_delivered(extension_id, "1.0"sv);
+        EXPECT(!manager.pending_install_event(extension_id).has_value());
+    }
+
+    // Restart after delivery: no install event.
+    {
+        WebView::ExtensionManager manager { extensions_directory, storage_path };
+        TRY_OR_FAIL(manager.load({}));
+        EXPECT(!manager.pending_install_event(extension_id).has_value());
+    }
+
+    // Upgrade to v2.0: "update" event with previousVersion "1.0".
+    write_crx(v2_crx);
+    {
+        WebView::ExtensionManager manager { extensions_directory, storage_path };
+        TRY_OR_FAIL(manager.load({}));
+        auto event = manager.pending_install_event(extension_id);
+        VERIFY(event.has_value());
+        EXPECT_EQ(event->reason, "update"sv);
+        EXPECT_EQ(event->previous_version, "1.0"sv);
+        manager.mark_install_event_delivered(extension_id, "2.0"sv);
+    }
+
+    // Reinstall same version via install(): "update" event with previousVersion "2.0".
+    auto installer_path = directory.path().append("reinstall.crx"sv).string();
+    {
+        auto file = MUST(Core::File::open(installer_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+        MUST(file->write_until_depleted(v2_crx));
+    }
+    {
+        WebView::ExtensionManager manager { extensions_directory, storage_path };
+        TRY_OR_FAIL(manager.load({}));
+        TRY_OR_FAIL(manager.install(installer_path, {}));
+        auto event = manager.pending_install_event(extension_id);
+        VERIFY(event.has_value());
+        EXPECT_EQ(event->reason, "update"sv);
+        EXPECT_EQ(event->previous_version, "2.0"sv);
+        // Unrelated reload before delivery preserves the pending update event.
+        TRY_OR_FAIL(manager.load({}));
+        event = manager.pending_install_event(extension_id);
+        VERIFY(event.has_value());
+        EXPECT_EQ(event->reason, "update"sv);
+        EXPECT_EQ(event->previous_version, "2.0"sv);
+    }
+    // Restart before delivery still preserves the pending same-version update, then delivery clears it.
+    {
+        WebView::ExtensionManager manager { extensions_directory, storage_path };
+        TRY_OR_FAIL(manager.load({}));
+        auto event = manager.pending_install_event(extension_id);
+        VERIFY(event.has_value());
+        EXPECT_EQ(event->reason, "update"sv);
+        EXPECT_EQ(event->previous_version, "2.0"sv);
+        manager.mark_install_event_delivered(extension_id, "2.0"sv);
+    }
+    {
+        WebView::ExtensionManager manager { extensions_directory, storage_path };
+        TRY_OR_FAIL(manager.load({}));
+        EXPECT(!manager.pending_install_event(extension_id).has_value());
+    }
+
+    // Installing v2 while v1's initial install event has not yet been delivered classifies v2 as an update from "1.0"
+    // and retains that classification across a restart before delivery.
+    {
+        Test::TemporaryDirectory pending_upgrade_dir { "TestExtensionLifecyclePendingUpgrade"sv };
+        auto pending_ext_dir = pending_upgrade_dir.path().append("Extensions"sv).string();
+        auto pending_storage = pending_upgrade_dir.path().append("Storage.json"sv).string();
+        auto v1_path = pending_upgrade_dir.path().append("v1.crx"sv).string();
+        auto v2_path = pending_upgrade_dir.path().append("v2.crx"sv).string();
+        {
+            auto file = MUST(Core::File::open(v1_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+            MUST(file->write_until_depleted(v1_crx));
+        }
+        {
+            auto file = MUST(Core::File::open(v2_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+            MUST(file->write_until_depleted(v2_crx));
+        }
+        {
+            WebView::ExtensionManager manager { pending_ext_dir, pending_storage };
+            TRY_OR_FAIL(manager.install(v1_path, {}));
+            auto v1_event = manager.pending_install_event(extension_id);
+            VERIFY(v1_event.has_value());
+            EXPECT_EQ(v1_event->reason, "install"sv);
+            TRY_OR_FAIL(manager.install(v2_path, {}));
+            auto v2_event = manager.pending_install_event(extension_id);
+            VERIFY(v2_event.has_value());
+            EXPECT_EQ(v2_event->reason, "update"sv);
+            EXPECT_EQ(v2_event->previous_version, "1.0"sv);
+        }
+        {
+            WebView::ExtensionManager restarted { pending_ext_dir, pending_storage };
+            TRY_OR_FAIL(restarted.load({}));
+            auto v2_event = restarted.pending_install_event(extension_id);
+            VERIFY(v2_event.has_value());
+            EXPECT_EQ(v2_event->reason, "update"sv);
+            EXPECT_EQ(v2_event->previous_version, "1.0"sv);
+            restarted.mark_install_event_delivered(extension_id, "2.0"sv);
+        }
+        {
+            WebView::ExtensionManager after_delivery { pending_ext_dir, pending_storage };
+            TRY_OR_FAIL(after_delivery.load({}));
+            EXPECT(!after_delivery.pending_install_event(extension_id).has_value());
+        }
+    }
+
+    // Loading v1 directly from the profile directory and replacing it with v2 before delivery persists v1's pending
+    // install so restarting classifies v2 as an update from "1.0".
+    {
+        Test::TemporaryDirectory dir_upgrade { "TestExtensionLifecycleProfileUpgrade"sv };
+        auto dir_ext = dir_upgrade.path().append("Extensions"sv).string();
+        auto dir_storage = dir_upgrade.path().append("Storage.json"sv).string();
+        MUST(Core::Directory::create(dir_ext, Core::Directory::CreateDirectories::Yes));
+        auto write_profile_crx = [&](ReadonlyBytes bytes) {
+            auto file = MUST(Core::File::open(LexicalPath::join(dir_ext, "ext.crx"sv).string(), Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+            MUST(file->write_until_depleted(bytes));
+        };
+        write_profile_crx(v1_crx);
+        {
+            WebView::ExtensionManager manager { dir_ext, dir_storage };
+            TRY_OR_FAIL(manager.load({}));
+            auto v1_event = manager.pending_install_event(extension_id);
+            VERIFY(v1_event.has_value());
+            EXPECT_EQ(v1_event->reason, "install"sv);
+        }
+        write_profile_crx(v2_crx);
+        {
+            WebView::ExtensionManager manager { dir_ext, dir_storage };
+            TRY_OR_FAIL(manager.load({}));
+            auto v2_event = manager.pending_install_event(extension_id);
+            VERIFY(v2_event.has_value());
+            EXPECT_EQ(v2_event->reason, "update"sv);
+            EXPECT_EQ(v2_event->previous_version, "1.0"sv);
+        }
+    }
+}

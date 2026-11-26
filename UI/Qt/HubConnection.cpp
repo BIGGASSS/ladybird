@@ -926,8 +926,12 @@ void HubConnection::view_discard(u64 view_id)
 
 void HubConnection::view_close(u64 view_id)
 {
-    if (auto* view = RemoteView::find(view_id); view && view->on_close)
-        view->on_close();
+    if (auto* view = RemoteView::find(view_id)) {
+        if (view->on_close)
+            view->on_close();
+        else
+            view->decline_close();
+    }
 }
 
 void HubConnection::view_link_hover(u64 view_id, URL::URL url)
