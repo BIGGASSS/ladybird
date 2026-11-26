@@ -3502,6 +3502,17 @@ void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffe
     registry.on_api_call = [this](Web::PageId page_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments) {
         async_extension_api_call(page_id, context_id, call_id, extension_id, method, arguments);
     };
+    registry.on_evaluate_network_request = [this](Web::PageId page_id, u64 request_id, Web::Extensions::ExtensionRegistry::NetworkRequest const& request) {
+        Vector<URL::URL> frame_urls;
+        Vector<Optional<URL::Origin>> frame_initiators;
+        Vector<bool> frame_is_top_level;
+        for (auto const& frame : request.ancestor_frames) {
+            frame_urls.append(frame.url);
+            frame_initiators.append(frame.initiator);
+            frame_is_top_level.append(frame.is_top_level);
+        }
+        async_evaluate_extension_network_request(page_id, request_id, request.url, request.method, MUST(String::from_utf8(request.resource_type)), request.initiator, request.initiator_extension_id, move(frame_urls), move(frame_initiators), move(frame_is_top_level));
+    };
     registry.on_message_response = [this](u64 delivery_id, bool, String const& response) {
         async_did_handle_extension_message(delivery_id, to_underlying(Web::Extensions::MessageDeliveryStatus::RespondedLater), response);
     };
@@ -3525,6 +3536,13 @@ void ConnectionFromClient::did_load_extension_resource(u64 request_id, bool foun
     if (found && data.validate_backing_size().is_error())
         found = false;
     Web::Extensions::ExtensionRegistry::the().did_load_resource(request_id, found ? Optional<ReadonlyBytes> { data.bytes() } : OptionalNone {}, mime_type);
+}
+
+void ConnectionFromClient::did_evaluate_extension_network_request(u64 request_id, u8 outcome, Optional<URL::URL> redirect_url)
+{
+    if (outcome > to_underlying(Web::Extensions::NetworkRequestOutcome::UpgradeScheme))
+        outcome = to_underlying(Web::Extensions::NetworkRequestOutcome::Allow);
+    Web::Extensions::ExtensionRegistry::the().did_evaluate_network_request(request_id, static_cast<Web::Extensions::NetworkRequestOutcome>(outcome), move(redirect_url));
 }
 
 void ConnectionFromClient::extension_api_call_completed(u64 call_id, u64 context_id, bool succeeded, String result)

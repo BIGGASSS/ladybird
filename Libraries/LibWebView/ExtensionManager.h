@@ -17,6 +17,7 @@
 #include <LibCore/Forward.h>
 #include <LibURL/URL.h>
 #include <LibWebView/Export.h>
+#include <LibWebView/ExtensionNetworkRules.h>
 #include <LibWebView/ExtensionPackage.h>
 
 namespace WebView {
@@ -67,6 +68,8 @@ public:
     // The toolbar buttons of the extensions that have one.
     Vector<Action> actions() const;
 
+    ExtensionNetworkRules& network_rules() { return m_network_rules; }
+
     // The page that runs the extension's background scripts or service worker, if it has any.
     Optional<URL::URL> background_page_url(StringView extension_id) const;
     String storage_json() const { return m_storage.serialized(); }
@@ -85,6 +88,7 @@ private:
     HashMap<String, ExtensionPackage> m_packages;
     HashMap<String, JsonObject> m_manifests;
     HashMap<String, JsonObject> m_messages;
+    ExtensionNetworkRules m_network_rules;
     Core::AnonymousBuffer m_extensions_buffer;
     JsonObject m_storage;
     RefPtr<Core::Timer> m_storage_save_timer;

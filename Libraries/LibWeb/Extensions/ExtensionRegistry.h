@@ -20,7 +20,10 @@
 #include <LibURL/Forward.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibURL/Origin.h>
+#include <LibURL/URL.h>
 #include <LibWebCommon/Extensions/MessageDeliveryStatus.h>
+#include <LibWebCommon/Extensions/NetworkRequestOutcome.h>
 #include <LibWebCommon/Page/PageId.h>
 
 namespace Web::Extensions {
@@ -126,6 +129,27 @@ public:
         MessageDeliveryStatus status { MessageDeliveryStatus::NoListener };
         String response;
     };
+    // https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest
+    // What happens to a request of a page is up to the network rules of the extensions, which the browser process keeps.
+    bool has_network_rules() const { return m_has_network_rules; }
+    using NetworkRequestCallback = GC::Ref<GC::Function<void(NetworkRequestOutcome, Optional<URL::URL>)>>;
+    struct AncestorFrame {
+        URL::URL url;
+        Optional<URL::Origin> initiator;
+        bool is_top_level { false };
+    };
+    struct NetworkRequest {
+        URL::URL url;
+        String method;
+        StringView resource_type;
+        Optional<URL::Origin> initiator;
+        Optional<String> initiator_extension_id;
+        Vector<AncestorFrame> ancestor_frames;
+    };
+    void evaluate_network_request(PageId, NetworkRequest, NetworkRequestCallback);
+    void did_evaluate_network_request(u64 request_id, NetworkRequestOutcome, Optional<URL::URL> redirect_url);
+    Function<void(PageId, u64 request_id, NetworkRequest const&)> on_evaluate_network_request;
+
     // Tells the extension's pages of an event of its API, such as its toolbar button being clicked.
     void deliver_event(StringView extension_id, StringView name, StringView arguments_json);
     MessageDeliveryResult deliver_message(u64 delivery_id, StringView extension_id, Optional<PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, StringView message_json, StringView sender_json);
@@ -143,6 +167,9 @@ private:
     HashMap<u64, GC::Root<GC::Function<void(Optional<ReadonlyBytes>, StringView)>>> m_pending_resource_loads;
     u64 m_next_resource_request_id { 0 };
     u64 m_next_call_id { 0 };
+    bool m_has_network_rules { false };
+    HashMap<u64, GC::Root<GC::Function<void(NetworkRequestOutcome, Optional<URL::URL>)>>> m_pending_network_requests;
+    u64 m_next_network_request_id { 0 };
     // Extension ID -> storage area name -> items.
     HashMap<String, HashMap<String, JsonObject>> m_storage;
 };

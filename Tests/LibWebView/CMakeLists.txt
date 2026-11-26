@@ -73,6 +73,7 @@ set(TEST_SOURCES
     TestBackgroundNetworking.cpp
     TestCanonicalBrowsingContextGroup.cpp
     TestCookieJar.cpp
+    TestDeclarativeNetRequest.cpp
     TestCrashReportDiagnostics.cpp
     TestDownloadSegmentation.cpp
     TestDownloadStore.cpp

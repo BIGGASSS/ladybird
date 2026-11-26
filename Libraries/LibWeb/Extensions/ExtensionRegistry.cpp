@@ -108,6 +108,7 @@ static RunAt run_at_from_string(StringView run_at)
 ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
 {
     Vector<Extension> extensions;
+    bool has_network_rules = false;
 
     if (!bytes.is_empty()) {
         auto json = TRY(JsonValue::from_string(StringView { bytes }));
@@ -199,12 +200,14 @@ ErrorOr<void> ExtensionRegistry::set_extensions_from_bytes(ReadonlyBytes bytes)
                 }));
             }
 
+            has_network_rules |= object.get_bool("network_rules"sv).value_or(false);
             extensions.append(move(extension));
             return {};
         }));
     }
 
     m_extensions = move(extensions);
+    m_has_network_rules = has_network_rules;
     return {};
 }
 
@@ -359,6 +362,23 @@ void ExtensionRegistry::load_resource(URL::URL const& url, ResourceCallback call
     auto request_id = ++m_next_resource_request_id;
     m_pending_resource_loads.set(request_id, GC::make_root(callback));
     on_load_resource(request_id, MUST(String::from_utf8(url.serialized_host())), path.release_value());
+}
+
+void ExtensionRegistry::evaluate_network_request(PageId page_id, NetworkRequest request, NetworkRequestCallback callback)
+{
+    if (!on_evaluate_network_request) {
+        callback->function()(NetworkRequestOutcome::Allow, {});
+        return;
+    }
+    auto request_id = ++m_next_network_request_id;
+    m_pending_network_requests.set(request_id, GC::make_root(callback));
+    on_evaluate_network_request(page_id, request_id, request);
+}
+
+void ExtensionRegistry::did_evaluate_network_request(u64 request_id, NetworkRequestOutcome outcome, Optional<URL::URL> redirect_url)
+{
+    if (auto callback = m_pending_network_requests.take(request_id); callback.has_value())
+        (*callback)->function()(outcome, move(redirect_url));
 }
 
 void ExtensionRegistry::did_load_resource(u64 request_id, Optional<ReadonlyBytes> data, StringView mime_type)

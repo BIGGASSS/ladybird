@@ -485,34 +485,8 @@
             onRemoved: createEvent()[0],
         };
 
-        // declarativeNetRequest: the rules are kept, but nothing applies them yet.
+        // declarativeNetRequest
 
-        const ruleResources =
-            (manifest.declarative_net_request && manifest.declarative_net_request.rule_resources) || [];
-        const dnrState = {
-            dynamic: [],
-            session: [],
-            enabled: new Set(ruleResources.filter(resource => resource.enabled).map(resource => resource.id)),
-        };
-        const updateRules = list => options => {
-            const removeIds = new Set(options.removeRuleIds || []);
-            const kept = list === "dynamic" ? dnrState.dynamic : dnrState.session;
-            const next = kept.filter(rule => !removeIds.has(rule.id)).concat(options.addRules || []);
-            if (list === "dynamic") dnrState.dynamic = next;
-            else dnrState.session = next;
-        };
-        const filterRules =
-            rules =>
-            (filter = {}) =>
-                Array.isArray(filter.ruleIds)
-                    ? rules().filter(rule => filter.ruleIds.includes(rule.id))
-                    : rules().slice();
-        const dnrFunction =
-            compute =>
-            (...args) => {
-                const callback = popCallback(args);
-                return settle(callback, () => compute(...args));
-            };
         chrome.declarativeNetRequest = {
             MAX_NUMBER_OF_DYNAMIC_RULES: 30000,
             MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES: 30000,
@@ -522,27 +496,30 @@
             GUARANTEED_MINIMUM_STATIC_RULES: 30000,
             DYNAMIC_RULESET_ID: "_dynamic",
             SESSION_RULESET_ID: "_session",
-            getDynamicRules: dnrFunction(filterRules(() => dnrState.dynamic)),
-            getSessionRules: dnrFunction(filterRules(() => dnrState.session)),
-            updateDynamicRules: dnrFunction(updateRules("dynamic")),
-            updateSessionRules: dnrFunction(updateRules("session")),
-            getEnabledRulesets: dnrFunction(() => Array.from(dnrState.enabled)),
-            updateEnabledRulesets: dnrFunction((options = {}) => {
-                for (const id of options.disableRulesetIds || []) dnrState.enabled.delete(id);
-                for (const id of options.enableRulesetIds || []) dnrState.enabled.add(id);
-            }),
-            getAvailableStaticRuleCount: dnrFunction(() => 300000),
-            getDisabledRuleIds: dnrFunction(() => []),
-            updateStaticRules: dnrFunction(() => undefined),
-            isRegexSupported: dnrFunction(() => ({ isSupported: true })),
-            getMatchedRules: dnrFunction(() => ({ rulesMatchedInfo: [] })),
-            setExtensionActionOptions: dnrFunction(() => undefined),
-            testMatchOutcome: dnrFunction(() => ({ matchedRules: [] })),
+            getDynamicRules: browserFunction("declarativeNetRequest.getDynamicRules", 1),
+            getSessionRules: browserFunction("declarativeNetRequest.getSessionRules", 1),
+            updateDynamicRules: browserFunction("declarativeNetRequest.updateDynamicRules", 1),
+            updateSessionRules: browserFunction("declarativeNetRequest.updateSessionRules", 1),
+            getEnabledRulesets: browserFunction("declarativeNetRequest.getEnabledRulesets", 0),
+            updateEnabledRulesets: browserFunction("declarativeNetRequest.updateEnabledRulesets", 1),
+            getAvailableStaticRuleCount: browserFunction("declarativeNetRequest.getAvailableStaticRuleCount", 0),
+            getDisabledRuleIds: browserFunction("declarativeNetRequest.getDisabledRuleIds", 1),
+            updateStaticRules: browserFunction("declarativeNetRequest.updateStaticRules", 1),
+            isRegexSupported: browserFunction("declarativeNetRequest.isRegexSupported", 1),
+            getMatchedRules: noop({ rulesMatchedInfo: [] }),
+            setExtensionActionOptions: noop(),
+            testMatchOutcome: browserFunction("declarativeNetRequest.testMatchOutcome", 1),
             onRuleMatchedDebug: createEvent()[0],
         };
 
         // scripting: registered content scripts are kept, but only the manifest's run.
 
+        const localFunction =
+            compute =>
+            (...args) => {
+                const callback = popCallback(args);
+                return settle(callback, () => compute(...args));
+            };
         let registeredContentScripts = [];
         const notSupported =
             name =>
@@ -551,22 +528,22 @@
                     throw new Error(name + " is not supported");
                 });
         chrome.scripting = {
-            registerContentScripts: dnrFunction(scripts => {
+            registerContentScripts: localFunction(scripts => {
                 registeredContentScripts = registeredContentScripts.concat(scripts || []);
             }),
-            updateContentScripts: dnrFunction(scripts => {
+            updateContentScripts: localFunction(scripts => {
                 for (const script of scripts || []) {
                     const index = registeredContentScripts.findIndex(existing => existing.id === script.id);
                     if (index !== -1)
                         registeredContentScripts[index] = { ...registeredContentScripts[index], ...script };
                 }
             }),
-            getRegisteredContentScripts: dnrFunction((filter = {}) =>
+            getRegisteredContentScripts: localFunction((filter = {}) =>
                 Array.isArray(filter.ids)
                     ? registeredContentScripts.filter(script => filter.ids.includes(script.id))
                     : registeredContentScripts.slice()
             ),
-            unregisterContentScripts: dnrFunction((filter = {}) => {
+            unregisterContentScripts: localFunction((filter = {}) => {
                 registeredContentScripts = Array.isArray(filter.ids)
                     ? registeredContentScripts.filter(script => !filter.ids.includes(script.id))
                     : [];

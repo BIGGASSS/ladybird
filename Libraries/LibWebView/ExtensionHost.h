@@ -13,6 +13,7 @@
 #include <AK/String.h>
 #include <AK/WeakPtr.h>
 #include <LibWebCommon/Page/PageId.h>
+#include <LibWebView/ExtensionNetworkRules.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
 
@@ -40,6 +41,9 @@ public:
 
     // An extension's popup acts for the tab of the window it was opened from.
     void set_tab_of_popup(u64 popup_view_id, u64 tab_view_id);
+
+    // What the network rules of the extensions make of a request of a page.
+    void evaluate_network_request(WebContentClient&, u64 request_id, DeclarativeNetRequest::Request const&, ExtensionNetworkRules::FrameContext const&);
 
     // The toolbar button of an extension that has no popup tells the extension's pages that it was clicked.
     void click_action(String const& extension_id, u64 tab_view_id);

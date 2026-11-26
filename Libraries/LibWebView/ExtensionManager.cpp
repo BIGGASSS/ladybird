@@ -277,14 +277,16 @@ ErrorOr<JsonObject> extension_data_for_web_content(ExtensionPackage const& packa
     data.set("ui_language"sv, preferred_languages.is_empty() ? "en-US"_string : preferred_languages.first());
     data.set("content_scripts"sv, move(content_scripts));
     data.set("resources"sv, move(resources));
+
+    // Processes ask the browser what to do with the requests of pages if an extension may have rules for them.
+    auto permissions = string_array(manifest, "permissions"sv);
+    data.set("network_rules"sv, permissions.contains_slow("declarativeNetRequest"_string) || permissions.contains_slow("declarativeNetRequestWithHostAccess"_string));
     return data;
 }
 
 static void warn_about_unsupported_features(InstalledExtension const& extension, JsonObject const& manifest)
 {
     Vector<StringView> unsupported;
-    if (manifest.has("declarative_net_request"sv))
-        unsupported.append("request blocking rules"sv);
     auto permissions = string_array(manifest, "permissions"sv);
     if (permissions.contains_slow("webRequest"_string) || permissions.contains_slow("webRequestBlocking"_string))
         unsupported.append("request interception"sv);
@@ -296,6 +298,16 @@ static void warn_about_unsupported_features(InstalledExtension const& extension,
 ExtensionManager::ExtensionManager(ByteString extensions_directory, ByteString storage_path)
     : m_extensions_directory(move(extensions_directory))
     , m_storage_path(move(storage_path))
+    , m_network_rules(LexicalPath::join(LexicalPath { m_storage_path }.parent().string(), "ExtensionNetworkRules.json"sv).string(), [this](StringView extension_id, StringView path) -> Optional<ByteBuffer> {
+        auto package = m_packages.get(extension_id);
+        if (!package.has_value())
+            return {};
+        auto normalized_path = normalized_package_path(path);
+        auto file = package->files.get(normalized_path.view());
+        if (!file.has_value())
+            return {};
+        return MUST(ByteBuffer::copy(*file));
+    })
 {
     load_storage();
 }
@@ -378,6 +390,11 @@ ErrorOr<void> ExtensionManager::load(ReadonlySpan<String> preferred_languages)
     m_packages = move(packages);
     m_manifests = move(manifests);
     m_messages = move(messages);
+
+    Vector<String> extension_ids;
+    for (auto const& extension : m_extensions)
+        extension_ids.append(extension.id);
+    m_network_rules.set_extensions(extension_ids, [this](StringView id) -> JsonObject const& { return *m_manifests.get(id); });
     m_extensions_buffer = move(buffer);
     return {};
 }
@@ -407,6 +424,7 @@ ErrorOr<InstalledExtension> ExtensionManager::install(StringView path, ReadonlyS
     }
 
     TRY(load(preferred_languages));
+    m_network_rules.mark_installed(package.id);
 
     for (auto const& extension : m_extensions) {
         if (extension.id == package.id)

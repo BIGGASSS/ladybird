@@ -359,7 +359,74 @@ void ExtensionHost::handle_api_call(WebContentClient& client, Web::PageId page_i
     if (method == "runtime.sendMessage"sv)
         return send_message(client, caller, context_id, call_id, extension_id, arguments);
 
+    // https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest
+    if (method.starts_with_bytes("declarativeNetRequest."sv)) {
+        auto& rules = m_manager.network_rules();
+        if (!rules.extension_has_permission(extension_id))
+            return fail("Extension does not have declarativeNetRequest permission"sv);
+        auto settle = [&](ErrorOr<void, String> result) {
+            if (result.is_error())
+                return fail(result.error());
+            respond(true, {});
+        };
+        if (method == "declarativeNetRequest.getDynamicRules"sv)
+            return respond(true, rules.dynamic_rules(extension_id, argument_object(0)));
+        if (method == "declarativeNetRequest.updateDynamicRules"sv)
+            return settle(rules.update_dynamic_rules(extension_id, argument_object(0)));
+        if (method == "declarativeNetRequest.getSessionRules"sv)
+            return respond(true, rules.session_rules(extension_id, argument_object(0)));
+        if (method == "declarativeNetRequest.updateSessionRules"sv)
+            return settle(rules.update_session_rules(extension_id, argument_object(0)));
+        if (method == "declarativeNetRequest.getEnabledRulesets"sv)
+            return respond(true, rules.enabled_rulesets(extension_id));
+        if (method == "declarativeNetRequest.updateEnabledRulesets"sv)
+            return settle(rules.update_enabled_rulesets(extension_id, argument_object(0)));
+        if (method == "declarativeNetRequest.getDisabledRuleIds"sv) {
+            auto result = rules.disabled_rule_ids(extension_id, argument_object(0));
+            if (result.is_error())
+                return fail(result.error());
+            return respond(true, result.release_value());
+        }
+        if (method == "declarativeNetRequest.updateStaticRules"sv)
+            return settle(rules.update_static_rules(extension_id, argument_object(0)));
+        if (method == "declarativeNetRequest.getAvailableStaticRuleCount"sv)
+            return respond(true, JsonValue { rules.available_static_rule_count(extension_id) });
+        if (method == "declarativeNetRequest.isRegexSupported"sv) {
+            auto options = argument_object(0);
+            JsonObject result;
+            auto supported = DeclarativeNetRequest::is_regex_supported(options.get_string("regex"sv).value_or({}), options.get_bool("isCaseSensitive"sv).value_or(false));
+            result.set("isSupported"sv, supported);
+            if (!supported)
+                result.set("reason"sv, "syntaxError"sv);
+            return respond(true, move(result));
+        }
+        if (method == "declarativeNetRequest.testMatchOutcome"sv) {
+            auto details = argument_object(0);
+            auto url = URL::Parser::basic_parse(details.get_string("url"sv).value_or({}));
+            auto type = DeclarativeNetRequest::resource_type_from_name(details.get_string("type"sv).value_or({}));
+            if (!url.has_value() || !type.has_value())
+                return fail("Invalid request details"sv);
+            DeclarativeNetRequest::Request request { *url, details.get_string("method"sv).value_or("get"_string).to_ascii_lowercase(), *type, {} };
+            if (auto initiator = URL::Parser::basic_parse(details.get_string("initiator"sv).value_or({})); initiator.has_value())
+                request.initiator = initiator->origin();
+            JsonObject result;
+            result.set("matchedRules"sv, rules.matching_rules(extension_id, request, {}));
+            return respond(true, move(result));
+        }
+    }
+
     fail(MUST(String::formatted("{} is not supported", method)));
+}
+
+void ExtensionHost::evaluate_network_request(WebContentClient& client, u64 request_id, DeclarativeNetRequest::Request const& request, ExtensionNetworkRules::FrameContext const& frame)
+{
+    // NB: Extensions do not act on private browsing.
+    if (client.is_private() == IsPrivate::Yes) {
+        client.async_did_evaluate_extension_network_request(request_id, to_underlying(Web::Extensions::NetworkRequestOutcome::Allow), {});
+        return;
+    }
+    auto outcome = m_manager.network_rules().evaluate(request, frame);
+    client.async_did_evaluate_extension_network_request(request_id, to_underlying(outcome.outcome), move(outcome.redirect_url));
 }
 
 // https://developer.chrome.com/docs/extensions/reference/api/action#event-onClicked

@@ -258,6 +258,7 @@ private:
     virtual void set_extension_storage(String storage) override;
     virtual void extension_storage_changed(String extension_id, String area, String changes) override;
     virtual void did_load_extension_resource(u64 request_id, bool found, Core::AnonymousBuffer data, String mime_type) override;
+    virtual void did_evaluate_extension_network_request(u64 request_id, u8 outcome, Optional<URL::URL> redirect_url) override;
     virtual void extension_api_call_completed(u64 call_id, u64 context_id, bool succeeded, String result) override;
     virtual void deliver_extension_event(String extension_id, String name, String arguments) override;
     virtual void deliver_extension_message(u64 delivery_id, String extension_id, Optional<Web::PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, String message, String sender) override;
