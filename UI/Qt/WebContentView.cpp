@@ -38,6 +38,7 @@
 #include <UI/Qt/Application.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/CrashReportReviewWidget.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/ReportReview.h>
 #include <UI/Qt/ScreenshotViewer.h>
@@ -72,6 +73,7 @@
 #include <QInputDevice>
 #include <QKeySequence>
 #include <QLabel>
+#include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QNativeGestureEvent>
@@ -1077,6 +1079,20 @@ void WebContentView::mouseDoubleClickEvent(QMouseEvent* event)
     mousePressEvent(event);
 }
 
+static QList<QString> dropped_extension_packages(QMimeData const& mime_data)
+{
+    if (!mime_data.hasUrls())
+        return {};
+
+    QList<QString> paths;
+    for (auto const& url : mime_data.urls()) {
+        if (!url.isLocalFile() || !url.toLocalFile().endsWith(QLatin1String(".crx"), Qt::CaseInsensitive))
+            return {};
+        paths.append(url.toLocalFile());
+    }
+    return paths;
+}
+
 void WebContentView::dragEnterEvent(QDragEnterEvent* event)
 {
     if (is_node_picker_active()) {
@@ -1086,6 +1102,12 @@ void WebContentView::dragEnterEvent(QDragEnterEvent* event)
 
     if (!event->mimeData()->hasUrls())
         return;
+
+    m_dragging_extension_packages = !dropped_extension_packages(*event->mimeData()).isEmpty();
+    if (m_dragging_extension_packages) {
+        event->acceptProposedAction();
+        return;
+    }
 
     enqueue_native_event(Web::DragEvent::Type::DragStart, *event);
     event->acceptProposedAction();
@@ -1098,6 +1120,11 @@ void WebContentView::dragMoveEvent(QDragMoveEvent* event)
         return;
     }
 
+    if (m_dragging_extension_packages) {
+        event->acceptProposedAction();
+        return;
+    }
+
     enqueue_native_event(Web::DragEvent::Type::DragMove, *event);
     event->acceptProposedAction();
 }
@@ -1106,6 +1133,11 @@ void WebContentView::dragLeaveEvent(QDragLeaveEvent*)
 {
     if (is_node_picker_active())
         return;
+
+    if (m_dragging_extension_packages) {
+        m_dragging_extension_packages = false;
+        return;
+    }
 
     // QDragLeaveEvent does not contain any mouse position or button information.
     Web::DragEvent event {};
@@ -1118,6 +1150,25 @@ void WebContentView::dropEvent(QDropEvent* event)
 {
     if (is_node_picker_active()) {
         event->ignore();
+        return;
+    }
+
+    if (m_dragging_extension_packages) {
+        m_dragging_extension_packages = false;
+        event->acceptProposedAction();
+
+        QStringList installed;
+        for (auto const& path : dropped_extension_packages(*event->mimeData())) {
+            auto result = HubConnection::the().install_extension(ak_byte_string_from_qstring(path));
+            if (!result.name().has_value()) {
+                QMessageBox::warning(this, "Ladybird", QString("Unable to install the extension %1: %2").arg(path, qstring_from_ak_string(result.error())));
+                continue;
+            }
+            installed.append(qstring_from_ak_string(*result.name()));
+        }
+
+        if (!installed.isEmpty())
+            QMessageBox::information(this, "Ladybird", QString("Installed %1. Reload open pages for it to run on them.").arg(installed.join(", ")));
         return;
     }
 

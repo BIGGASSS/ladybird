@@ -64,6 +64,11 @@ Trustworthiness is_url_potentially_trustworthy(URL::URL const& url)
     if (URL::is_webui_url(url))
         return Trustworthiness::PotentiallyTrustworthy;
 
+    // AD-HOC: The files of installed extensions are served directly by the user agent, as in Chrome, which considers
+    //         chrome-extension: an authenticated scheme.
+    if (url.scheme() == "chrome-extension"sv)
+        return Trustworthiness::PotentiallyTrustworthy;
+
     // 2. If url's scheme is "data", return "Potentially Trustworthy".
     if (url.scheme() == "data"sv)
         return Trustworthiness::PotentiallyTrustworthy;

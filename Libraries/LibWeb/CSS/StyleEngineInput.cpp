@@ -28,6 +28,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/HTML/CustomElements/CustomStateSet.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
@@ -54,6 +55,7 @@
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/MathML/TagNames.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
@@ -1724,7 +1726,7 @@ static u32 open_box_type_adjustment_facts(DOM::Element const& element, ElementOp
         }
     }
 
-    set(has_flag(open_facts, ElementOpenFacts::Audio) && !element.has_attribute(HTML::AttributeNames::controls), ElementStyleAdjustmentFact::HideAudioWithoutControls);
+    set((has_flag(open_facts, ElementOpenFacts::Audio) && !element.has_attribute(HTML::AttributeNames::controls)) || element.is_collapsed_by_extension(), ElementStyleAdjustmentFact::HideAudioWithoutControls);
     set(element.is_document_element(), ElementStyleAdjustmentFact::IsDocumentElement);
     return facts;
 }
@@ -2781,8 +2783,17 @@ static StyleSheetState* owning_compiled_sheet(StyleSheetState* sheet)
 {
     while (sheet && !sheet->constructed() && sheet->style_engine_sheet_id() == 0) {
         auto* owner = sheet->owner_import();
-        if (!owner)
+        if (!owner) {
+            if (auto document = sheet->owning_document()) {
+                if (auto* style_computer = document->style_computer_if_created()) {
+                    for (auto const& entry : style_computer->non_author_style_sheets()) {
+                        if (entry.sheet.ptr() == sheet)
+                            return sheet;
+                    }
+                }
+            }
             return nullptr;
+        }
         sheet = owner->parent_style_sheet();
     }
     return sheet;
@@ -2937,6 +2948,16 @@ static void record_style_rule_inserted_in(u64 identity, bool changes_environment
     document.flush_deferred_style_change_event();
     auto& style_computer = document.style_computer();
     auto sheet_id = style_computer.style_engine_sheet_id_for(sheet);
+    bool is_non_author_sheet = false;
+    if (sheet_id == 0) {
+        for (auto const& entry : style_computer.non_author_style_sheets()) {
+            if (entry.sheet.ptr() == &sheet) {
+                sheet_id = entry.sheet_id;
+                is_non_author_sheet = true;
+                break;
+            }
+        }
+    }
     if (sheet_id == 0)
         return;
 
@@ -2951,6 +2972,8 @@ static void record_style_rule_inserted_in(u64 identity, bool changes_environment
         style_computer
     };
     compile_rules_into(context, sheet, identity);
+    if (is_non_author_sheet && document.navigable())
+        document.page().client().request_frame_for(document);
 }
 
 // A rule arrived. Compile it, and everything it brings with it, into the position it holds.
@@ -3196,6 +3219,7 @@ static StyleComputer::NonAuthorStyleSheetsKey non_author_style_sheets_key(DOM::D
         .needs_mathml_and_svg_user_agent_style_sheets = document.needs_mathml_and_svg_user_agent_style_sheets(),
         .is_html_document = document.document_type() == DOM::Document::Type::HTML,
         .user_style_sheet = style_scope.m_user_style_sheet.ptr(),
+        .inserted_user_style_sheets_version = Extensions::ExtensionRegistry::the().inserted_user_style_sheets_version(document),
     };
 }
 
@@ -3327,6 +3351,7 @@ void record_non_author_stylesheets(DOM::Document& document)
             updated.append(attach_sheet(index, successor));
         }
         recorded = move(updated);
+        style_scope.publish_cascade_layer_order();
         return;
     }
 
@@ -3335,6 +3360,7 @@ void record_non_author_stylesheets(DOM::Document& document)
     recorded.clear();
     for (size_t index = 0; index < sheets.size(); ++index)
         recorded.append(attach_sheet(index, first_author_sheet));
+    style_scope.publish_cascade_layer_order();
 }
 
 void record_stylesheet_rule_conditions(StyleSheetState& sheet)

@@ -432,6 +432,19 @@ bool file_scheme_urls_have_tuple_origins()
     return s_file_scheme_urls_have_tuple_origins;
 }
 
+static bool s_chrome_extension_urls_have_tuple_origins = false;
+
+void set_chrome_extension_urls_have_tuple_origins()
+{
+    s_chrome_extension_urls_have_tuple_origins = true;
+}
+
+extern "C" bool url_rust_chrome_extension_urls_have_tuple_origins();
+extern "C" bool url_rust_chrome_extension_urls_have_tuple_origins()
+{
+    return s_chrome_extension_urls_have_tuple_origins;
+}
+
 extern "C" bool url_rust_file_scheme_urls_have_tuple_origins();
 
 extern "C" bool url_rust_file_scheme_urls_have_tuple_origins()

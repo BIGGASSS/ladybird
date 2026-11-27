@@ -95,6 +95,7 @@ private:
     virtual Messages::HubServer::ViewKeepStateForDiscardingResponse view_keep_state_for_discarding(u64 view_id) override;
     virtual void view_restore_state_of_discarded_tab(u64 view_id, u64 discarded_tab_state_id) override;
     virtual void view_decline_discard(u64 view_id) override;
+    virtual void view_decline_close(u64 view_id) override;
     virtual void forget_state_of_discarded_tab(u64 discarded_tab_state_id) override;
     virtual Messages::HubServer::ViewHistoryStepAtDeltaResponse view_history_step_at_delta(u64 view_id, i32 delta) override;
     virtual Messages::HubServer::ViewLookUpSelectedTextAtResponse view_look_up_selected_text_at(u64 view_id, Gfx::IntPoint position) override;
@@ -154,6 +155,10 @@ private:
     virtual void pause_active_downloads() override;
     virtual void cancel_unresumable_downloads() override;
     virtual void active_view_changed(Optional<u64> view_id) override;
+    virtual Messages::HubServer::InstallExtensionResponse install_extension(ByteString path) override;
+    virtual Messages::HubServer::ExtensionActionsResponse extension_actions() override;
+    virtual void click_extension_action(String extension_id, u64 tab_view_id) override;
+    virtual void set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id, String extension_id) override;
     virtual void answer_clipboard_text(u64 request_id, Utf16String text) override;
     virtual void answer_clipboard_item(u64 request_id, Web::Clipboard::SystemClipboardItem item) override;
     virtual void answer_download_path(u64 request_id, Optional<ByteString> path) override;

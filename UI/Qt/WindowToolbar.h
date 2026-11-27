@@ -101,6 +101,9 @@ public:
     void show_downloads_popover();
     void update_downloads_button();
     void update_feedback_button();
+    // The toolbar buttons of the extensions that are installed.
+    void update_extension_actions();
+    static void resize_extension_popup(u64 popup_view_id, Gfx::IntSize);
 
 private:
     virtual bool event(QEvent*) override;
@@ -181,6 +184,8 @@ private:
 
     DownloadsButton* m_downloads_button { nullptr };
     QPointer<DownloadsPopover> m_downloads_popover;
+    QWidget* m_extension_actions { nullptr };
+    QPointer<QWidget> m_extension_popup;
     size_t m_completed_download_count { 0 };
 
     FeedbackButton* m_feedback_button { nullptr };

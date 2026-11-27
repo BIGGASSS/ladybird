@@ -113,6 +113,14 @@ struct Hub::DownloadState {
     Vector<WebView::FileDownloader::SegmentProgress> segments;
 }
 
+// The toolbar button of an extension, and the popup it opens, if any.
+struct Hub::ExtensionAction {
+    String extension_id;
+    String title;
+    Optional<ByteBuffer> icon;
+    Optional<URL::URL> popup_url;
+}
+
 // What only the UI can tell, which the Hub needs from the start.
 struct Hub::UIInfo {
     Optional<String> ui_font_family;
@@ -245,6 +253,8 @@ struct Hub::ViewState {
 endpoint HubClient
 {
     crash_reports_changed() =|
+    extension_actions_changed() =|
+    resize_extension_popup(u64 popup_view_id, Gfx::IntSize size) =|
     request_finished(u64 request_id, bool had_network_error, Optional<u32> response_code, Vector<HTTP::Header> response_headers, ByteString body) =|
     app_open_new_tab(Vector<URL::URL> urls) =|
     app_open_new_window(Vector<URL::URL> urls) =|

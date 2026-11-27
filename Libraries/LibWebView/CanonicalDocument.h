@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/HashTable.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
@@ -110,6 +111,15 @@ public:
 
     void make_active();
 
+    HashTable<String>& authorized_content_script_extensions() { return m_authorized_content_script_extensions; }
+    HashTable<String> const& authorized_content_script_extensions() const { return m_authorized_content_script_extensions; }
+    bool has_snapshotted_content_script_extensions() const { return m_has_snapshotted_content_script_extensions; }
+    void set_snapshotted_content_script_extensions() { m_has_snapshotted_content_script_extensions = true; }
+    Optional<u64> extension_generation() const { return m_extension_generation; }
+    void set_extension_generation(u64 generation) { m_extension_generation = generation; }
+    void retain_pending_extension_generation();
+    void release_pending_extension_generation();
+
 private:
     CanonicalDocument(Web::HTML::CrossProcessId id, URL::URL creation_url, URL::Origin, NonnullRefPtr<CanonicalBrowsingContext>, NonnullRefPtr<CanonicalWindow>, Web::HTML::SandboxingFlagSet active_sandboxing_flag_set, IsInitialAboutBlank);
 
@@ -128,6 +138,10 @@ private:
     bool m_is_local_file_content { false };
     Optional<String> m_web_ui_host;
     RefPtr<WebContentPage> m_host;
+    HashTable<String> m_authorized_content_script_extensions;
+    bool m_has_snapshotted_content_script_extensions { false };
+    Optional<u64> m_extension_generation;
+    bool m_retains_pending_extension_generation { false };
 };
 
 }

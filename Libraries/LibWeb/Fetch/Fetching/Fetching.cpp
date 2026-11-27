@@ -28,6 +28,7 @@
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/Fetch/BodyInit.h>
 #include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
 #include <LibWeb/Fetch/Engine/FetchByteChannel.h>
@@ -652,6 +653,340 @@ void upgrade_request_to_https_for_known_hsts_host_if_appropriate(Page& page, Inf
     }
 }
 
+// https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest#type-ResourceType
+static StringView extension_resource_type(Infrastructure::Request const& request)
+{
+    using Destination = Infrastructure::Request::Destination;
+    using InitiatorType = Infrastructure::Request::InitiatorType;
+
+    if (request.mode() == Infrastructure::Request::Mode::WebSocket)
+        return "websocket"sv;
+
+    auto destination = request.destination();
+    if (!destination.has_value()) {
+        switch (request.initiator_type().value_or(InitiatorType::Other)) {
+        case InitiatorType::Fetch:
+        case InitiatorType::XMLHttpRequest:
+            return "xmlhttprequest"sv;
+        case InitiatorType::Beacon:
+        case InitiatorType::Ping:
+            return "ping"sv;
+        default:
+            return "other"sv;
+        }
+    }
+
+    switch (*destination) {
+    case Destination::Document:
+        return "main_frame"sv;
+    case Destination::Frame:
+    case Destination::IFrame:
+        return "sub_frame"sv;
+    case Destination::Style:
+    case Destination::XSLT:
+        return "stylesheet"sv;
+    case Destination::Script:
+    case Destination::JSON:
+    case Destination::Worker:
+    case Destination::SharedWorker:
+    case Destination::ServiceWorker:
+    case Destination::AudioWorklet:
+    case Destination::PaintWorklet:
+        return "script"sv;
+    case Destination::Image:
+        return "image"sv;
+    case Destination::Font:
+        return "font"sv;
+    case Destination::Object:
+    case Destination::Embed:
+        return "object"sv;
+    case Destination::Audio:
+    case Destination::Video:
+    case Destination::Track:
+        return "media"sv;
+    case Destination::Report:
+        return "csp_report"sv;
+    case Destination::Manifest:
+    case Destination::Text:
+    case Destination::WebIdentity:
+        return "other"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static GC::Ref<PendingResponse> main_fetch_response(JS::Realm&, Infrastructure::FetchParams const&, bool check_extension_network_rules = true);
+
+// Asks the browser process what the network rules of extensions make of the request, and goes on as they say, if any
+// extension may have such rules.
+static GC::Ptr<PendingResponse> apply_extension_network_rules(JS::Realm& realm, Infrastructure::FetchParams const& fetch_params)
+{
+    auto* window = Bindings::window_from_global_object(realm.global_object());
+    if (!window)
+        return {};
+    auto& registry = Extensions::ExtensionRegistry::the();
+    if (!registry.has_network_rules())
+        return {};
+
+    auto request = fetch_params.request();
+    Extensions::ExtensionRegistry::NetworkRequest network_request {
+        .url = request->current_url(),
+        .method = MUST(String::from_byte_string(request->method())),
+        .resource_type = extension_resource_type(*request),
+        .initiator = {},
+        .initiator_extension_id = {},
+        .ancestor_frames = {},
+    };
+    if (auto const* origin = request->origin().get_pointer<URL::Origin>(); origin && !origin->is_opaque()) {
+        network_request.initiator = *origin;
+        if (origin->scheme() == "chrome-extension"sv)
+            network_request.initiator_extension_id = origin->host().serialize();
+    } else if (auto const& client = request->client_snapshot(); client && client->creation_url.scheme() == "chrome-extension"sv) {
+        network_request.initiator_extension_id = MUST(String::from_utf8(client->creation_url.serialized_host()));
+    }
+
+    // Collect the ancestor documents (innermost first) whose allowAllRequests rules apply to this request.
+    GC::Ptr<HTML::Navigable> start_navigable;
+    if (request->mode() != Infrastructure::Request::Mode::Navigate) {
+        start_navigable = window->navigable();
+    } else if (network_request.resource_type == "sub_frame"sv) {
+        if (auto const& child_nav = request->child_navigable_navigation(); child_nav.has_value() && window->navigable()) {
+            if (auto target = window->navigable()->top_level_traversable()->find(child_nav->navigable_id))
+                start_navigable = target->parent();
+        }
+        if (!start_navigable)
+            start_navigable = window->navigable();
+    }
+    for (auto current = start_navigable; current && network_request.ancestor_frames.size() < 64; current = current->parent()) {
+        auto url = current->active_document_url();
+        if (!url.has_value())
+            continue;
+        auto parent = current->parent();
+        Optional<URL::Origin> frame_initiator;
+        if (parent) {
+            if (auto parent_origin = parent->active_document_origin(); parent_origin.has_value() && !parent_origin->is_opaque())
+                frame_initiator = *parent_origin;
+        }
+        network_request.ancestor_frames.append({ move(*url), move(frame_initiator), parent == nullptr });
+    }
+    if (network_request.ancestor_frames.is_empty() && request->mode() != Infrastructure::Request::Mode::Navigate) {
+        if (auto const& client = request->client_snapshot()) {
+            network_request.ancestor_frames.append({ client->creation_url, {}, client->top_level_creation_url == client->creation_url });
+            if (client->top_level_creation_url.has_value() && *client->top_level_creation_url != client->creation_url)
+                network_request.ancestor_frames.append({ *client->top_level_creation_url, {}, true });
+        }
+    }
+
+    auto pending_response = PendingResponse::create(fetch_params);
+    auto page_id = window->page().client().id();
+    registry.evaluate_network_request(page_id, move(network_request), GC::create_function<void(Extensions::NetworkRequestOutcome, Optional<URL::URL>)>(realm.heap(), GC::captures(realm, NonnullRefPtr { fetch_params }, pending_response), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, auto& pending_response, Extensions::NetworkRequestOutcome outcome, Optional<URL::URL> redirect_url) {
+        if (fetch_params->is_canceled()) {
+            pending_response->resolve(Infrastructure::Response::appropriate_network_error(*fetch_params));
+            return;
+        }
+
+        auto resolve_with = [&](GC::Ref<PendingResponse> response) {
+            response->when_loaded(GC::create_function<void(NonnullRefPtr<Infrastructure::Response>)>(realm.heap(), GC::captures(pending_response), [](auto& pending_response, NonnullRefPtr<Infrastructure::Response> response) {
+                pending_response->resolve(response);
+            }));
+        };
+
+        auto request = fetch_params->request();
+        switch (outcome) {
+        case Extensions::NetworkRequestOutcome::Block: {
+            auto blocked_response = Infrastructure::Response::network_error("Request was blocked by an extension"_string);
+            blocked_response->set_should_collapse_initiator(true);
+            pending_response->resolve(move(blocked_response));
+            return;
+        }
+        case Extensions::NetworkRequestOutcome::Redirect:
+        case Extensions::NetworkRequestOutcome::UpgradeScheme: {
+            if (!redirect_url.has_value()
+                || !redirect_url->scheme().is_one_of("http"sv, "https"sv, "chrome-extension"sv, "data"sv)) {
+                pending_response->resolve(Infrastructure::Response::network_error("Request was redirected to an invalid URL by an extension"_string));
+                return;
+            }
+            if (request->redirect_mode() == Infrastructure::Request::RedirectMode::Error) {
+                pending_response->resolve(Infrastructure::Response::network_error("Request with 'error' redirect mode was redirected by an extension"_string));
+                return;
+            }
+            if (request->redirect_mode() == Infrastructure::Request::RedirectMode::Manual) {
+                auto internal_redirect = Infrastructure::Response::create();
+                internal_redirect->set_status(307);
+                internal_redirect->set_status_message("Internal Redirect"sv);
+                internal_redirect->set_url_list(request->url_list());
+                internal_redirect->header_list()->append(HTTP::Header::isomorphic_encode("Location"sv, redirect_url->serialize()));
+                internal_redirect->header_list()->append(HTTP::Header::isomorphic_encode("Cross-Origin-Resource-Policy"sv, "cross-origin"sv));
+                if (request->mode() == Infrastructure::Request::Mode::Navigate) {
+                    if (Infrastructure::is_http_or_https_scheme(redirect_url->scheme())) {
+                        auto* engine_record = fetch_params->engine_record();
+                        VERIFY(engine_record);
+                        auto continuation_id = engine_record->open_redirect_continuation(nullptr);
+                        fetch_params->controller()->set_next_manual_redirect_steps(continuation_id, GC::create_function(GC::Heap::the(), GC::captures(realm, fetch_params, internal_redirect), [](auto& realm, auto& fetch_params, auto& response) {
+                            if (http_redirect_fetch(realm, *fetch_params, *response))
+                                fetch_params->controller()->resolve_redirect(Engine::Command::ResolveRedirect::Abandon {});
+                        }));
+                        pending_response->resolve(internal_redirect);
+                        return;
+                    }
+                } else {
+                    pending_response->resolve(Infrastructure::OpaqueRedirectFilteredResponse::create(*internal_redirect));
+                    return;
+                }
+            }
+            // NB: The request goes on to the new URL, as it would after a redirect, which has a limit of 20.
+            if (request->redirect_count() >= 20 || request->url_list().size() > 20) {
+                pending_response->resolve(Infrastructure::Response::network_error("Request was redirected by an extension too often"_string));
+                return;
+            }
+            if (request->mode() == Infrastructure::Request::Mode::CORS
+                && redirect_url->includes_credentials()
+                && request->origin().has<URL::Origin>()
+                && !request->origin().get<URL::Origin>().is_same_origin(redirect_url->origin())) {
+                pending_response->resolve(Infrastructure::Response::network_error("Request with 'cors' mode and different URL and request origin must not include credentials in redirect URL"_string));
+                return;
+            }
+            if (request->response_tainting() == Infrastructure::Request::ResponseTainting::CORS && redirect_url->includes_credentials()) {
+                pending_response->resolve(Infrastructure::Response::network_error("Request with 'cors' response tainting must not include credentials in redirect URL"_string));
+                return;
+            }
+            if (!request->current_url().origin().is_same_origin(redirect_url->origin()))
+                request->header_list()->delete_("Authorization"sv);
+            request->set_redirect_count(request->redirect_count() + 1);
+            auto target_is_extension = redirect_url->scheme() == "chrome-extension"sv;
+            request->url_list().append(redirect_url.release_value());
+            if (!target_is_extension) {
+                // Re-run main_fetch so local-URLs-only, SVG, CSP, mixed-content, bad-port, HSTS, and referrer policy apply.
+                resolve_with(*main_fetch(realm, *fetch_params, Recursive::Yes));
+            } else {
+                // Web-accessible extension redirects bypass page CSP (as in Chrome) but still honor local/SVG/SRI policies.
+                if (request->local_urls_only()
+                    || is_request_from_an_svg_image(*request)
+                    || SRI::should_request_be_blocked_by_integrity_policy(request) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+                    pending_response->resolve(Infrastructure::Response::network_error("Request redirected to extension resource was blocked"_string));
+                    return;
+                }
+                request->set_referrer(Infrastructure::Request::Referrer::NoReferrer);
+                resolve_with(main_fetch_response(realm, *fetch_params, false));
+            }
+            return;
+        }
+        case Extensions::NetworkRequestOutcome::Allow:
+            resolve_with(main_fetch_response(realm, *fetch_params, false));
+            return;
+        }
+        VERIFY_NOT_REACHED();
+    }));
+    return pending_response;
+}
+
+static GC::Ref<PendingResponse> main_fetch_response(JS::Realm& realm, Infrastructure::FetchParams const& fetch_params, bool check_extension_network_rules)
+{
+    auto request = fetch_params.request();
+    auto controller = fetch_params.controller();
+
+    // AD-HOC: The network rules of browser extensions may block or redirect HTTP(S) requests before CORS or HTTP fetch.
+    if (check_extension_network_rules && Infrastructure::is_http_or_https_scheme(request->current_url().scheme())) {
+        if (auto pending_response = apply_extension_network_rules(realm, fetch_params))
+            return *pending_response;
+    }
+
+    auto const* origin = request->origin().get_pointer<URL::Origin>();
+
+    // -> request’s current URL’s origin is same origin with request’s origin, and request’s response tainting is "basic"
+    // -> request’s current URL’s scheme is "data"
+    // -> request’s mode is "navigate" or "websocket"
+    // AD-HOC: Treat file:// font loads from file:// pages as same-origin.
+    //         Fonts require CORS mode per spec, but file:// origins are opaque in our implementation,
+    //         so the standard same-origin check always fails. Other browsers (Chromium, WebKit, Firefox)
+    //         all allow loading fonts from file:// URLs on file:// pages.
+    auto is_file_to_file_font_load = origin && origin->is_file_origin()
+        && request->current_url().scheme() == "file"sv
+        && request->destination() == Infrastructure::Request::Destination::Font;
+
+    // AD-HOC: The files an extension makes web accessible can be read by anyone, as in Chrome.
+    if (
+        (origin && request->current_url().origin().is_same_origin(*origin) && request->response_tainting() == Infrastructure::Request::ResponseTainting::Basic)
+        || is_file_to_file_font_load
+        || request->current_url().scheme() == "data"sv
+        || request->current_url().scheme() == "chrome-extension"sv
+        || (request->mode() == Infrastructure::Request::Mode::Navigate || request->mode() == Infrastructure::Request::Mode::WebSocket)) {
+        // 1. Set request’s response tainting to "basic".
+        request->set_response_tainting(Infrastructure::Request::ResponseTainting::Basic);
+
+        // 2. Return the result of running scheme fetch given fetchParams.
+        return scheme_fetch(realm, fetch_params);
+
+        // NOTE: HTML assigns any documents and workers created from URLs whose scheme is "data" a unique
+        //       opaque origin. Service workers can only be created from URLs whose scheme is an HTTP(S) scheme.
+    }
+
+    // -> request’s mode is "same-origin"
+    if (request->mode() == Infrastructure::Request::Mode::SameOrigin) {
+        // Return a network error.
+        return PendingResponse::create(controller, Infrastructure::Response::network_error("Request with 'same-origin' mode must have same URL and request origin"_string));
+    }
+
+    // -> request’s mode is "no-cors"
+    if (request->mode() == Infrastructure::Request::Mode::NoCORS) {
+        // 1. If request’s redirect mode is not "follow", then return a network error.
+        if (request->redirect_mode() != Infrastructure::Request::RedirectMode::Follow)
+            return PendingResponse::create(controller, Infrastructure::Response::network_error("Request with 'no-cors' mode must have redirect mode set to 'follow'"_string));
+
+        // 2. Set request’s response tainting to "opaque".
+        request->set_response_tainting(Infrastructure::Request::ResponseTainting::Opaque);
+
+        // 3. Return the result of running scheme fetch given fetchParams.
+        return scheme_fetch(realm, fetch_params);
+    }
+
+    // -> request’s current URL’s scheme is not an HTTP(S) scheme
+    // AD-HOC: We allow CORS requests for resource:// URLs from opaque origins to enable requesting JS modules from internal pages.
+    if (!Infrastructure::is_http_or_https_scheme(request->current_url().scheme())
+        && !(origin && origin->is_opaque() && request->current_url().scheme() == "resource"sv)) {
+        // NOTE: At this point all other request modes have been handled. Ensure we're not lying in the error message :^)
+        VERIFY(request->mode() == Infrastructure::Request::Mode::CORS);
+
+        // Return a network error.
+        return PendingResponse::create(controller, Infrastructure::Response::network_error("Request with 'cors' mode must have URL with HTTP or HTTPS scheme"_string));
+    }
+
+    // -> request’s use-CORS-preflight flag is set
+    // -> request’s unsafe-request flag is set and either request’s method is not a CORS-safelisted method or
+    //    CORS-unsafe request-header names with request’s header list is not empty
+    if (
+        request->use_cors_preflight()
+        || (request->unsafe_request()
+            && (!HTTP::is_cors_safelisted_method(request->method())
+                || !Infrastructure::get_cors_unsafe_header_names(request->header_list()).is_empty()))) {
+        // 1. Set request’s response tainting to "cors".
+        request->set_response_tainting(Infrastructure::Request::ResponseTainting::CORS);
+
+        auto returned_pending_response = PendingResponse::create(controller);
+
+        // 2. Let corsWithPreflightResponse be the result of running HTTP fetch given fetchParams and true.
+        auto cors_with_preflight_response = http_fetch(realm, fetch_params, MakeCORSPreflight::Yes);
+        cors_with_preflight_response->when_loaded(GC::create_function(GC::Heap::the(), GC::captures(request, returned_pending_response), [](NonnullRefPtr<Infrastructure::Request>& request, GC::Ref<PendingResponse>& returned_pending_response, NonnullRefPtr<Infrastructure::Response> cors_with_preflight_response) {
+            dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' cors_with_preflight_response load callback");
+            // 3. If corsWithPreflightResponse is a network error, then clear cache entries using request.
+            if (cors_with_preflight_response->is_network_error()) {
+                Infrastructure::PreflightCache::the().clear_cache_entries(request);
+            }
+
+            // 4. Return corsWithPreflightResponse.
+            returned_pending_response->resolve(cors_with_preflight_response);
+        }));
+
+        return returned_pending_response;
+    }
+
+    // -> Otherwise
+    //     1. Set request’s response tainting to "cors".
+    request->set_response_tainting(Infrastructure::Request::ResponseTainting::CORS);
+
+    //     2. Return the result of running HTTP fetch given fetchParams.
+    return http_fetch(realm, fetch_params);
+}
+
 // https://fetch.spec.whatwg.org/#concept-main-fetch
 GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParams const& fetch_params, Recursive recursive)
 {
@@ -719,9 +1054,8 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     // 10. Set request’s current URL’s scheme to "https" if all of the following conditions are true:
     upgrade_request_to_https_for_known_hsts_host_if_appropriate(Bindings::principal_host_defined_page(realm), *request);
 
-    auto get_response = GC::create_function<GC::Ref<PendingResponse>()>(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller(), request), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, GC::Ref<Infrastructure::FetchController>& controller, NonnullRefPtr<Infrastructure::Request>& request) -> GC::Ref<PendingResponse> {
+    auto get_response = GC::create_function<GC::Ref<PendingResponse>()>(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller()), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, GC::Ref<Infrastructure::FetchController>& controller) -> GC::Ref<PendingResponse> {
         dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' get_response() function");
-        auto const* origin = request->origin().get_pointer<URL::Origin>();
 
         // -> fetchParams’s preloaded response candidate is not null
         if (!fetch_params->preloaded_response_candidate().has<Empty>()) {
@@ -764,97 +1098,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
             return PendingResponse::create(controller, fetch_params->preloaded_response_candidate().get<NonnullRefPtr<Infrastructure::Response>>());
         }
 
-        // -> request’s current URL’s origin is same origin with request’s origin, and request’s response tainting is "basic"
-        // -> request’s current URL’s scheme is "data"
-        // -> request’s mode is "navigate" or "websocket"
-        // AD-HOC: Treat file:// font loads from file:// pages as same-origin.
-        //         Fonts require CORS mode per spec, but file:// origins are opaque in our implementation,
-        //         so the standard same-origin check always fails. Other browsers (Chromium, WebKit, Firefox)
-        //         all allow loading fonts from file:// URLs on file:// pages.
-        auto is_file_to_file_font_load = origin && origin->is_file_origin()
-            && request->current_url().scheme() == "file"sv
-            && request->destination() == Infrastructure::Request::Destination::Font;
-
-        if (
-            (origin && request->current_url().origin().is_same_origin(*origin) && request->response_tainting() == Infrastructure::Request::ResponseTainting::Basic)
-            || is_file_to_file_font_load
-            || request->current_url().scheme() == "data"sv
-            || (request->mode() == Infrastructure::Request::Mode::Navigate || request->mode() == Infrastructure::Request::Mode::WebSocket)) {
-            // 1. Set request’s response tainting to "basic".
-            request->set_response_tainting(Infrastructure::Request::ResponseTainting::Basic);
-
-            // 2. Return the result of running scheme fetch given fetchParams.
-            return scheme_fetch(realm, *fetch_params);
-
-            // NOTE: HTML assigns any documents and workers created from URLs whose scheme is "data" a unique
-            //       opaque origin. Service workers can only be created from URLs whose scheme is an HTTP(S) scheme.
-        }
-
-        // -> request’s mode is "same-origin"
-        if (request->mode() == Infrastructure::Request::Mode::SameOrigin) {
-            // Return a network error.
-            return PendingResponse::create(controller, Infrastructure::Response::network_error("Request with 'same-origin' mode must have same URL and request origin"_string));
-        }
-
-        // -> request’s mode is "no-cors"
-        if (request->mode() == Infrastructure::Request::Mode::NoCORS) {
-            // 1. If request’s redirect mode is not "follow", then return a network error.
-            if (request->redirect_mode() != Infrastructure::Request::RedirectMode::Follow)
-                return PendingResponse::create(controller, Infrastructure::Response::network_error("Request with 'no-cors' mode must have redirect mode set to 'follow'"_string));
-
-            // 2. Set request’s response tainting to "opaque".
-            request->set_response_tainting(Infrastructure::Request::ResponseTainting::Opaque);
-
-            // 3. Return the result of running scheme fetch given fetchParams.
-            return scheme_fetch(realm, *fetch_params);
-        }
-
-        // -> request’s current URL’s scheme is not an HTTP(S) scheme
-        // AD-HOC: We allow CORS requests for resource:// URLs from opaque origins to enable requesting JS modules from internal pages.
-        if (!Infrastructure::is_http_or_https_scheme(request->current_url().scheme())
-            && !(origin && origin->is_opaque() && request->current_url().scheme() == "resource"sv)) {
-            // NOTE: At this point all other request modes have been handled. Ensure we're not lying in the error message :^)
-            VERIFY(request->mode() == Infrastructure::Request::Mode::CORS);
-
-            // Return a network error.
-            return PendingResponse::create(controller, Infrastructure::Response::network_error("Request with 'cors' mode must have URL with HTTP or HTTPS scheme"_string));
-        }
-
-        // -> request’s use-CORS-preflight flag is set
-        // -> request’s unsafe-request flag is set and either request’s method is not a CORS-safelisted method or
-        //    CORS-unsafe request-header names with request’s header list is not empty
-        if (
-            request->use_cors_preflight()
-            || (request->unsafe_request()
-                && (!HTTP::is_cors_safelisted_method(request->method())
-                    || !Infrastructure::get_cors_unsafe_header_names(request->header_list()).is_empty()))) {
-            // 1. Set request’s response tainting to "cors".
-            request->set_response_tainting(Infrastructure::Request::ResponseTainting::CORS);
-
-            auto returned_pending_response = PendingResponse::create(controller);
-
-            // 2. Let corsWithPreflightResponse be the result of running HTTP fetch given fetchParams and true.
-            auto cors_with_preflight_response = http_fetch(realm, *fetch_params, MakeCORSPreflight::Yes);
-            cors_with_preflight_response->when_loaded(GC::create_function(GC::Heap::the(), GC::captures(request, returned_pending_response), [](NonnullRefPtr<Infrastructure::Request>& request, GC::Ref<PendingResponse>& returned_pending_response, NonnullRefPtr<Infrastructure::Response> cors_with_preflight_response) {
-                dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' cors_with_preflight_response load callback");
-                // 3. If corsWithPreflightResponse is a network error, then clear cache entries using request.
-                if (cors_with_preflight_response->is_network_error()) {
-                    Infrastructure::PreflightCache::the().clear_cache_entries(request);
-                }
-
-                // 4. Return corsWithPreflightResponse.
-                returned_pending_response->resolve(cors_with_preflight_response);
-            }));
-
-            return returned_pending_response;
-        }
-
-        // -> Otherwise
-        //     1. Set request’s response tainting to "cors".
-        request->set_response_tainting(Infrastructure::Request::ResponseTainting::CORS);
-
-        //     2. Return the result of running HTTP fetch given fetchParams.
-        return http_fetch(realm, *fetch_params);
+        return main_fetch_response(realm, *fetch_params, true);
     });
 
     if (recursive == Recursive::Yes) {
@@ -1592,6 +1836,15 @@ void finish_fetch_response_handover(GC::Ref<Infrastructure::FetchController> con
     }
 }
 
+static NonnullRefPtr<Infrastructure::Response> extension_resource_response(ReadonlyBytes data, StringView mime_type)
+{
+    auto response = Infrastructure::Response::create();
+    response->set_status_message("OK"sv);
+    response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Type"sv, mime_type));
+    response->set_body(Infrastructure::byte_sequence_as_response_body(data));
+    return response;
+}
+
 // https://fetch.spec.whatwg.org/#concept-scheme-fetch
 GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchParams const& fetch_params)
 {
@@ -1865,6 +2118,57 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
             return error;
 
         return nonstandard_resource_loader_file_or_http_network_fetch(realm, fetch_params);
+    }
+    // AD-HOC: "chrome-extension"
+    else if (request->current_url().scheme() == "chrome-extension"sv) {
+        auto& registry = Extensions::ExtensionRegistry::the();
+        auto sandbox_policy = registry.sandbox_policy_for(request->current_url());
+        auto with_sandbox_policy = [&](NonnullRefPtr<Infrastructure::Response> response) {
+            // https://developer.chrome.com/docs/extensions/reference/manifest/sandbox
+            if (sandbox_policy.has_value())
+                response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Security-Policy"sv, *sandbox_policy));
+            return response;
+        };
+
+        // A page can fetch the files an installed extension makes web accessible to it, as in Chrome.
+        auto const* origin = request->origin().get_pointer<URL::Origin>();
+        auto is_redirected_browser_navigation = !request->client_snapshot() && request->mode() == Infrastructure::Request::Mode::Navigate && request->url_list().size() > 1;
+        Optional<URL::Origin> war_requester;
+        if (origin && !origin->is_opaque())
+            war_requester = *origin;
+        else if (is_redirected_browser_navigation)
+            war_requester = request->url_list()[request->url_list().size() - 2].origin();
+        else if (origin)
+            war_requester = *origin;
+        if (auto resource = war_requester.has_value() ? registry.web_accessible_resource(request->current_url(), *war_requester) : OptionalNone {}; resource.has_value())
+            return PendingResponse::create(fetch_params, with_sandbox_policy(extension_resource_response(resource->data, resource->mime_type)));
+
+        // The extension's own pages can fetch any of its files, and the browser can navigate directly to them (not via
+        // a redirect from a public URL). So can its sandboxed pages, whose origin is opaque.
+        auto const& extension_origin = request->current_url().origin();
+        auto is_browser_navigation = !request->client_snapshot() && request->mode() == Infrastructure::Request::Mode::Navigate && request->url_list().size() == 1;
+        auto is_from_own_sandboxed_page = request->client_snapshot()
+            && request->client_snapshot()->creation_url.scheme() == "chrome-extension"sv
+            && request->client_snapshot()->creation_url.serialized_host() == request->current_url().serialized_host()
+            && registry.sandbox_policy_for(request->client_snapshot()->creation_url).has_value();
+        if (!is_browser_navigation && !is_from_own_sandboxed_page && !(origin && origin->is_same_origin(extension_origin)))
+            return PendingResponse::create(fetch_params, Infrastructure::Response::network_error("Request for a resource that is not web accessible"_string));
+        // NB: The browser process answers the main thread only, so workers get only web accessible resources.
+        if (!Bindings::window_from_global_object(realm.global_object()))
+            return PendingResponse::create(fetch_params, Infrastructure::Response::network_error("Extension resources can only be loaded by windows"_string));
+
+        auto pending_response = PendingResponse::create(fetch_params);
+        registry.load_resource(request->current_url(), GC::create_function(realm.heap(), GC::captures(pending_response, move(sandbox_policy)), [](auto& pending_response, auto& sandbox_policy, Optional<ReadonlyBytes> data, StringView mime_type) {
+            if (!data.has_value()) {
+                pending_response->resolve(Infrastructure::Response::network_error("Extension resource not found"_string));
+                return;
+            }
+            auto response = extension_resource_response(*data, mime_type);
+            if (sandbox_policy.has_value())
+                response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Security-Policy"sv, *sandbox_policy));
+            pending_response->resolve(response);
+        }));
+        return pending_response;
     }
     // -> HTTP(S) scheme
     else if (Infrastructure::is_http_or_https_scheme(request->current_url().scheme())) {

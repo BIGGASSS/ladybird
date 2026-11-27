@@ -108,7 +108,7 @@ bool style_engine_begin_style_trace(DocumentHost const*, BegunRead const*);
 bool style_engine_end_style_trace(DocumentHost const*, BegunRead const*);
 u32 style_engine_style_trace_size(DocumentHost const*, BegunRead const*, StyleNodeID root);
 u64 style_engine_style_trace_entry(DocumentHost const*, BegunRead const*, StyleNodeID root, u32 index);
-u32 style_engine_layer_index(DocumentHost const*, BegunRead const*, TreeScopeID tree_scope, u32 layer);
+u32 style_engine_layer_index(DocumentHost const*, BegunRead const*, TreeScopeID tree_scope, u8 origin, u32 layer);
 u64 style_engine_ensure_random_base_value(DocumentHost const*, BegunRead const*, StyleNodeID node, ReadonlySpan<u16> name, bool element_shared);
 }
 

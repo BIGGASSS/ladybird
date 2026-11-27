@@ -71,6 +71,11 @@ private:
 WEB_API WrapperWorld& host_defined_wrapper_world(JS::Realm&);
 WEB_API WrapperWorld const& host_defined_wrapper_world(JS::Realm const&);
 
+// Whether an object of one realm may be given to code of the other, which it would let into the realm of the object:
+// unless they are in the same one, not if either is an extension's isolated world.
+WEB_API bool realms_can_share_objects(JS::Realm const&, JS::Realm const&);
+WEB_API bool is_extension_world_realm(JS::Realm const&);
+
 template<typename T>
 class WrapperWorldWeakValueCache {
 public:

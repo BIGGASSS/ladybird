@@ -245,12 +245,20 @@ public:
     bool discarding_ends_a_process() const;
     void set_pinned(bool pinned);
     void set_current_tab_of_window(bool current_tab_of_window);
+    bool is_current_tab_of_window() const { return m_current_tab_of_window; }
+    // Of the tabs that are current in their window, the one that most recently became so is current in the most recently
+    // used window.
+    u64 became_current_tab_of_window_order() const { return m_became_current_tab_of_window_order; }
+    // Whether the view is a tab of a browser window, rather than, say, a popup that shows a page for the browser.
+    virtual bool is_tab() const { return true; }
     // When the user last stopped seeing the view, if they don't see it now.
     Optional<MonotonicTime> hidden_since() const { return m_hidden_since; }
     bool discard_requested() const { return m_discard_requested; }
     void request_discard(DiscardReason);
     // The UI may keep a tab that the Hub asked it to discard, such as one with an unfinished edit of its address.
     void did_decline_discard();
+    // The UI may keep a tab that the Hub asked it to close, such as when active downloads would be interrupted.
+    void did_decline_close();
     void did_save_session_history_entry_states(Badge<WebContentPage>, WebContentPage&);
 
     // Whether the view shows its frames from CPU memory for now, so that the Compositor shares them there rather than
@@ -500,6 +508,7 @@ public:
     void detach_debugger();
     void interrupt_debugger();
     void resume_debugger(DebuggerResumeMode);
+    void resume_debugger_if_paused();
     void did_pause_debugger(Badge<WebContentPage>);
     void did_resume_debugger(Badge<WebContentPage>);
     void update_debugger_blackboxing(Utf16String, Vector<DebuggerBlackboxRange>, DebuggerBlackboxingOperation);
@@ -1007,6 +1016,7 @@ protected:
     };
     Optional<BrowserUILoad> m_browser_ui_load;
     URL::URL m_displayed_url { URL::about_blank() };
+    URL::URL m_last_committed_url { URL::about_blank() };
     bool m_text_fragment_indication_is_visible { false };
     Utf16String m_title;
 
@@ -1384,6 +1394,7 @@ protected:
     // NB: The current tab of a minimized window is hidden, but the user sees it again as soon as they bring the window
     //     back.
     bool m_current_tab_of_window { false };
+    u64 m_became_current_tab_of_window_order { 0 };
     // The UI was asked to discard the view, so it isn't asked again until the user has seen it.
     bool m_discard_requested { false };
     DiscardReason m_discard_reason { DiscardReason::Inactivity };

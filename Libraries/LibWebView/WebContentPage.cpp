@@ -3642,6 +3642,30 @@ Messages::WebContentClient::DidRequestStorageUsageResponse WebContentPage::did_r
     return client().session().storage_jar->usage(*canonical_key);
 }
 
+void WebContentPage::extension_api_call(Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String extension_id, String method, String arguments)
+{
+    if (auto* host = Application::the().extension_host())
+        host->handle_api_call(client(), id(), document_id, context_id, call_id, extension_id, method, arguments);
+    else
+        client().async_extension_api_call_completed(call_id, context_id, false, "\"Extensions are not available\""_string);
+}
+
+void WebContentPage::evaluate_extension_network_request(u64 request_id, URL::URL url, String method, String resource_type, Optional<URL::Origin> initiator, Optional<String> initiator_extension_id, Vector<URL::URL> frame_urls, Vector<Optional<URL::Origin>> frame_initiators, Vector<bool> frame_is_top_level)
+{
+    auto type = DeclarativeNetRequest::resource_type_from_name(resource_type);
+    auto* host = Application::the().extension_host();
+    if (!host || !type.has_value()) {
+        client().async_did_evaluate_extension_network_request(request_id, to_underlying(Web::Extensions::NetworkRequestOutcome::Allow), {});
+        return;
+    }
+    ExtensionNetworkRules::FrameContext frame_context;
+    auto frame_count = min(frame_urls.size(), min(frame_initiators.size(), frame_is_top_level.size()));
+    for (size_t i = 0; i < frame_count; ++i)
+        frame_context.ancestors.append({ move(frame_urls[i]), move(frame_initiators[i]), frame_is_top_level[i] });
+    DeclarativeNetRequest::Request request { move(url), method.to_ascii_lowercase(), *type, move(initiator), move(initiator_extension_id) };
+    host->evaluate_network_request(client(), request_id, request, frame_context);
+}
+
 void WebContentPage::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)
 {
     if (auto settings = hosted_environment(message.environment_id); settings.has_value())

@@ -137,4 +137,16 @@ WrapperWorld const& host_defined_wrapper_world(JS::Realm const& realm)
     return *host_defined_of(realm).wrapper_world;
 }
 
+bool is_extension_world_realm(JS::Realm const& realm)
+{
+    return realm.host_defined() && host_defined_wrapper_world(realm).type() == WrapperWorld::Type::Extension;
+}
+
+bool realms_can_share_objects(JS::Realm const& first, JS::Realm const& second)
+{
+    if (!is_extension_world_realm(first) && !is_extension_world_realm(second))
+        return true;
+    return &host_defined_wrapper_world(first) == &host_defined_wrapper_world(second);
+}
+
 }

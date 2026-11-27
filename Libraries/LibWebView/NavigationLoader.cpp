@@ -707,6 +707,7 @@ void NavigationLoader::set_document(CanonicalDocument const& document, Canonical
 {
     VERIFY(m_result.has_value());
     m_result->document_id = document.id();
+    m_result->extension_generation = document.extension_generation();
     if (auto top_level_origin = document.top_level_origin(); top_level_origin.has_value())
         m_top_level_site = URL::Site::serialize_for_partitioning(*top_level_origin);
 

@@ -5,6 +5,7 @@
  */
 
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -348,6 +349,8 @@ GC::Ref<GC::Function<void(HistoryNavigationPopulation)>> HistoryExecutor::popula
         output->navigation_same_site_status = result.navigation_same_site_status;
         output->inline_content_origin = move(result.inline_content_origin);
         output->document_id = result.document_id;
+        output->extension_generation = result.extension_generation;
+        output->blocked_by_extension = result.blocked_by_extension;
         if (result.replacement_document_state.has_value()) {
             output->replacement_document_state = DocumentState::create(result.replacement_document_state->id);
             apply_session_history_document_state_descriptor_from_ui_process(*output->replacement_document_state, *result.replacement_document_state);
@@ -617,7 +620,7 @@ void HistoryExecutor::clear_ui_changing_navigable_ongoing_traversal(CrossProcess
 
 // Steps 14.4 to 14.9 and step 14.12 of apply the history step, for the changing navigable continuation the UI process
 // dequeued.
-Optional<HistoryExecutor::DequeuedChangingNavigableContinuation> HistoryExecutor::dequeue_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex history_object_length_and_index, Vector<SessionHistoryEntryDescriptor> entry_descriptors_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, GC::Ref<OnChangingNavigableContinuationApplied> on_complete)
+Optional<HistoryExecutor::DequeuedChangingNavigableContinuation> HistoryExecutor::dequeue_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex history_object_length_and_index, Vector<SessionHistoryEntryDescriptor> entry_descriptors_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation, GC::Ref<OnChangingNavigableContinuationApplied> on_complete)
 {
     auto* operation = find_history_operation(operation_id);
     VERIFY(operation);
@@ -668,7 +671,7 @@ Optional<HistoryExecutor::DequeuedChangingNavigableContinuation> HistoryExecutor
 
     // 12. In both cases, let afterPotentialUnloads be the following steps:
     bool const update_only = continuation->update_only;
-    auto after_potential_unload = GC::create_function(heap(), GC::captures(navigable, update_only, target_entry, continuation, population_output, clear_classic_history_api_state, clear_navigable_target_name, GC::Ref { *displayed_document }, script_history_length, script_history_index, move(entries_for_navigation_api), continuation->navigation_type, on_complete), [](auto& navigable, auto& update_only, auto& target_entry, auto& continuation, auto& population_output, auto& clear_classic_history_api_state, auto& clear_navigable_target_name, auto& displayed_document, auto& script_history_length, auto& script_history_index, auto& entries_for_navigation_api, auto& navigation_type, auto& on_complete) {
+    auto after_potential_unload = GC::create_function(heap(), GC::captures(navigable, update_only, target_entry, continuation, population_output, clear_classic_history_api_state, clear_navigable_target_name, extension_generation, GC::Ref { *displayed_document }, script_history_length, script_history_index, move(entries_for_navigation_api), continuation->navigation_type, on_complete), [](auto& navigable, auto& update_only, auto& target_entry, auto& continuation, auto& population_output, auto& clear_classic_history_api_state, auto& clear_navigable_target_name, auto& extension_generation, auto& displayed_document, auto& script_history_length, auto& script_history_index, auto& entries_for_navigation_api, auto& navigation_type, auto& on_complete) {
         // AD-HOC: A provisional navigable stands in for a navigable another process hosts, which is destroyed as soon
         //         as its container is removed, e.g. while displayedDocument unloads. The provisional navigable is only
         //         discarded once that navigable's subtree has unloaded, and has no container to take over until then.
@@ -708,6 +711,8 @@ Optional<HistoryExecutor::DequeuedChangingNavigableContinuation> HistoryExecutor
         //         about:blank stays the about:blank's while it unloads, and is handed over just before activation.
         if (continuation->target_document_to_create && !update_only) {
             continuation->target_document = continuation->target_document_to_create->create_document();
+            if (extension_generation.has_value() && continuation->target_document)
+                Extensions::ExtensionRegistry::the().snapshot_extensions_for_document(*continuation->target_document, extension_generation);
             if (continuation->unload_of_replaced_document.has_value())
                 continuation->target_document->take_unload_timing_of_replaced_document(*continuation->unload_of_replaced_document);
         }
@@ -775,9 +780,9 @@ Optional<HistoryExecutor::DequeuedChangingNavigableContinuation> HistoryExecutor
 }
 
 // 10. If changingNavigableContinuation's update-only is true, or targetEntry's document is displayedDocument:
-void HistoryExecutor::apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex history_object_length_and_index, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, GC::Ref<OnChangingNavigableContinuationApplied> on_complete)
+void HistoryExecutor::apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex history_object_length_and_index, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation, GC::Ref<OnChangingNavigableContinuationApplied> on_complete)
 {
-    auto dequeued = dequeue_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry_identity, history_object_length_and_index, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, on_complete);
+    auto dequeued = dequeue_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry_identity, history_object_length_and_index, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, extension_generation, on_complete);
     if (!dequeued.has_value()) {
         on_complete->function()({}, {});
         return;
@@ -797,9 +802,9 @@ void HistoryExecutor::apply_ui_changing_navigable_continuation(CrossProcessId op
 //     2. Deactivate displayedDocument, given userInvolvement, targetEntry, navigationType, and afterPotentialUnloads.
 // NB: The UI process has unloaded every descendant subtree of displayedDocument. This is the task that unload a document
 //     and its descendants queues last, for displayedDocument.
-void HistoryExecutor::unload_displayed_document_and_apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex history_object_length_and_index, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, GC::Ref<OnChangingNavigableContinuationApplied> on_complete)
+void HistoryExecutor::unload_displayed_document_and_apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex history_object_length_and_index, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation, GC::Ref<OnChangingNavigableContinuationApplied> on_complete)
 {
-    auto dequeued = dequeue_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry_identity, history_object_length_and_index, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, on_complete);
+    auto dequeued = dequeue_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry_identity, history_object_length_and_index, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, extension_generation, on_complete);
     if (!dequeued.has_value()) {
         on_complete->function()({}, {});
         return;

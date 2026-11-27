@@ -308,8 +308,8 @@ void Tab::initialize(Optional<u64> hub_view_id)
             if (auto index_to_activate = m_window->tab_index(m_tab_to_activate_on_close); index_to_activate >= 0)
                 m_window->activate_tab(index_to_activate);
         }
-        if (!m_window_is_closing)
-            m_window->definitely_close_tab(index);
+        if (!m_window_is_closing && !m_window->definitely_close_tab(index))
+            view().decline_close();
     };
 
     view().on_request_web_compat_report_review = [this](WebCompatReportCapture capture) {

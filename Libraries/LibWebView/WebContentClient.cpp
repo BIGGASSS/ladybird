@@ -234,6 +234,10 @@ WebContentClient::~WebContentClient()
     StorageAreaRegistry::the().remove_listener(*this);
     WorkerAgentManager::the().remove_web_content_owner(*this);
     GamepadManager::the().client_disconnected(*this);
+    if (Application::is_initialized()) {
+        if (auto* host = Application::the().extension_host())
+            host->on_client_disconnected(*this);
+    }
     clients().remove(this);
 }
 
@@ -682,6 +686,8 @@ void WebContentClient::did_lose_process()
 {
     // Removing pages can release the last reference to this client.
     RefPtr self = this;
+    if (auto* host = Application::the().extension_host())
+        host->on_client_disconnected(*this);
     // A close request the client made before the loss; one its lost pages' release makes now is not one.
     auto requested_close = m_requested_close;
 
@@ -742,6 +748,8 @@ void WebContentClient::did_lose_process()
                 view->handle_web_content_process_crash(crash_reason);
             if (view->on_web_content_crashed)
                 view->on_web_content_crashed(crash_reason);
+            if (auto* host = Application::the().extension_host())
+                host->on_tab_crashed(view_id);
         });
     }
 }
@@ -1003,6 +1011,70 @@ void WebContentClient::did_close_browsing_context(Web::PageId page_id)
     page->set_detached_close_pending(false);
     release_unneeded_representing_pages();
     close_server_if_unused();
+}
+
+void WebContentClient::request_extension_resource(u64 request_id, String extension_id, String path)
+{
+    Application::the().load_extension_resource({}, *this, request_id, extension_id, path);
+}
+
+void WebContentClient::did_handle_extension_message(u64 delivery_id, u8 status, String response)
+{
+    if (auto* host = Application::the().extension_host())
+        host->did_handle_message(*this, delivery_id, status, response);
+}
+
+void WebContentClient::connect_extension_port(Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id, String extension_id, String name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id)
+{
+    if (auto* host = Application::the().extension_host())
+        host->connect_port(*this, page_id, document_id, context_id, local_port_id, extension_id, name, target_tab_id, target_frame_id, move(target_document_id));
+}
+
+void WebContentClient::accept_extension_port(u64 channel_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id)
+{
+    if (auto* host = Application::the().extension_host())
+        host->accept_port(*this, channel_id, document_id, context_id, local_port_id);
+}
+
+void WebContentClient::finish_open_extension_port(u64 channel_id)
+{
+    if (auto* host = Application::the().extension_host())
+        host->finish_open_port(*this, channel_id);
+}
+
+void WebContentClient::post_extension_port_message(u64 context_id, u64 local_port_id, String message)
+{
+    if (auto* host = Application::the().extension_host())
+        host->post_port_message(*this, context_id, local_port_id, message);
+}
+
+void WebContentClient::disconnect_extension_port(u64 context_id, u64 local_port_id)
+{
+    if (auto* host = Application::the().extension_host())
+        host->disconnect_port(*this, context_id, local_port_id);
+}
+
+void WebContentClient::disconnect_extension_context_ports(u64 context_id)
+{
+    if (auto* host = Application::the().extension_host())
+        host->disconnect_context_ports(*this, context_id);
+}
+
+void WebContentClient::did_complete_extension_script_injection(u64 injection_id, u32 target_index, bool succeeded, String result_json, String error)
+{
+    if (auto* host = Application::the().extension_host())
+        host->did_complete_script_injection(*this, injection_id, target_index, succeeded, result_json, error);
+}
+
+void WebContentClient::did_complete_extension_css_injection(u64 injection_id, u32 target_index, bool succeeded, String error)
+{
+    if (auto* host = Application::the().extension_host())
+        host->did_complete_css_injection(*this, injection_id, target_index, succeeded, error);
+}
+
+void WebContentClient::did_change_extension_storage(String extension_id, String area, String changes)
+{
+    Application::the().extension_storage_did_change({}, *this, extension_id, area, changes);
 }
 
 void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)

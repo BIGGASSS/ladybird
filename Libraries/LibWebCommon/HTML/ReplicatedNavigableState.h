@@ -89,6 +89,7 @@ struct HostedNavigableState {
     bool is_closing { false };
     ReplicatedContainerState container;
     bool delays_the_load_event_of_its_container { false };
+    bool is_collapsed_by_extension { false };
     Optional<Web::CompositorContextId> compositor_context_id;
 };
 
@@ -117,6 +118,7 @@ struct ReplicatedNavigableState {
     ReplicatedContainerState container;
 
     bool delays_the_load_event_of_its_container { false };
+    bool is_collapsed_by_extension { false };
     bool has_session_history_entry_and_ready_for_navigation { false };
 
     Optional<Web::CompositorContextId> compositor_context_id;

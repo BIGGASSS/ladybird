@@ -73,9 +73,11 @@ set(TEST_SOURCES
     TestBackgroundNetworking.cpp
     TestCanonicalBrowsingContextGroup.cpp
     TestCookieJar.cpp
+    TestDeclarativeNetRequest.cpp
     TestCrashReportDiagnostics.cpp
     TestDownloadSegmentation.cpp
     TestDownloadStore.cpp
+    TestExtensionPackage.cpp
     TestExternalURLHandler.cpp
     TestFaviconStore.cpp
     TestForceDarkSettings.cpp
@@ -160,6 +162,8 @@ if (NOT WIN32)
         TestCompositorStartup.cpp
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
+        TestExtensionPorts.cpp
+        TestExtensionScripting.cpp
         TestFavicon.cpp
         TestFileDownloader.cpp
         TestFocusWithoutSystemFocus.cpp

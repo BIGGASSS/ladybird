@@ -83,6 +83,8 @@ private:
     virtual void create_platform_arguments(Core::ArgsParser&) override;
     virtual Optional<pid_t> ui_process_id() const override;
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
+    virtual void extensions_did_change() override;
+    virtual void extension_popup_did_request_size(u64 popup_view_id, Gfx::IntSize size) override;
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab, WebView::ViewImplementation const* related_view = nullptr) const override;
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab, WebView::ViewImplementation const* source_view = nullptr) const override;
     virtual void activate_or_open_tab_with_url(URL::URL const&) const override;

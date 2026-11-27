@@ -69,6 +69,7 @@ public:
 
     Web::HTML::CrossProcessId id() const { return m_id; }
     void set_id(Web::HTML::CrossProcessId id) { m_id = id; }
+    u64 extension_frame_id() const { return is_top_level_traversable() ? 0 : m_extension_frame_id; }
 
     // The page whose document tree contains this frame: the page hosting its container document. When the frame is
     // local, this page also hosts the frame's active document.
@@ -221,7 +222,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-active-history-entry
     RefPtr<CanonicalSessionHistoryEntry> const& active_session_history_entry() const { return m_active_session_history_entry; }
-    void set_active_session_history_entry(RefPtr<CanonicalSessionHistoryEntry> entry) { m_active_session_history_entry = move(entry); }
+    void set_active_session_history_entry(RefPtr<CanonicalSessionHistoryEntry> entry);
 
     bool current_session_history_entry_is(CanonicalSessionHistoryEntry const&) const;
     bool active_document_is(CanonicalSessionHistoryEntry const&) const;
@@ -269,6 +270,7 @@ private:
     void send_completely_finished_loading_to_container() const;
 
     Web::HTML::CrossProcessId m_id;
+    u64 m_extension_frame_id { 0 };
     CanonicalNavigable* m_parent { nullptr };
     RefPtr<CanonicalDocument> m_container_document;
     Vector<NonnullOwnPtr<CanonicalNavigable>> m_children;
@@ -278,9 +280,13 @@ private:
     RefPtr<CanonicalDocumentState> m_document_state_populated_by_history_job;
     RefPtr<CanonicalSessionHistoryEntry> m_current_session_history_entry;
     RefPtr<CanonicalSessionHistoryEntry> m_active_session_history_entry;
+    enum class NavigationEndReason : u8 {
+        Finished,
+        Canceled,
+    };
     void set_the_ongoing_navigation(OngoingNavigation);
     void notify_view_of_ongoing_navigation() const;
-    void end_navigation(CanonicalNavigation&);
+    void end_navigation(CanonicalNavigation&, NavigationEndReason);
     OngoingNavigation m_ongoing_navigation;
     Vector<NonnullRefPtr<CanonicalNavigation>> m_navigations;
 

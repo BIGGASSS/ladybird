@@ -2044,6 +2044,14 @@ void Application::crash_reports_changed()
     update_feedback_buttons();
 }
 
+void Application::update_extension_actions()
+{
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget))
+            window->toolbar().update_extension_actions();
+    }
+}
+
 void Application::update_feedback_buttons()
 {
     for (auto* widget : QApplication::topLevelWidgets()) {

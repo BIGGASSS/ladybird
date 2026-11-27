@@ -7,6 +7,7 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/HTMLFrameSetElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
@@ -22,6 +23,15 @@ HTMLHtmlElement::HTMLHtmlElement(DOM::Document& document, DOM::QualifiedName qua
 }
 
 HTMLHtmlElement::~HTMLHtmlElement() = default;
+
+// AD-HOC: Content scripts that run at document_start do so once the document element exists, before anything else of
+//         the document is parsed, as in Chrome.
+void HTMLHtmlElement::post_connection()
+{
+    Base::post_connection();
+    if (document().document_element() == this)
+        Extensions::ExtensionRegistry::the().run_content_scripts(document(), Extensions::RunAt::DocumentStart);
+}
 
 void HTMLHtmlElement::children_changed(ChildrenChangedMetadata const& metadata)
 {

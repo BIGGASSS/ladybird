@@ -72,8 +72,8 @@ public:
     void populate_ui_history_entry_document(CrossProcessId operation_id, SessionHistoryEntryDescriptor target_entry_descriptor, Optional<Bindings::NavigationType>, bool ongoing_navigation_is_traversal, HistoryNavigationPopulation, GC::Ref<OnChangingNavigableHistoryStepJobComplete>);
     bool create_ui_history_navigation_params(CrossProcessId operation_id, NavigationPopulationRequest, bool allow_POST);
     bool resume_history_navigation_population(CrossProcessId operation_id, HistoryNavigationPopulation&&);
-    void apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, GC::Ref<OnChangingNavigableContinuationApplied>);
-    void unload_displayed_document_and_apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, GC::Ref<OnChangingNavigableContinuationApplied>);
+    void apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation, GC::Ref<OnChangingNavigableContinuationApplied>);
+    void unload_displayed_document_and_apply_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation, GC::Ref<OnChangingNavigableContinuationApplied>);
     void clear_ui_changing_navigable_ongoing_traversal(CrossProcessId operation_id, CrossProcessId navigable_id);
 
 private:
@@ -88,7 +88,7 @@ private:
         GC::Ref<ChangingNavigableContinuationState> continuation;
         GC::Ref<GC::Function<void()>> after_potential_unloads;
     };
-    Optional<DequeuedChangingNavigableContinuation> dequeue_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, GC::Ref<OnChangingNavigableContinuationApplied>);
+    Optional<DequeuedChangingNavigableContinuation> dequeue_ui_changing_navigable_continuation(CrossProcessId operation_id, CrossProcessId navigable_id, SessionHistoryEntryIdentity target_entry_identity, HistoryObjectLengthAndIndex, Vector<SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation, GC::Ref<OnChangingNavigableContinuationApplied>);
 
     using AfterDocumentPopulated = GC::Function<void(GC::Ptr<PopulateSessionHistoryEntryDocumentOutput>)>;
     GC::Ref<AfterDocumentPopulated> after_document_populated_steps(CrossProcessId operation_id, GC::Ref<ChangingNavigableContinuationState>, GC::Ref<OnChangingNavigableHistoryStepJobComplete>);

@@ -205,6 +205,8 @@ void SharedResourceRequest::fetch_resource(NonnullRefPtr<Fetch::Infrastructure::
 
         // Check for failed fetch response
         if (!response->body()) {
+            if (response->should_collapse_initiator())
+                self->m_should_collapse_initiator = true;
             self->handle_failed_fetch();
             return;
         }

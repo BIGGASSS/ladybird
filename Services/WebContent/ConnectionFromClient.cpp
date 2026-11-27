@@ -58,6 +58,7 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/Gamepad/GamepadRegistry.h>
@@ -764,7 +765,7 @@ void ConnectionFromClient::clear_ongoing_history_traversal(Web::PageId page_id, 
         page->page().history_executor().clear_ui_changing_navigable_ongoing_traversal(operation_id, navigable_id);
 }
 
-void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name)
+void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
@@ -772,14 +773,14 @@ void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId pag
         return;
     }
 
-    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, extension_generation, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
         if (!connection)
             return;
         connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
     }));
 }
 
-void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name)
+void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name, Optional<u64> extension_generation)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
@@ -787,7 +788,7 @@ void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigabl
         return;
     }
 
-    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, extension_generation, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
         if (!connection)
             return;
         connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
@@ -3475,6 +3476,148 @@ void ConnectionFromClient::set_content_blockers(Core::AnonymousBuffer patterns_b
 
     if (had_cosmetic_rules || blocker.has_cosmetic_rules())
         m_page_host->invalidate_user_style();
+}
+
+void ConnectionFromClient::set_extensions(Core::AnonymousBuffer extensions_buffer, u64 generation, u64 min_retained_generation)
+{
+    if (auto result = extensions_buffer.validate_backing_size(); result.is_error()) {
+        dbgln("Failed to set extensions: {}", result.error());
+        return;
+    }
+
+    auto& registry = Web::Extensions::ExtensionRegistry::the();
+    if (auto result = registry.set_extensions_from_bytes(extensions_buffer.bytes(), generation, min_retained_generation); result.is_error()) {
+        dbgln("Failed to set extensions: {}", result.error());
+        return;
+    }
+    if (registry.has_extensions())
+        URL::set_chrome_extension_urls_have_tuple_origins();
+
+    registry.on_storage_change = [this](String const& extension_id, String const& area, String const& changes) {
+        async_did_change_extension_storage(extension_id, area, changes);
+    };
+    registry.on_load_resource = [this](u64 request_id, String const& extension_id, String const& path) {
+        async_request_extension_resource(request_id, extension_id, path);
+    };
+    registry.on_api_call = [this](Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String const& extension_id, String const& method, String const& arguments) {
+        async_extension_api_call(page_id, document_id, context_id, call_id, extension_id, method, arguments);
+    };
+    registry.on_evaluate_network_request = [this](Web::PageId page_id, u64 request_id, Web::Extensions::ExtensionRegistry::NetworkRequest const& request) {
+        Vector<URL::URL> frame_urls;
+        Vector<Optional<URL::Origin>> frame_initiators;
+        Vector<bool> frame_is_top_level;
+        for (auto const& frame : request.ancestor_frames) {
+            frame_urls.append(frame.url);
+            frame_initiators.append(frame.initiator);
+            frame_is_top_level.append(frame.is_top_level);
+        }
+        async_evaluate_extension_network_request(page_id, request_id, request.url, request.method, MUST(String::from_utf8(request.resource_type)), request.initiator, request.initiator_extension_id, move(frame_urls), move(frame_initiators), move(frame_is_top_level));
+    };
+    registry.on_message_response = [this](u64 delivery_id, bool, String const& response) {
+        async_did_handle_extension_message(delivery_id, to_underlying(Web::Extensions::MessageDeliveryStatus::RespondedLater), response);
+    };
+    registry.on_connect_port = [this](Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id, String const& extension_id, String const& name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id) {
+        async_connect_extension_port(page_id, document_id, context_id, local_port_id, extension_id, name, target_tab_id, target_frame_id, move(target_document_id));
+    };
+    registry.on_accept_port = [this](u64 channel_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id) {
+        async_accept_extension_port(channel_id, document_id, context_id, local_port_id);
+    };
+    registry.on_finish_open_port = [this](u64 channel_id) {
+        async_finish_open_extension_port(channel_id);
+    };
+    registry.on_post_port_message = [this](u64 context_id, u64 local_port_id, String const& message) {
+        async_post_extension_port_message(context_id, local_port_id, message);
+    };
+    registry.on_disconnect_port = [this](u64 context_id, u64 local_port_id) {
+        async_disconnect_extension_port(context_id, local_port_id);
+    };
+    registry.on_disconnect_context_ports = [this](u64 context_id) {
+        async_disconnect_extension_context_ports(context_id);
+    };
+    registry.on_script_injection_complete = [this](u64 injection_id, u32 target_index, bool succeeded, String const& result_json, String const& error) {
+        async_did_complete_extension_script_injection(injection_id, target_index, succeeded, result_json, error);
+    };
+    registry.on_css_injection_complete = [this](u64 injection_id, u32 target_index, bool succeeded, String const& error) {
+        async_did_complete_extension_css_injection(injection_id, target_index, succeeded, error);
+    };
+
+    // The CSS of content scripts is part of each document's user style sheet.
+    m_page_host->invalidate_user_style();
+}
+
+void ConnectionFromClient::set_extension_storage(String storage)
+{
+    auto json = JsonValue::from_string(storage);
+    if (json.is_error() || !json.value().is_object()) {
+        dbgln("Failed to set extension storage");
+        return;
+    }
+    Web::Extensions::ExtensionRegistry::the().set_storage(json.release_value().as_object());
+}
+
+void ConnectionFromClient::did_load_extension_resource(u64 request_id, bool found, Core::AnonymousBuffer data, String mime_type)
+{
+    if (found && data.validate_backing_size().is_error())
+        found = false;
+    Web::Extensions::ExtensionRegistry::the().did_load_resource(request_id, found ? Optional<ReadonlyBytes> { data.bytes() } : OptionalNone {}, mime_type);
+}
+
+void ConnectionFromClient::did_evaluate_extension_network_request(u64 request_id, u8 outcome, Optional<URL::URL> redirect_url)
+{
+    if (outcome > to_underlying(Web::Extensions::NetworkRequestOutcome::UpgradeScheme))
+        outcome = to_underlying(Web::Extensions::NetworkRequestOutcome::Allow);
+    Web::Extensions::ExtensionRegistry::the().did_evaluate_network_request(request_id, static_cast<Web::Extensions::NetworkRequestOutcome>(outcome), move(redirect_url));
+}
+
+void ConnectionFromClient::extension_api_call_completed(u64 call_id, u64 context_id, bool succeeded, String result)
+{
+    Web::Extensions::ExtensionRegistry::the().did_complete_call(call_id, context_id, succeeded, result);
+}
+
+void ConnectionFromClient::deliver_extension_event(String extension_id, String name, String arguments)
+{
+    Web::Extensions::ExtensionRegistry::the().deliver_event(extension_id, name, arguments);
+}
+
+void ConnectionFromClient::deliver_extension_message(u64 delivery_id, String extension_id, Optional<Web::PageId> content_scripts_of_page, bool only_top_level_frame, u64 excluded_context_id, String message, String sender)
+{
+    auto result = Web::Extensions::ExtensionRegistry::the().deliver_message(delivery_id, extension_id, content_scripts_of_page, only_top_level_frame, excluded_context_id, message, sender);
+    async_did_handle_extension_message(delivery_id, to_underlying(result.status), result.response);
+}
+
+void ConnectionFromClient::open_extension_port(u64 channel_id, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool target_extension_page, u64 excluded_context_id, String name, String sender)
+{
+    Web::Extensions::ExtensionRegistry::the().open_port(channel_id, extension_id, page_id, document_id, target_extension_page, excluded_context_id, name, sender);
+}
+
+void ConnectionFromClient::deliver_extension_port_message(u64 context_id, u64 local_port_id, String message)
+{
+    Web::Extensions::ExtensionRegistry::the().deliver_port_message(context_id, local_port_id, message);
+}
+
+void ConnectionFromClient::disconnect_extension_port_endpoint(u64 context_id, u64 local_port_id, String error, bool notify)
+{
+    Web::Extensions::ExtensionRegistry::the().disconnect_port_endpoint(context_id, local_port_id, error, notify);
+}
+
+void ConnectionFromClient::execute_extension_script(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, bool main_world, bool inject_immediately, Vector<String> file_paths, Vector<String> file_sources, Optional<String> func_source, Optional<String> args_json)
+{
+    Web::Extensions::ExtensionRegistry::the().execute_script(injection_id, target_index, extension_id, page_id, document_id, main_world, inject_immediately, file_paths, file_sources, func_source, args_json);
+}
+
+void ConnectionFromClient::insert_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys, Vector<String> css_sources, bool is_user_origin)
+{
+    Web::Extensions::ExtensionRegistry::the().insert_css(injection_id, target_index, extension_id, page_id, document_id, css_keys, css_sources, is_user_origin);
+}
+
+void ConnectionFromClient::remove_extension_css(u64 injection_id, u32 target_index, String extension_id, Web::PageId page_id, Web::HTML::CrossProcessId document_id, Vector<String> css_keys)
+{
+    Web::Extensions::ExtensionRegistry::the().remove_css(injection_id, target_index, extension_id, page_id, document_id, css_keys);
+}
+
+void ConnectionFromClient::extension_storage_changed(String extension_id, String area, String changes)
+{
+    Web::Extensions::ExtensionRegistry::the().apply_storage_changes(extension_id, area, changes, Web::Extensions::ExtensionRegistry::ChangeSource::OtherProcess);
 }
 
 void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host)

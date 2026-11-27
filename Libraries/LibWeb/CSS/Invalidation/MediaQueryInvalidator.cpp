@@ -52,7 +52,8 @@ void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
 
     for (auto origin : { CascadeOrigin::UserAgent, CascadeOrigin::User }) {
         document.style_scope().for_each_stylesheet(origin, [&](CSS::StyleSheetState& style_sheet) {
-            auto changed = style_sheet.evaluate_media_queries(document);
+            Parser::ValueParserFFI::NativeStyleSheetMediaEvaluation result {};
+            auto changed = style_sheet.evaluate_media_queries(document, result);
             record_stylesheet_rule_conditions(style_sheet, document);
 
             for (auto const& entry : document.style_computer().non_author_style_sheets()) {
@@ -65,6 +66,8 @@ void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
 
             if (!changed)
                 return;
+            if (origin == CascadeOrigin::User && result.layer_order_inputs_changed)
+                scopes_with_changed_layer_order.set(&document.style_scope());
             document.style_scope().invalidate_style_cache();
             document.style_scope().invalidate_counter_style_cache();
             style_sheet.reload_fonts_after_media_query_change();

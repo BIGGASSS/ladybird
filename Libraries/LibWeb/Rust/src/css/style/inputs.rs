@@ -1966,7 +1966,11 @@ impl StyleEngine {
         let moved = self
             .retained
             .write_projection_for_test(|writes| writes.set_element_adjustment_facts(node, facts));
-        if moved & super::bridge::element_adjustment_fact::RENDERED_IN_TOP_LAYER != 0 {
+        if moved
+            & (super::bridge::element_adjustment_fact::RENDERED_IN_TOP_LAYER
+                | super::bridge::element_adjustment_fact::HIDE_AUDIO_WITHOUT_CONTROLS)
+            != 0
+        {
             self.note_top_layer_move(node);
         }
     }

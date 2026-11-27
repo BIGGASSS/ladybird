@@ -130,6 +130,8 @@
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
+#include <LibWeb/Extensions/ExtensionContext.h>
 #include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -571,6 +573,8 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_about_base_url = navigation_params.about_base_url;
     document->set_url(*creation_url);
     document->set_id(navigation_params.document_id.has_value() ? *navigation_params.document_id : browsing_context->page().client().allocate_cross_process_id());
+    if (navigation_params.extension_generation.has_value())
+        Extensions::ExtensionRegistry::the().snapshot_extensions_for_document(*document, navigation_params.extension_generation);
 
     // AD-HOC: Record when the readiness becomes "loading" for PerformanceTiming's domLoading. The window is not yet
     //         associated with document, so relate the time to loadTimingInfo directly.
@@ -970,6 +974,7 @@ void Document::finalize()
         m_layout_node_arena->set_document({}, nullptr);
     }
     CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
+    Extensions::ExtensionRegistry::the().did_destroy_document(*this);
     Base::finalize();
     HTML::main_thread_event_loop().unregister_document({}, *this);
 }
@@ -1015,6 +1020,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
         import->visit_edges(visitor);
     visitor.visit(m_page);
     visitor.visit(m_window);
+    visitor.visit(m_extension_contexts);
+    visitor.visit(m_extension_idle_timer);
     visitor.visit(m_relevant_global_event_target);
     visitor.visit(m_style_sheets);
     visitor.visit(m_hovered_node);
@@ -1204,6 +1211,37 @@ void Document::invalidate_content_blocker_style_sheet()
     m_content_blocker_style_sheet.clear();
     m_content_blocker_style_sheet_checked_classes.clear();
     m_content_blocker_style_sheet_checked_ids.clear();
+}
+
+Utf16String const& Document::dynamic_extension_style_sheet() const
+{
+    static Utf16String const empty_style_sheet;
+    if (m_dynamic_extension_style_sheet.has_value())
+        return *m_dynamic_extension_style_sheet;
+    return empty_style_sheet;
+}
+
+void Document::snapshot_dynamic_extension_style_sheet()
+{
+    if (m_dynamic_extension_style_sheet.has_value() || !m_navigable)
+        return;
+    m_dynamic_extension_style_sheet = Extensions::ExtensionRegistry::the().style_sheet_for_document(*this, Extensions::ExtensionRegistry::ContentScriptKind::Dynamic);
+    if (!m_dynamic_extension_style_sheet->is_empty())
+        m_style_scope.invalidate_user_style_sheet();
+}
+
+GC::Ptr<Extensions::ExtensionContext> Document::extension_context(StringView extension_id) const
+{
+    for (auto const& context : m_extension_contexts) {
+        if (context->extension_id() == extension_id)
+            return context;
+    }
+    return nullptr;
+}
+
+void Document::add_extension_context(GC::Ref<Extensions::ExtensionContext> context)
+{
+    m_extension_contexts.append(context);
 }
 
 bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
@@ -4999,6 +5037,23 @@ void Document::update_readiness(HTML::DocumentReadyState readiness_value)
         }
     }
 
+    // AD-HOC: Content scripts that run at document_end do so once the DOM is complete. Those that run at document_idle
+    //         do so once the document has loaded, or a little after the DOM is complete if loading takes longer, as in
+    //         Chrome.
+    if (readiness_value == HTML::DocumentReadyState::Interactive) {
+        Extensions::ExtensionRegistry::the().run_content_scripts(*this, Extensions::RunAt::DocumentEnd);
+        if (Extensions::ExtensionRegistry::the().has_extensions_for_document(*this) && !m_extension_idle_timer) {
+            m_extension_idle_timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(200), GC::create_function(heap(), GC::captures(GC::Ref { *this }), [](auto& document) {
+                HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*document), GC::create_function(document->heap(), GC::captures(document), [](auto& document) {
+                    Extensions::ExtensionRegistry::the().run_content_scripts(*document, Extensions::RunAt::DocumentIdle);
+                }));
+            }));
+            m_extension_idle_timer->start();
+        }
+    } else if (readiness_value == HTML::DocumentReadyState::Complete) {
+        Extensions::ExtensionRegistry::the().run_content_scripts(*this, Extensions::RunAt::DocumentIdle);
+    }
+
     // 4. Fire an event named readystatechange at document.
     dispatch_event(Event::create(
         HTML::EventNames::readystatechange,
@@ -6431,6 +6486,12 @@ void Document::destroy()
     // 4. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
     run_unloading_cleanup_steps();
 
+    // AD-HOC: Extensions can no longer run code in this document, so let go of what they keep for it.
+    for (auto& context : m_extension_contexts)
+        context->detach();
+    m_extension_contexts.clear();
+    Extensions::ExtensionRegistry::the().did_destroy_document(*this);
+
     // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable().
     //         Tear the layout tree down now instead of holding it until finalization.
     tear_down_layout_tree();
@@ -6980,6 +7041,10 @@ void Document::did_stop_being_active_document_in_navigable()
 {
     page().active_media_session_tracker().document_became_inactive(*this);
 
+    for (auto& context : m_extension_contexts)
+        Extensions::ExtensionRegistry::the().disconnect_ports_of_context(context->id(), Extensions::ExtensionRegistry::NotifyLocalPorts::Yes);
+    Extensions::ExtensionRegistry::the().cancel_pending_script_injections_for_document(*this);
+
     stop_compositor_animation_timers();
     tear_down_layout_tree();
 
@@ -7487,6 +7552,9 @@ void Document::make_active()
     // 3. Set document's browsing context's WindowProxy's [[Window]] internal slot value to window.
     m_browsing_context->set_active_window(window);
 
+    Extensions::ExtensionRegistry::the().snapshot_extensions_for_document(*this);
+    snapshot_dynamic_extension_style_sheet();
+
     auto current_navigable = this->navigable();
     if (current_navigable && current_navigable->is_top_level_traversable()) {
         page().client().page_did_change_active_document_in_top_level_browsing_context(*this);
@@ -7517,6 +7585,23 @@ void Document::make_active()
         notify_each_document_observer([&](auto const& document_observer) {
             return document_observer.document_became_active();
         });
+    }
+
+    // AD-HOC: Content scripts run once the document is active. Those of document_start run as soon as the document
+    //         element exists, but a document that has none, or that got further before it became active, gets those
+    //         of the stages it has reached here.
+    if (Extensions::ExtensionRegistry::the().has_extensions_for_document(*this)) {
+        HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*this), GC::create_function(heap(), GC::captures(GC::Ref { *this }), [](auto& document) {
+            // NB: A document that is still loading gets its document element from the parser, which runs them then.
+            if (document->readiness() == HTML::DocumentReadyState::Loading && !document->document_element())
+                return;
+            auto stage = Extensions::RunAt::DocumentStart;
+            if (document->readiness() == HTML::DocumentReadyState::Interactive)
+                stage = Extensions::RunAt::DocumentEnd;
+            else if (document->readiness() == HTML::DocumentReadyState::Complete)
+                stage = Extensions::RunAt::DocumentIdle;
+            Extensions::ExtensionRegistry::the().run_content_scripts(*document, stage);
+        }));
     }
 }
 
@@ -10137,6 +10222,9 @@ GC::Ref<WebIDL::ObservableArray> Document::adopted_style_sheets() const
 
 void Document::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const
 {
+    // Injected AUTHOR stylesheets precede page stylesheets in Chrome's cascade order.
+    Extensions::ExtensionRegistry::the().for_each_inserted_author_style_sheet(*this, callback);
+
     for (auto& style_sheet : m_style_scope.style_sheets()) {
         if (!style_sheet->disabled())
             callback(*style_sheet);

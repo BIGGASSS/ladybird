@@ -1,0 +1,1186 @@
+// The chrome.* API of an extension. This evaluates to a function, which the engine calls in each context that the
+// extension's code runs in: the isolated world of its content scripts in a page ("content"), or one of its own pages
+// ("page"), such as its background page or popup. It returns the API object, and a function the engine calls to tell
+// the context of something: a change of storage, the result of a call it made, or a message.
+(function (native, extensionId, manifestJSON, messagesJSON, uiLanguage, contextKind, contextId) {
+    "use strict";
+
+    const manifest = JSON.parse(manifestJSON);
+    const messages = JSON.parse(messagesJSON);
+    const baseURL = "chrome-extension://" + extensionId + "/";
+    const isPage = contextKind === "page";
+    const noReceiverError = "Could not establish connection. Receiving end does not exist.";
+    const portClosedError = "The message port closed before a response was received.";
+
+    let lastError;
+
+    // The events of the API that the browser tells the extension's pages of, by name.
+    const browserEvents = {};
+
+    function reportError(error) {
+        queueMicrotask(() => {
+            throw error;
+        });
+    }
+
+    function createEvent() {
+        const listeners = [];
+        const event = {
+            addListener(listener) {
+                if (typeof listener === "function" && !listeners.includes(listener)) listeners.push(listener);
+            },
+            removeListener(listener) {
+                const index = listeners.indexOf(listener);
+                if (index !== -1) listeners.splice(index, 1);
+            },
+            hasListener(listener) {
+                return listeners.includes(listener);
+            },
+            hasListeners() {
+                return listeners.length > 0;
+            },
+        };
+        const dispatch = (...args) => {
+            for (const listener of listeners.slice()) {
+                try {
+                    listener(...args);
+                } catch (error) {
+                    reportError(error);
+                }
+            }
+        };
+        return [event, dispatch, listeners];
+    }
+
+    function toError(thrown) {
+        return thrown instanceof Error ? thrown : new Error(String(thrown));
+    }
+
+    // Calls the callback, if any, with runtime.lastError set to any error. Otherwise, gives back a promise.
+    function finish(callback, promise) {
+        if (typeof callback !== "function") return promise;
+        promise.then(
+            result => {
+                try {
+                    callback(result);
+                } catch (thrown) {
+                    reportError(thrown);
+                }
+            },
+            error => {
+                lastError = { message: toError(error).message };
+                try {
+                    callback();
+                } catch (thrown) {
+                    reportError(thrown);
+                } finally {
+                    lastError = undefined;
+                }
+            }
+        );
+        return undefined;
+    }
+
+    // Settles an API call whose result is known here.
+    function settle(callback, compute) {
+        let promise;
+        try {
+            promise = Promise.resolve(compute());
+        } catch (thrown) {
+            promise = Promise.reject(toError(thrown));
+        }
+        return finish(callback, promise);
+    }
+
+    function popCallback(args) {
+        return typeof args[args.length - 1] === "function" ? args.pop() : undefined;
+    }
+
+    // Calls into the browser process, for what only it knows of or can do.
+    const pendingCalls = new Map();
+    function callBrowser(method, ...args) {
+        return new Promise((resolve, reject) => {
+            const callId = native.call(contextId, method, JSON.stringify(args));
+            pendingCalls.set(callId, { resolve, reject });
+        });
+    }
+
+    function browserFunction(method, argumentCount) {
+        return (...args) => {
+            const callback = popCallback(args);
+            args.length = Math.min(args.length, argumentCount);
+            return finish(callback, callBrowser(method, ...args));
+        };
+    }
+
+    // Functions that are not supported, but that an extension calls as part of its setup, succeed doing nothing.
+    function noop(result) {
+        return (...args) => settle(popCallback(args), () => result);
+    }
+
+    // runtime
+
+    const [onMessage, , messageListeners] = createEvent();
+    const [onConnect, dispatchConnect, connectListeners] = createEvent();
+    const [onInstalled, dispatchInstalled] = createEvent();
+    const [onStartup, dispatchStartup] = createEvent();
+    if (isPage) {
+        browserEvents["runtime.onInstalled"] = dispatchInstalled;
+        browserEvents["runtime.onStartup"] = dispatchStartup;
+    }
+
+    const activePorts = new Map();
+
+    function serializePortMessage(message) {
+        const serialized = JSON.stringify(message === undefined ? null : message);
+        if (typeof serialized !== "string")
+            throw new TypeError("Could not serialize message.");
+        return serialized;
+    }
+
+    function createPortObject(portId, name, sender) {
+        const [onPortMessage, dispatchPortMessage] = createEvent();
+        const [onDisconnect, dispatchDisconnect] = createEvent();
+        let disconnected = false;
+        const port = {
+            name,
+            onMessage: onPortMessage,
+            onDisconnect,
+            postMessage(message) {
+                if (disconnected) throw new Error("Attempting to use a disconnected port object");
+                const serialized = serializePortMessage(message);
+                native.portPostMessage(contextId, portId, serialized);
+            },
+            disconnect() {
+                if (disconnected) return;
+                disconnected = true;
+                activePorts.delete(portId);
+                native.portDisconnect(contextId, portId);
+            },
+        };
+        if (sender !== undefined) port.sender = sender;
+        activePorts.set(portId, {
+            deliverMessage(messageJSON) {
+                if (disconnected) return;
+                dispatchPortMessage(JSON.parse(messageJSON), port);
+            },
+            deliverDisconnect(errorMessage, notify = true) {
+                if (disconnected) return;
+                disconnected = true;
+                activePorts.delete(portId);
+                if (!notify) return;
+                if (errorMessage) {
+                    port.error = { message: errorMessage };
+                    lastError = { message: errorMessage };
+                    try {
+                        dispatchDisconnect(port);
+                    } finally {
+                        lastError = undefined;
+                    }
+                } else {
+                    dispatchDisconnect(port);
+                }
+            },
+        });
+        return port;
+    }
+
+    function createDisconnectedPort(name, errorMessage = noReceiverError) {
+        const [onPortMessage] = createEvent();
+        const [onDisconnect, dispatchDisconnect] = createEvent();
+        let disconnected = false;
+        const port = {
+            name,
+            onMessage: onPortMessage,
+            onDisconnect,
+            postMessage(message) {
+                if (disconnected) throw new Error("Attempting to use a disconnected port object");
+                serializePortMessage(message);
+            },
+            disconnect() {
+                disconnected = true;
+            },
+        };
+        queueMicrotask(() => {
+            if (disconnected) return;
+            disconnected = true;
+            port.error = { message: errorMessage };
+            lastError = { message: errorMessage };
+            try {
+                dispatchDisconnect(port);
+            } finally {
+                lastError = undefined;
+            }
+        });
+        return port;
+    }
+
+    function sendMessage(target, message, callback) {
+        let serialized;
+        try {
+            serialized = JSON.stringify(message === undefined ? null : message);
+        } catch (thrown) {
+            return finish(callback, Promise.reject(toError(thrown)));
+        }
+        const promise = callBrowser(
+            "runtime.sendMessage",
+            target,
+            serialized,
+            location.href,
+            window === window.top
+        ).then(response => (response === undefined ? undefined : JSON.parse(response)));
+        return finish(callback, promise);
+    }
+
+    const runtime = {
+        id: extensionId,
+        getManifest() {
+            return JSON.parse(manifestJSON);
+        },
+        getURL(path) {
+            return baseURL + String(path).replace(/^\/+/, "");
+        },
+        sendMessage(...args) {
+            const callback = popCallback(args);
+            // sendMessage([extensionId,] message [, options]): a first string is an extension's ID only if it looks
+            // like one, and messages to other extensions cannot be sent.
+            const isExtensionId = value => typeof value === "string" && /^[a-p]{32}$/.test(value);
+            if (args.length >= 2 && (args[0] === null || args[0] === undefined)) {
+                args.shift();
+            } else if (args.length >= 2 && isExtensionId(args[0])) {
+                if (args[0] !== extensionId) return finish(callback, Promise.reject(new Error(noReceiverError)));
+                args.shift();
+            }
+            return sendMessage({ tabId: null }, args[0], callback);
+        },
+        connect(...args) {
+            let targetExtensionId;
+            let connectInfo;
+            if (args.length === 0) {
+                connectInfo = undefined;
+            } else if (typeof args[0] === "string") {
+                targetExtensionId = args[0];
+                connectInfo = args[1];
+            } else if (args[0] === null || args[0] === undefined) {
+                connectInfo = args[1];
+            } else if (typeof args[0] === "object") {
+                connectInfo = args[0];
+            } else {
+                throw new TypeError("Invalid arguments to runtime.connect");
+            }
+            if (connectInfo !== undefined && connectInfo !== null && typeof connectInfo !== "object")
+                throw new TypeError("Invalid connectInfo");
+            const name = connectInfo && connectInfo.name !== undefined ? String(connectInfo.name) : "";
+            if (targetExtensionId !== undefined && targetExtensionId !== extensionId)
+                return createDisconnectedPort(name, noReceiverError);
+            const portId = native.portConnect(contextId, name, null, null, null);
+            if (!portId) return createDisconnectedPort(name, noReceiverError);
+            return createPortObject(portId, name);
+        },
+        getPlatformInfo: noop({ os: "linux", arch: "x86-64", nacl_arch: "x86-64" }),
+        onMessage,
+        onConnect,
+        onInstalled,
+        onStartup,
+    };
+    Object.defineProperty(runtime, "lastError", {
+        get() {
+            return lastError;
+        },
+        enumerable: true,
+    });
+
+    // i18n
+
+    const predefinedMessages = {
+        "@@extension_id": extensionId,
+        "@@ui_locale": uiLanguage.replace("-", "_"),
+        "@@bidi_dir": "ltr",
+        "@@bidi_reversed_dir": "rtl",
+        "@@bidi_start_edge": "left",
+        "@@bidi_end_edge": "right",
+    };
+
+    const i18n = {
+        getMessage(name, substitutions) {
+            name = String(name);
+            if (Object.hasOwn(predefinedMessages, name)) return predefinedMessages[name];
+
+            const entry = messages[name.toLowerCase()];
+            if (!entry || typeof entry.message !== "string") return "";
+
+            let values = [];
+            if (Array.isArray(substitutions)) values = substitutions.slice(0, 9).map(String);
+            else if (substitutions !== undefined && substitutions !== null) values = [String(substitutions)];
+
+            const placeholders = {};
+            for (const [key, value] of Object.entries(entry.placeholders || {}))
+                placeholders[key.toLowerCase()] = value && value.content !== undefined ? String(value.content) : "";
+
+            const substitute = text => text.replace(/\$(\d)/g, (_, digit) => values[digit - 1] ?? "");
+
+            return entry.message.replace(/\$\$|\$([A-Za-z0-9_@]+)\$|\$(\d)/g, (match, placeholder, digit) => {
+                if (match === "$$") return "$";
+                if (placeholder !== undefined) {
+                    const key = placeholder.toLowerCase();
+                    return Object.hasOwn(placeholders, key) ? substitute(placeholders[key]) : match;
+                }
+                return values[digit - 1] ?? "";
+            });
+        },
+        getUILanguage() {
+            return uiLanguage;
+        },
+        getAcceptLanguages(callback) {
+            return settle(callback, () => Array.from(navigator.languages));
+        },
+        detectLanguage(text, callback) {
+            return settle(callback, () => ({ isReliable: false, languages: [] }));
+        },
+    };
+
+    // storage
+
+    const [onStorageChanged, dispatchStorageChanged] = createEvent();
+    const storageAreaDispatchers = {};
+
+    function createStorageArea(areaName, quotaBytes, readOnly) {
+        const read = () => JSON.parse(native.storageGet(extensionId, areaName));
+        const write = changes => {
+            if (readOnly) throw new Error("This storage area is read-only.");
+            native.storageApply(extensionId, areaName, JSON.stringify(changes));
+        };
+        const keyList = keys => (Array.isArray(keys) ? keys : [keys]).map(String);
+        const [onChanged, dispatch] = createEvent();
+        storageAreaDispatchers[areaName] = dispatch;
+
+        return {
+            QUOTA_BYTES: quotaBytes,
+            onChanged,
+            get(keys, callback) {
+                if (typeof keys === "function") {
+                    callback = keys;
+                    keys = null;
+                }
+                return settle(callback, () => {
+                    const items = read();
+                    if (keys === null || keys === undefined) return items;
+                    const result = {};
+                    if (typeof keys === "string" || Array.isArray(keys)) {
+                        for (const key of keyList(keys)) {
+                            if (Object.hasOwn(items, key)) result[key] = items[key];
+                        }
+                        return result;
+                    }
+                    if (typeof keys === "object") {
+                        for (const key of Object.keys(keys))
+                            result[key] = Object.hasOwn(items, key) ? items[key] : keys[key];
+                        return result;
+                    }
+                    throw new TypeError("Invalid storage keys");
+                });
+            },
+            getKeys(callback) {
+                return settle(callback, () => Object.keys(read()));
+            },
+            getBytesInUse(keys, callback) {
+                if (typeof keys === "function") {
+                    callback = keys;
+                    keys = null;
+                }
+                return settle(callback, () => {
+                    const items = read();
+                    const wanted = keys === null || keys === undefined ? Object.keys(items) : keyList(keys);
+                    let total = 0;
+                    for (const key of wanted) {
+                        if (Object.hasOwn(items, key)) total += key.length + JSON.stringify(items[key]).length;
+                    }
+                    return total;
+                });
+            },
+            set(items, callback) {
+                return settle(callback, () => {
+                    if (typeof items !== "object" || items === null)
+                        throw new TypeError("Storage items must be an object");
+                    const set = {};
+                    for (const key of Object.keys(items)) {
+                        if (items[key] !== undefined) set[key] = items[key];
+                    }
+                    write({ set });
+                });
+            },
+            remove(keys, callback) {
+                return settle(callback, () => write({ remove: keyList(keys) }));
+            },
+            clear(callback) {
+                return settle(callback, () => write({ clear: true }));
+            },
+        };
+    }
+
+    const storage = {
+        local: createStorageArea("local", 10485760),
+        sync: createStorageArea("sync", 102400),
+        onChanged: onStorageChanged,
+    };
+    if (isPage) {
+        storage.session = createStorageArea("session", 10485760);
+        storage.session.setAccessLevel = noop();
+        storage.managed = createStorageArea("managed", 0, true);
+    }
+
+    const chrome = {
+        runtime,
+        i18n,
+        storage,
+        extension: {
+            getURL: runtime.getURL,
+            inIncognitoContext: false,
+            sendMessage: runtime.sendMessage,
+            onMessage,
+        },
+    };
+
+    // Content scripts can get at the shadow roots of elements, including closed ones.
+    if (!isPage) {
+        chrome.dom = {
+            openOrClosedShadowRoot(element) {
+                return element instanceof Element ? element.shadowRoot : null;
+            },
+        };
+    }
+
+    if (isPage) {
+        runtime.openOptionsPage = browserFunction("runtime.openOptionsPage", 0);
+        runtime.reload = () => location.reload();
+        runtime.setUninstallURL = noop();
+        runtime.requestUpdateCheck = noop("no_update");
+        runtime.onUpdateAvailable = createEvent()[0];
+
+        // tabs and windows
+
+        const [onTabUpdated, dispatchTabUpdated] = createEvent();
+        const [onTabActivated, dispatchTabActivated] = createEvent();
+        const [onTabRemoved, dispatchTabRemoved] = createEvent();
+        const [onTabCreated, dispatchTabCreated] = createEvent();
+        browserEvents["tabs.onUpdated"] = dispatchTabUpdated;
+        browserEvents["tabs.onActivated"] = dispatchTabActivated;
+        browserEvents["tabs.onRemoved"] = dispatchTabRemoved;
+        browserEvents["tabs.onCreated"] = dispatchTabCreated;
+        chrome.tabs = {
+            TAB_ID_NONE: -1,
+            query: browserFunction("tabs.query", 1),
+            get: browserFunction("tabs.get", 1),
+            create: browserFunction("tabs.create", 1),
+            update(...args) {
+                const callback = popCallback(args);
+                const [tabId, properties] = typeof args[0] === "number" ? args : [null, args[0]];
+                return finish(callback, callBrowser("tabs.update", tabId, properties));
+            },
+            reload(...args) {
+                const callback = popCallback(args);
+                const tabId = typeof args[0] === "number" ? args[0] : null;
+                return finish(callback, callBrowser("tabs.reload", tabId));
+            },
+            remove: browserFunction("tabs.remove", 1),
+            connect(tabId, connectInfo) {
+                if (typeof tabId !== "number" || !Number.isSafeInteger(tabId) || tabId < 0)
+                    throw new TypeError("Invalid tabId");
+                if (connectInfo !== undefined && connectInfo !== null && typeof connectInfo !== "object")
+                    throw new TypeError("Invalid connectInfo");
+                const name = connectInfo && connectInfo.name !== undefined ? String(connectInfo.name) : "";
+                const frameId = connectInfo ? connectInfo.frameId : undefined;
+                if (frameId !== undefined) {
+                    if (typeof frameId !== "number" || !Number.isSafeInteger(frameId) || frameId < 0)
+                        throw new TypeError("Invalid frameId");
+                }
+                const documentId = connectInfo ? connectInfo.documentId : undefined;
+                if (documentId !== undefined) {
+                    if (typeof documentId !== "string" || documentId.length === 0)
+                        throw new TypeError("Invalid documentId");
+                }
+                const portId = native.portConnect(
+                    contextId,
+                    name,
+                    tabId,
+                    frameId === undefined ? null : frameId,
+                    documentId === undefined ? null : documentId
+                );
+                if (!portId) return createDisconnectedPort(name, noReceiverError);
+                return createPortObject(portId, name);
+            },
+            sendMessage(tabId, message, ...rest) {
+                const callback = popCallback(rest);
+                const options = rest[0] || {};
+                if (options.frameId !== undefined && options.frameId !== 0)
+                    return finish(
+                        callback,
+                        Promise.reject(new Error("Messages can only go to a tab's top-level frame"))
+                    );
+                return sendMessage({ tabId, frameId: options.frameId }, message, callback);
+            },
+            onUpdated: onTabUpdated,
+            onActivated: onTabActivated,
+            onRemoved: onTabRemoved,
+            onCreated: onTabCreated,
+            onReplaced: createEvent()[0],
+        };
+        chrome.windows = {
+            WINDOW_ID_NONE: -1,
+            WINDOW_ID_CURRENT: -2,
+            create(...args) {
+                const callback = popCallback(args);
+                const info = args[0] || {};
+                const url = Array.isArray(info.url) ? info.url[0] : info.url;
+                const promise = callBrowser("tabs.create", { url, active: true }).then(tab => ({
+                    id: 1,
+                    focused: true,
+                    tabs: [tab],
+                }));
+                return finish(callback, promise);
+            },
+            update: noop({ id: 1, focused: true }),
+            get: noop({ id: 1, focused: true }),
+            getCurrent: noop({ id: 1, focused: true }),
+            getLastFocused: noop({ id: 1, focused: true }),
+            getAll: noop([{ id: 1, focused: true }]),
+            onFocusChanged: createEvent()[0],
+            onRemoved: createEvent()[0],
+        };
+
+        // permissions: an extension has what its manifest asks for.
+
+        const grantedPermissions = {
+            permissions: Array.isArray(manifest.permissions) ? manifest.permissions.slice() : [],
+            origins: Array.isArray(manifest.host_permissions)
+                ? manifest.host_permissions.slice()
+                : (manifest.permissions || []).filter(permission => /^(\*|https?|file|<all_urls>)/.test(permission)),
+        };
+        // A granted host pattern covers a requested one if it covers its scheme (where * is http and https, and
+        // <all_urls> is every scheme) and its host (where *.example.com is example.com and its subdomains). Host
+        // permissions are for any path.
+        const parsePattern = pattern => {
+            const match = /^([^:]+):\/\/([^/]*)\//.exec(pattern);
+            if (!match) return null;
+            const hostAndPort = /^(.*?)(?::(\d+|\*))?$/.exec(match[2].toLowerCase());
+            return { scheme: match[1].toLowerCase(), host: hostAndPort[1], port: hostAndPort[2] };
+        };
+        const coversHost = (granted, requested) => {
+            if (granted === "*" || granted === requested) return true;
+            if (!granted.startsWith("*.")) return false;
+            const domain = granted.slice(2);
+            const requestedDomain = requested.startsWith("*.") ? requested.slice(2) : requested;
+            return requestedDomain === domain || requestedDomain.endsWith("." + domain);
+        };
+        // A grant without a port, or with any port, is for every port. Otherwise, the ports have to be the same.
+        const coversPort = (granted, requested) => granted === undefined || granted === "*" || granted === requested;
+        const patternContains = (granted, requested) => {
+            if (granted === requested || granted === "<all_urls>") return true;
+            const grantedPattern = parsePattern(granted);
+            const requestedPattern = parsePattern(requested);
+            if (!grantedPattern || !requestedPattern) return false;
+            const coversScheme =
+                grantedPattern.scheme === requestedPattern.scheme ||
+                (grantedPattern.scheme === "*" && /^(https?|\*)$/.test(requestedPattern.scheme));
+            return (
+                coversScheme &&
+                coversHost(grantedPattern.host, requestedPattern.host) &&
+                coversPort(grantedPattern.port, requestedPattern.port)
+            );
+        };
+        const containsPermissions = permissions =>
+            (permissions.permissions || []).every(name => grantedPermissions.permissions.includes(name)) &&
+            (permissions.origins || []).every(origin =>
+                grantedPermissions.origins.some(granted => patternContains(granted, origin))
+            );
+        chrome.permissions = {
+            getAll: noop(grantedPermissions),
+            contains(permissions, callback) {
+                return settle(callback, () => containsPermissions(permissions || {}));
+            },
+            // NB: There is no prompt to grant more, so an extension gets nothing besides what its manifest asks for.
+            request(permissions, callback) {
+                return settle(callback, () => containsPermissions(permissions || {}));
+            },
+            remove: noop(false),
+            onAdded: createEvent()[0],
+            onRemoved: createEvent()[0],
+        };
+
+        // declarativeNetRequest
+
+        chrome.declarativeNetRequest = {
+            MAX_NUMBER_OF_DYNAMIC_RULES: 30000,
+            MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES: 30000,
+            MAX_NUMBER_OF_SESSION_RULES: 5000,
+            MAX_NUMBER_OF_UNSAFE_DYNAMIC_RULES: 5000,
+            MAX_NUMBER_OF_UNSAFE_SESSION_RULES: 5000,
+            MAX_NUMBER_OF_ENABLED_STATIC_RULESETS: 50,
+            MAX_NUMBER_OF_REGEX_RULES: 1000,
+            GUARANTEED_MINIMUM_STATIC_RULES: 30000,
+            DYNAMIC_RULESET_ID: "_dynamic",
+            SESSION_RULESET_ID: "_session",
+            DomainType: {
+                FIRST_PARTY: "firstParty",
+                THIRD_PARTY: "thirdParty",
+            },
+            HeaderOperation: {
+                APPEND: "append",
+                SET: "set",
+                REMOVE: "remove",
+            },
+            ResourceType: {
+                MAIN_FRAME: "main_frame",
+                SUB_FRAME: "sub_frame",
+                STYLESHEET: "stylesheet",
+                SCRIPT: "script",
+                IMAGE: "image",
+                FONT: "font",
+                OBJECT: "object",
+                XMLHTTPREQUEST: "xmlhttprequest",
+                PING: "ping",
+                CSP_REPORT: "csp_report",
+                MEDIA: "media",
+                WEBSOCKET: "websocket",
+                WEBTRANSPORT: "webtransport",
+                WEBBUNDLE: "webbundle",
+                OTHER: "other",
+            },
+            RuleActionType: {
+                BLOCK: "block",
+                REDIRECT: "redirect",
+                ALLOW: "allow",
+                UPGRADE_SCHEME: "upgradeScheme",
+                MODIFY_HEADERS: "modifyHeaders",
+                ALLOW_ALL_REQUESTS: "allowAllRequests",
+            },
+            getDynamicRules: browserFunction("declarativeNetRequest.getDynamicRules", 1),
+            getSessionRules: browserFunction("declarativeNetRequest.getSessionRules", 1),
+            updateDynamicRules: browserFunction("declarativeNetRequest.updateDynamicRules", 1),
+            updateSessionRules: browserFunction("declarativeNetRequest.updateSessionRules", 1),
+            getEnabledRulesets: browserFunction("declarativeNetRequest.getEnabledRulesets", 0),
+            updateEnabledRulesets: browserFunction("declarativeNetRequest.updateEnabledRulesets", 1),
+            getAvailableStaticRuleCount: browserFunction("declarativeNetRequest.getAvailableStaticRuleCount", 0),
+            getDisabledRuleIds: browserFunction("declarativeNetRequest.getDisabledRuleIds", 1),
+            updateStaticRules: browserFunction("declarativeNetRequest.updateStaticRules", 1),
+            isRegexSupported: browserFunction("declarativeNetRequest.isRegexSupported", 1),
+            getMatchedRules: noop({ rulesMatchedInfo: [] }),
+            setExtensionActionOptions: noop(),
+            testMatchOutcome: browserFunction("declarativeNetRequest.testMatchOutcome", 1),
+            onRuleMatchedDebug: createEvent()[0],
+        };
+
+        // scripting
+
+        function normalizeScriptingTarget(target) {
+            if (!target || typeof target !== "object")
+                throw new TypeError("injection.target must be an object");
+            if (!Number.isSafeInteger(target.tabId) || target.tabId < 0)
+                throw new TypeError("target.tabId must be a non-negative integer");
+            const normalized = { tabId: target.tabId };
+            if (target.allFrames !== undefined) {
+                if (typeof target.allFrames !== "boolean")
+                    throw new TypeError("target.allFrames must be a boolean");
+                normalized.allFrames = target.allFrames;
+            }
+            if (target.frameIds !== undefined) {
+                if (!Array.isArray(target.frameIds) || target.frameIds.length === 0)
+                    throw new TypeError("target.frameIds must be a non-empty array");
+                for (const frameId of target.frameIds) {
+                    if (!Number.isSafeInteger(frameId) || frameId < 0)
+                        throw new TypeError("target.frameIds entries must be non-negative integers");
+                }
+                normalized.frameIds = target.frameIds.slice();
+            }
+            if (target.documentIds !== undefined) {
+                if (!Array.isArray(target.documentIds) || target.documentIds.length === 0)
+                    throw new TypeError("target.documentIds must be a non-empty array");
+                for (const documentId of target.documentIds) {
+                    if (typeof documentId !== "string" || documentId.length === 0)
+                        throw new TypeError("target.documentIds entries must be non-empty strings");
+                }
+                normalized.documentIds = target.documentIds.slice();
+            }
+            if (normalized.allFrames && (normalized.frameIds || normalized.documentIds))
+                throw new Error("Cannot specify both 'allFrames' and 'frameIds' or 'documentIds'");
+            if (normalized.frameIds && normalized.documentIds)
+                throw new Error("Cannot specify both 'frameIds' and 'documentIds'");
+            return normalized;
+        }
+
+        function normalizeCSSInjection(injection) {
+            if (!injection || typeof injection !== "object")
+                throw new TypeError("injection must be an object");
+            const target = normalizeScriptingTarget(injection.target);
+            const hasCSS = injection.css !== undefined;
+            const hasFiles = injection.files !== undefined;
+            if (hasCSS === hasFiles)
+                throw new Error("Exactly one of 'css' or 'files' must be specified");
+            const payload = { target };
+            if (hasCSS) {
+                if (typeof injection.css !== "string")
+                    throw new TypeError("injection.css must be a string");
+                payload.css = injection.css;
+            } else {
+                if (!Array.isArray(injection.files) || injection.files.length === 0)
+                    throw new TypeError("injection.files must be a non-empty array");
+                for (const file of injection.files) {
+                    if (typeof file !== "string" || file.length === 0)
+                        throw new TypeError("injection.files entries must be non-empty strings");
+                }
+                payload.files = injection.files.slice();
+            }
+            if (injection.origin !== undefined) {
+                if (injection.origin !== "AUTHOR" && injection.origin !== "USER")
+                    throw new TypeError("injection.origin must be 'AUTHOR' or 'USER'");
+                payload.origin = injection.origin;
+            } else {
+                payload.origin = "AUTHOR";
+            }
+            return payload;
+        }
+
+        chrome.scripting = {
+            registerContentScripts: browserFunction("scripting.registerContentScripts", 1),
+            updateContentScripts: browserFunction("scripting.updateContentScripts", 1),
+            getRegisteredContentScripts: browserFunction("scripting.getRegisteredContentScripts", 1),
+            unregisterContentScripts: browserFunction("scripting.unregisterContentScripts", 1),
+            executeScript(...args) {
+                const callback = popCallback(args);
+                const injection = args[0];
+                return settle(callback, () => {
+                    if (!injection || typeof injection !== "object")
+                        throw new TypeError("injection must be an object");
+                    const target = normalizeScriptingTarget(injection.target);
+                    const hasFiles = injection.files !== undefined;
+                    const hasFunc = injection.func !== undefined;
+                    if (hasFiles === hasFunc)
+                        throw new Error("Exactly one of 'files' or 'func' must be specified");
+                    const payload = { target };
+                    if (hasFiles) {
+                        if (injection.args !== undefined)
+                            throw new Error("'args' may only be specified with 'func'");
+                        if (!Array.isArray(injection.files) || injection.files.length === 0)
+                            throw new TypeError("injection.files must be a non-empty array");
+                        for (const file of injection.files) {
+                            if (typeof file !== "string" || file.length === 0)
+                                throw new TypeError("injection.files entries must be non-empty strings");
+                        }
+                        payload.files = injection.files.slice();
+                    } else {
+                        if (typeof injection.func !== "function")
+                            throw new TypeError("injection.func must be a function");
+                        const funcSource = Function.prototype.toString.call(injection.func);
+                        if (funcSource.includes("[native code]"))
+                            throw new Error("Native or bound functions cannot be injected");
+                        payload.func = funcSource;
+                        if (injection.args !== undefined) {
+                            if (!Array.isArray(injection.args))
+                                throw new TypeError("injection.args must be an array");
+                            let argsJSON;
+                            try {
+                                argsJSON = JSON.stringify(injection.args);
+                            } catch (e) {
+                                throw new TypeError("injection.args must be JSON-serializable");
+                            }
+                            if (typeof argsJSON !== "string")
+                                throw new TypeError("injection.args must be JSON-serializable");
+                            payload.argsJSON = argsJSON;
+                        }
+                    }
+                    if (injection.world !== undefined) {
+                        if (injection.world !== "ISOLATED" && injection.world !== "MAIN")
+                            throw new TypeError("injection.world must be 'ISOLATED' or 'MAIN'");
+                        payload.world = injection.world;
+                    } else {
+                        payload.world = "ISOLATED";
+                    }
+                    if (injection.injectImmediately !== undefined) {
+                        if (typeof injection.injectImmediately !== "boolean")
+                            throw new TypeError("injection.injectImmediately must be a boolean");
+                        payload.injectImmediately = injection.injectImmediately;
+                    } else {
+                        payload.injectImmediately = false;
+                    }
+                    return callBrowser("scripting.executeScript", payload).then(results =>
+                        Array.isArray(results)
+                            ? results.map(entry => {
+                                  const out = { frameId: entry.frameId, documentId: entry.documentId };
+                                  if (typeof entry.resultJSON === "string") {
+                                      try {
+                                          out.result = JSON.parse(entry.resultJSON);
+                                      } catch {}
+                                  }
+                                  return out;
+                              })
+                            : results
+                    );
+                });
+            },
+            insertCSS(...args) {
+                const callback = popCallback(args);
+                const injection = args[0];
+                return settle(callback, () => callBrowser("scripting.insertCSS", normalizeCSSInjection(injection)));
+            },
+            removeCSS(...args) {
+                const callback = popCallback(args);
+                const injection = args[0];
+                return settle(callback, () => callBrowser("scripting.removeCSS", normalizeCSSInjection(injection)));
+            },
+        };
+
+        // alarms
+
+        const [onAlarm, dispatchAlarm] = createEvent();
+        const alarms = new Map();
+        const clearAlarm = name => {
+            const alarm = alarms.get(name);
+            if (!alarm) return false;
+            clearTimeout(alarm.timer);
+            alarms.delete(name);
+            return true;
+        };
+        const describe = ({ name, scheduledTime, periodInMinutes }) => ({ name, scheduledTime, periodInMinutes });
+        chrome.alarms = {
+            create(...args) {
+                const callback = popCallback(args);
+                const name = typeof args[0] === "string" ? args.shift() : "";
+                const info = args[0] || {};
+                return settle(callback, () => {
+                    clearAlarm(name);
+                    const delay =
+                        info.when !== undefined
+                            ? info.when - Date.now()
+                            : (info.delayInMinutes ?? info.periodInMinutes ?? 0) * 60000;
+                    const alarm = {
+                        name,
+                        periodInMinutes: info.periodInMinutes,
+                        scheduledTime: Date.now() + Math.max(delay, 0),
+                    };
+                    const fire = () => {
+                        if (alarm.periodInMinutes) {
+                            alarm.scheduledTime = Date.now() + alarm.periodInMinutes * 60000;
+                            alarm.timer = setTimeout(fire, alarm.periodInMinutes * 60000);
+                        } else {
+                            alarms.delete(name);
+                        }
+                        dispatchAlarm(describe(alarm));
+                    };
+                    alarm.timer = setTimeout(fire, Math.max(delay, 0));
+                    alarms.set(name, alarm);
+                });
+            },
+            get: (name, callback) =>
+                settle(callback, () => (alarms.has(name) ? describe(alarms.get(name)) : undefined)),
+            getAll: callback => settle(callback, () => Array.from(alarms.values()).map(describe)),
+            clear: (name, callback) => settle(callback, () => clearAlarm(name ?? "")),
+            clearAll: callback =>
+                settle(callback, () => {
+                    for (const name of Array.from(alarms.keys())) clearAlarm(name);
+                    return true;
+                }),
+            onAlarm,
+        };
+
+        // The toolbar button shows no badge, title or icon of the extension's choosing yet.
+        const action = {
+            setIcon: noop(),
+            setTitle: noop(),
+            getTitle: noop(manifest.name),
+            setBadgeText: noop(),
+            getBadgeText: noop(""),
+            setBadgeBackgroundColor: noop(),
+            setBadgeTextColor: noop(),
+            setPopup: noop(),
+            enable: noop(),
+            disable: noop(),
+        };
+        [action.onClicked, browserEvents["action.onClicked"]] = createEvent();
+        chrome.action = action;
+        chrome.browserAction = action;
+        chrome.commands = { getAll: noop([]), onCommand: createEvent()[0] };
+
+        // A popup is as large as its page would like to be, as in Chrome. Other pages say so for nothing.
+        let reportedSize = "";
+        const reportPreferredSize = () => {
+            const root = document.documentElement;
+            if (!root) return;
+            const previousWidth = root.style.width;
+            root.style.width = "max-content";
+            const rect = root.getBoundingClientRect();
+            root.style.width = previousWidth;
+            const size = Math.ceil(rect.width) + "x" + Math.ceil(rect.height);
+            if (size === reportedSize) return;
+            reportedSize = size;
+            callBrowser("popup.setPreferredSize", Math.ceil(rect.width), Math.ceil(rect.height)).catch(() => {});
+        };
+        addEventListener("load", () => {
+            reportPreferredSize();
+            if (document.body) new ResizeObserver(reportPreferredSize).observe(document.body);
+        });
+        chrome.contextMenus = {
+            create: () => 0,
+            update: noop(),
+            remove: noop(),
+            removeAll: noop(),
+            onClicked: createEvent()[0],
+        };
+
+        function matchesUrlFilter(urlString, filter) {
+            if (!filter || typeof filter !== "object") return true;
+            let parsed;
+            try {
+                parsed = new URL(urlString);
+            } catch {
+                return false;
+            }
+            const scheme = parsed.protocol.endsWith(":") ? parsed.protocol.slice(0, -1).toLowerCase() : parsed.protocol.toLowerCase();
+            const host = parsed.hostname;
+            const path = parsed.pathname;
+            const query = parsed.search.startsWith("?") ? parsed.search.slice(1) : parsed.search;
+            const urlWithoutFragment = parsed.href.split("#")[0];
+            const originAndPath = parsed.origin + parsed.pathname;
+
+            const dottedHost = "." + host;
+            if (filter.hostContains !== undefined && !dottedHost.includes(filter.hostContains)) return false;
+            if (filter.hostEquals !== undefined && host !== filter.hostEquals) return false;
+            if (filter.hostPrefix !== undefined && !host.startsWith(filter.hostPrefix)) return false;
+            if (filter.hostSuffix !== undefined && !dottedHost.endsWith(filter.hostSuffix)) return false;
+
+            if (filter.pathContains !== undefined && !path.includes(filter.pathContains)) return false;
+            if (filter.pathEquals !== undefined && path !== filter.pathEquals) return false;
+            if (filter.pathPrefix !== undefined && !path.startsWith(filter.pathPrefix)) return false;
+            if (filter.pathSuffix !== undefined && !path.endsWith(filter.pathSuffix)) return false;
+
+            if (filter.queryContains !== undefined && !query.includes(filter.queryContains)) return false;
+            if (filter.queryEquals !== undefined && query !== filter.queryEquals) return false;
+            if (filter.queryPrefix !== undefined && !query.startsWith(filter.queryPrefix)) return false;
+            if (filter.querySuffix !== undefined && !query.endsWith(filter.querySuffix)) return false;
+
+            if (filter.urlContains !== undefined && !urlWithoutFragment.includes(filter.urlContains)) return false;
+            if (filter.urlEquals !== undefined && urlWithoutFragment !== filter.urlEquals) return false;
+            if (filter.urlPrefix !== undefined && !urlWithoutFragment.startsWith(filter.urlPrefix)) return false;
+            if (filter.urlSuffix !== undefined && !urlWithoutFragment.endsWith(filter.urlSuffix)) return false;
+            if (filter.urlMatches !== undefined && !new RegExp(filter.urlMatches).test(urlWithoutFragment)) return false;
+            if (filter.originAndPathMatches !== undefined && !new RegExp(filter.originAndPathMatches).test(originAndPath)) return false;
+
+            if (Array.isArray(filter.schemes) && !filter.schemes.some(s => String(s).toLowerCase() === scheme)) return false;
+            if (Array.isArray(filter.ports)) {
+                const defaultPort = scheme === "https" ? 443 : scheme === "http" ? 80 : NaN;
+                const port = parsed.port ? Number(parsed.port) : defaultPort;
+                const portMatches = filter.ports.some(p => {
+                    if (Array.isArray(p) && p.length === 2) return port >= p[0] && port <= p[1];
+                    return port === p;
+                });
+                if (!portMatches) return false;
+            }
+            return true;
+        }
+
+        function createFilteredNavigationEvent() {
+            const entries = [];
+            const event = {
+                addListener(listener, filters) {
+                    if (typeof listener !== "function") return;
+                    const existing = entries.find(e => e.listener === listener);
+                    if (existing) {
+                        existing.filters = filters;
+                        return;
+                    }
+                    entries.push({ listener, filters });
+                },
+                removeListener(listener) {
+                    const index = entries.findIndex(e => e.listener === listener);
+                    if (index !== -1) entries.splice(index, 1);
+                },
+                hasListener(listener) {
+                    return entries.some(e => e.listener === listener);
+                },
+                hasListeners() {
+                    return entries.length > 0;
+                },
+            };
+            const dispatch = details => {
+                for (const entry of entries.slice()) {
+                    try {
+                        if (entry.filters && Array.isArray(entry.filters.url)) {
+                            const url = details && typeof details.url === "string" ? details.url : "";
+                            if (!entry.filters.url.some(filter => matchesUrlFilter(url, filter))) continue;
+                        }
+                        entry.listener(details);
+                    } catch (error) {
+                        reportError(error);
+                    }
+                }
+            };
+            return [event, dispatch];
+        }
+
+        const [onBeforeNavigate, dispatchBeforeNavigate] = createFilteredNavigationEvent();
+        const [onCommitted, dispatchCommitted] = createFilteredNavigationEvent();
+        const [onCompleted, dispatchCompleted] = createFilteredNavigationEvent();
+        const [onErrorOccurred, dispatchErrorOccurred] = createFilteredNavigationEvent();
+        browserEvents["webNavigation.onBeforeNavigate"] = dispatchBeforeNavigate;
+        browserEvents["webNavigation.onCommitted"] = dispatchCommitted;
+        browserEvents["webNavigation.onCompleted"] = dispatchCompleted;
+        browserEvents["webNavigation.onErrorOccurred"] = dispatchErrorOccurred;
+        chrome.webNavigation = {
+            getAllFrames: browserFunction("webNavigation.getAllFrames", 1),
+            getFrame: browserFunction("webNavigation.getFrame", 1),
+            onBeforeNavigate,
+            onCommitted,
+            onCompleted,
+            onDOMContentLoaded: createFilteredNavigationEvent()[0],
+            onErrorOccurred,
+            onHistoryStateUpdated: createFilteredNavigationEvent()[0],
+            onReferenceFragmentUpdated: createFilteredNavigationEvent()[0],
+            onTabReplaced: createEvent()[0],
+        };
+
+        chrome.webRequest = {
+            OnBeforeRequestOptions: {
+                BLOCKING: "blocking",
+                REQUEST_BODY: "requestBody",
+                EXTRA_HEADERS: "extraHeaders",
+            },
+            OnBeforeSendHeadersOptions: {
+                REQUEST_HEADERS: "requestHeaders",
+                BLOCKING: "blocking",
+                EXTRA_HEADERS: "extraHeaders",
+            },
+            OnHeadersReceivedOptions: {
+                BLOCKING: "blocking",
+                RESPONSE_HEADERS: "responseHeaders",
+                EXTRA_HEADERS: "extraHeaders",
+            },
+            handlerBehaviorChanged: noop(),
+            onBeforeRequest: createEvent()[0],
+            onBeforeSendHeaders: createEvent()[0],
+            onSendHeaders: createEvent()[0],
+            onHeadersReceived: createEvent()[0],
+            onResponseStarted: createEvent()[0],
+            onBeforeRedirect: createEvent()[0],
+            onCompleted: createEvent()[0],
+            onErrorOccurred: createEvent()[0],
+        };
+
+        chrome.management = {
+            getSelf(callback) {
+                return settle(callback, () => ({
+                    id: extensionId,
+                    name: manifest.name || "",
+                    shortName: manifest.short_name || manifest.name || "",
+                    description: manifest.description || "",
+                    version: manifest.version || "",
+                    enabled: true,
+                    mayDisable: true,
+                    installType: "normal",
+                    type: "extension",
+                    homepageUrl: manifest.homepage_url || "",
+                    updateUrl: manifest.update_url || "",
+                }));
+            },
+        };
+
+        chrome.cookies = {
+            get: noop(null),
+            getAll(...args) {
+                return settle(popCallback(args), () => []);
+            },
+            getAllCookieStores(...args) {
+                return settle(popCallback(args), () => [{ id: "0", tabIds: [] }]);
+            },
+            set: noop(null),
+            remove: noop(null),
+            onChanged: createEvent()[0],
+        };
+    }
+
+    function dispatch(type, ...args) {
+        if (type === "event") {
+            const [name, argumentsJSON] = args;
+            if (browserEvents[name]) browserEvents[name](...JSON.parse(argumentsJSON));
+            return;
+        }
+
+        if (type === "storage") {
+            const [areaName, changesJSON] = args;
+            const changes = JSON.parse(changesJSON);
+            dispatchStorageChanged(changes, areaName);
+            if (storageAreaDispatchers[areaName]) storageAreaDispatchers[areaName](changes);
+            return;
+        }
+
+        if (type === "result") {
+            const [callId, succeeded, resultJSON] = args;
+            const call = pendingCalls.get(callId);
+            if (!call) return;
+            pendingCalls.delete(callId);
+            const result = resultJSON === "" ? undefined : JSON.parse(resultJSON);
+            if (succeeded) call.resolve(result);
+            else call.reject(new Error(String(result)));
+            return;
+        }
+
+        if (type === "message") {
+            // Gives back how the listeners answered: "r" and the response, "async" if one will respond later, or "none".
+            const [deliveryId, messageJSON, senderJSON] = args;
+            const message = JSON.parse(messageJSON);
+            const sender = JSON.parse(senderJSON);
+            let response;
+            let responded = false;
+            let willRespond = false;
+            const sendResponse = value => {
+                if (responded) return;
+                responded = true;
+                const serialized = value === undefined ? undefined : JSON.stringify(value);
+                if (willRespond) native.respond(deliveryId, serialized ?? "");
+                else response = serialized;
+            };
+            for (const listener of messageListeners.slice()) {
+                let result;
+                try {
+                    result = listener(message, sender, sendResponse);
+                } catch (error) {
+                    reportError(error);
+                    continue;
+                }
+                if (result === true) willRespond = true;
+                else if (result && typeof result.then === "function") {
+                    willRespond = true;
+                    result.then(sendResponse, error => sendResponse({ error: String(error) }));
+                }
+            }
+            if (responded) return "r" + (response ?? "");
+            if (willRespond) return "async";
+            return messageListeners.length ? "none" : "nolistener";
+        }
+
+        if (type === "port-has-connect-listeners") {
+            return connectListeners.length > 0;
+        }
+
+        if (type === "port-connect") {
+            const [portId, name, senderJSON] = args;
+            const port = createPortObject(portId, name, JSON.parse(senderJSON));
+            dispatchConnect(port);
+            return;
+        }
+
+        if (type === "port-message") {
+            const [portId, messageJSON] = args;
+            const entry = activePorts.get(portId);
+            if (entry) entry.deliverMessage(messageJSON);
+            return;
+        }
+
+        if (type === "port-disconnect") {
+            const [portId, errorMessage, notify] = args;
+            const entry = activePorts.get(portId);
+            if (entry) entry.deliverDisconnect(errorMessage, notify !== false);
+            return;
+        }
+    }
+
+    return [chrome, dispatch];
+});

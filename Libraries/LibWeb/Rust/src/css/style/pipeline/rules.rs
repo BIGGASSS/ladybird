@@ -2800,7 +2800,7 @@ impl RuleIndex {
         let placement = self.entries.place(sheet, group, version.layer, || EntryPlacement {
             origin: placement.origin,
             group,
-            layer_rank: program.layer_rank(layer_scope, version.layer),
+            layer_rank: program.layer_rank_for_origin(placement.origin, layer_scope, version.layer),
             sheet_rank: placement.sheet_rank,
             layer: version.layer,
         });
@@ -3237,7 +3237,7 @@ impl RuleIndex {
                 // The entries take the ranks of their sheet and layers where they are placed.
                 self.entries.rank_placements_of(sheet, group, |placement| {
                     placement.sheet_rank = sheet_rank;
-                    placement.layer_rank = program.layer_rank(layer_scope, placement.layer);
+                    placement.layer_rank = program.layer_rank_for_origin(placement.origin, layer_scope, placement.layer);
                 });
             }
             // NB: A sheet whose rank was only relabeled keeps its order against the others.

@@ -25,6 +25,7 @@
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AdoptedStyleSheets.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Extensions/ExtensionRegistry.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Namespace.h>
@@ -234,7 +235,6 @@ void StyleScope::build_rule_cache()
 {
     if (!m_rule_cache.has_value()) {
         m_rule_cache = StyleRuleCache {};
-        add_rules_to_rule_cache(CascadeOrigin::Author);
 
         // NB: A shadow root's scope holds only its own sheets. What the user and user-agent sheets define is found
         //     in the document's scope, where every name a shadow root's scope does not define is looked for next.
@@ -251,9 +251,48 @@ void StyleScope::build_rule_cache()
                     sheet.evaluate_media_queries(document());
                 });
             }
-            add_rules_to_rule_cache(CascadeOrigin::User);
             add_rules_to_rule_cache(CascadeOrigin::UserAgent);
+            add_rules_to_rule_cache(CascadeOrigin::User);
         }
+        add_rules_to_rule_cache(CascadeOrigin::Author);
+
+        auto collect_layer_ranks = [&](CascadeOrigin origin) {
+            HashMap<Utf16FlyString, size_t> ranks;
+            Vector<Parser::ValueParserFFI::NativeStyleSheet const*> sheets;
+            for_each_stylesheet(origin, [&](auto& sheet) {
+                if (sheet.disabled() || !sheet.native_media_list().matches())
+                    return;
+                if (auto* shared_compiled_style_sheet = sheet.shared_compiled_style_sheet())
+                    sheets.append(shared_compiled_style_sheet->contents().native_sheet().handle());
+                else
+                    sheets.append(sheet.native_sheet().handle());
+            });
+            Parser::ValueParserFFI::rust_style_sheets_visit_layer_order(
+                sheets.data(), sheets.size(), &ranks,
+                [](void* context, u16 const* data, size_t length, size_t rank) {
+                    auto& ranks = *static_cast<HashMap<Utf16FlyString, size_t>*>(context);
+                    ranks.set(Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(data), length }), rank);
+                });
+            return ranks;
+        };
+
+        Optional<HashMap<Utf16FlyString, size_t>> author_layer_ranks;
+        Optional<HashMap<Utf16FlyString, size_t>> user_layer_ranks;
+        Optional<HashMap<Utf16FlyString, size_t>> user_agent_layer_ranks;
+        m_rule_cache->resolve_named_rules([&](CascadeOrigin origin, Utf16FlyString const& layer_name) -> size_t {
+            if (layer_name.is_empty())
+                return NumericLimits<size_t>::max();
+            auto& ranks = [&]() -> Optional<HashMap<Utf16FlyString, size_t>>& {
+                if (origin == CascadeOrigin::User)
+                    return user_layer_ranks;
+                if (origin == CascadeOrigin::UserAgent)
+                    return user_agent_layer_ranks;
+                return author_layer_ranks;
+            }();
+            if (!ranks.has_value())
+                ranks = collect_layer_ranks(origin);
+            return ranks->get(layer_name).value_or(NumericLimits<size_t>::max());
+        });
     }
 
     if (!m_has_published_rule_cache) {
@@ -292,16 +331,22 @@ void StyleScope::build_user_style_sheet_if_needed()
 
     auto user_style_source = document().page().user_style();
     auto const& content_blocker_style_source = document().content_blocker_style_sheet();
-    if (!user_style_source.has_value() && content_blocker_style_source.is_empty())
+    // NB: Chrome adds the CSS of content scripts as author style sheets. Here, they are part of the user style sheet,
+    //     which is close enough for what they are mostly used for: hiding and restyling parts of the page.
+    auto static_extension_style_source = Extensions::ExtensionRegistry::the().style_sheet_for_document(document(), Extensions::ExtensionRegistry::ContentScriptKind::Static);
+    auto const& dynamic_extension_style_source = document().dynamic_extension_style_sheet();
+    if (!user_style_source.has_value() && content_blocker_style_source.is_empty() && static_extension_style_source.is_empty() && dynamic_extension_style_source.is_empty())
         return;
 
     Utf16StringBuilder source;
     if (user_style_source.has_value())
         source.append(user_style_source->utf16_view());
-    if (!content_blocker_style_source.is_empty()) {
+    for (Utf16String const& extra_source : { content_blocker_style_source, static_extension_style_source, dynamic_extension_style_source }) {
+        if (extra_source.is_empty())
+            continue;
         if (!source.is_empty())
             source.append_ascii('\n');
-        source.append(content_blocker_style_source.utf16_view());
+        source.append(extra_source.utf16_view());
     }
 
     m_user_style_sheet = parse_css_stylesheet(CSS::Parser::ParsingParams(document()), source.view());
@@ -424,6 +469,7 @@ void StyleScope::for_each_stylesheet(CascadeOrigin cascade_origin, Function<void
         style_scope.build_user_style_sheet_if_needed();
         if (style_scope.m_user_style_sheet)
             callback(*style_scope.m_user_style_sheet);
+        Extensions::ExtensionRegistry::the().for_each_inserted_user_style_sheet(document(), callback);
     }
     if (cascade_origin == CascadeOrigin::Author) {
         for_each_active_css_style_sheet(move(callback));
@@ -448,10 +494,10 @@ void StyleScope::add_rules_to_rule_cache(CascadeOrigin cascade_origin)
 
 void StyleRuleCache::add_rules_from_cache(StyleRuleCache const& other)
 {
-    for (auto const& [name, keyframe_set] : other.rules_by_animation_keyframes)
-        rules_by_animation_keyframes.set(name, keyframe_set);
-    for (auto const& [name, declarations] : other.rules_by_position_try)
-        rules_by_position_try.set(name, RustDeclarationBlockSnapshot { Parser::ValueParserFFI::rust_declaration_data_retain(declarations.data()) });
+    for (auto const& rule : other.keyframe_rules)
+        keyframe_rules.append({ rule.name, rule.qualified_layer_name, rule.cascade_origin, rule.keyframes });
+    for (auto const& rule : other.position_try_rules)
+        position_try_rules.append({ rule.name, rule.qualified_layer_name, rule.cascade_origin, RustDeclarationBlockSnapshot { Parser::ValueParserFFI::rust_declaration_data_retain(rule.declarations.data()) } });
     function_rules.extend(other.function_rules);
     has_size_container_queries |= other.has_size_container_queries;
 }
@@ -466,7 +512,7 @@ void StyleRuleCache::add_rules_from_sheet(StyleSheetState& sheet, CascadeOrigin 
             function_rules.append({ rule.compile_function(), Utf16FlyString::from_utf16(layer_prefix), cascade_origin });
         if (rule.type() == RustRule::Type::PositionTry) {
             if (auto* declarations = rule.position_try_declarations())
-                rules_by_position_try.set(Utf16FlyString { rule.name() }, RustDeclarationBlockSnapshot { declarations });
+                position_try_rules.append({ Utf16FlyString { rule.name() }, Utf16FlyString::from_utf16(layer_prefix), cascade_origin, RustDeclarationBlockSnapshot { declarations } });
             return;
         }
         if (rule.type() != RustRule::Type::Keyframes)
@@ -476,8 +522,40 @@ void StyleRuleCache::add_rules_from_sheet(StyleSheetState& sheet, CascadeOrigin 
         auto base_url_string = base_url.has_value() ? base_url->to_string() : String {};
         auto keyframe_set = Animations::KeyframeSetHandle::adopt(Animations::RustFFI::animations_keyframe_set_from_keyframes_rule(
             &rule.native_view(), true, base_url_string.bytes(), sheet.is_origin_clean()));
-        rules_by_animation_keyframes.set(Utf16FlyString { rule.name() }, move(keyframe_set));
+        keyframe_rules.append({ Utf16FlyString { rule.name() }, Utf16FlyString::from_utf16(layer_prefix), cascade_origin, move(keyframe_set) });
     });
+}
+
+void StyleRuleCache::resolve_named_rules(Function<size_t(CascadeOrigin, Utf16FlyString const&)> const& layer_rank_for)
+{
+    struct Precedence {
+        u8 origin { 0 };
+        size_t layer_rank { NumericLimits<size_t>::max() };
+        bool operator<=(Precedence const& other) const
+        {
+            return origin < other.origin || (origin == other.origin && layer_rank <= other.layer_rank);
+        }
+    };
+
+    rules_by_animation_keyframes.clear();
+    HashMap<Utf16FlyString, Precedence> keyframe_precedence;
+    for (auto const& rule : keyframe_rules) {
+        Precedence precedence { cascade_origin_precedence(rule.cascade_origin), layer_rank_for(rule.cascade_origin, rule.qualified_layer_name) };
+        if (auto existing = keyframe_precedence.get(rule.name); existing.has_value() && !(existing.value() <= precedence))
+            continue;
+        keyframe_precedence.set(rule.name, precedence);
+        rules_by_animation_keyframes.set(rule.name, rule.keyframes);
+    }
+
+    rules_by_position_try.clear();
+    HashMap<Utf16FlyString, Precedence> position_try_precedence;
+    for (auto const& rule : position_try_rules) {
+        Precedence precedence { cascade_origin_precedence(rule.cascade_origin), layer_rank_for(rule.cascade_origin, rule.qualified_layer_name) };
+        if (auto existing = position_try_precedence.get(rule.name); existing.has_value() && !(existing.value() <= precedence))
+            continue;
+        position_try_precedence.set(rule.name, precedence);
+        rules_by_position_try.set(rule.name, RustDeclarationBlockSnapshot { Parser::ValueParserFFI::rust_declaration_data_retain(rule.declarations.data()) });
+    }
 }
 
 void StyleScope::publish_cascade_layer_order(StyleSheetState* pending_attachment)
@@ -500,8 +578,20 @@ void StyleScope::publish_cascade_layer_order(StyleSheetState* pending_attachment
 
     m_has_published_named_layer_order = Parser::ValueParserFFI::rust_style_sheet_publish_layer_order(
         sheets.data(), sheets.size(), document().style_computer().style_engine().host(),
-        style_engine_tree_scope().value(), m_has_published_named_layer_order, &document(),
+        style_engine_tree_scope().value(), false, m_has_published_named_layer_order, &document(),
         [](void* document) { static_cast<DOM::Document*>(document)->flush_deferred_style_change_event(); });
+
+    if (m_node->is_document()) {
+        Vector<Parser::ValueParserFFI::NativeStyleSheet const*> user_sheets;
+        for_each_stylesheet(CascadeOrigin::User, [&](auto& sheet) {
+            if (!sheet.disabled() && sheet.native_media_list().matches())
+                user_sheets.append(sheet.native_sheet().handle());
+        });
+        m_has_published_user_named_layer_order = Parser::ValueParserFFI::rust_style_sheet_publish_layer_order(
+            user_sheets.data(), user_sheets.size(), document().style_computer().style_engine().host(),
+            style_engine_tree_scope().value(), true, m_has_published_user_named_layer_order, &document(),
+            [](void* document) { static_cast<DOM::Document*>(document)->flush_deferred_style_change_event(); });
+    }
 }
 
 // The `@keyframes` this scope defines, as the rule cache just built resolved them. The style computation resolves an
@@ -642,9 +732,13 @@ void StyleScope::build_counter_style_cache(Layout::BegunRead const& read)
     auto const tree_scope = style_engine_tree_scope();
     // NB: Asking the style engine for the index of a layer waits on it, and the predefined counter styles alone are
     //     over a hundred rules in one layer, so each layer is asked for once.
-    HashMap<u32, u32> layer_indices;
-    auto layer_index = [&](u32 layer) {
-        return layer_indices.ensure(layer, [&] { return StyleEngineFFI::style_engine_layer_index(style_engine.host(), &read, tree_scope, layer); });
+    HashMap<u64, u32> layer_indices;
+    auto layer_index = [&](CSS::CascadeOrigin cascade_origin, u32 layer) {
+        auto origin_rank = cascade_origin_precedence(cascade_origin);
+        u64 cache_key = (static_cast<u64>(origin_rank) << 32) | layer;
+        return layer_indices.ensure(cache_key, [&] {
+            return StyleEngineFFI::style_engine_layer_index(style_engine.host(), &read, tree_scope, origin_rank, layer);
+        });
     };
     auto collect_counter_style_rules = [&](CSS::CascadeOrigin cascade_origin, CSS::StyleSheetState const& style_sheet) {
         if (!style_sheet.native_media_list().matches())
@@ -658,7 +752,7 @@ void StyleScope::build_counter_style_cache(Layout::BegunRead const& read)
                 .name = Utf16FlyString { rule.name() },
                 .descriptors = rule.descriptors(),
                 .origin = cascade_origin_precedence(cascade_origin),
-                .layer = layer_index(layer),
+                .layer = layer_index(cascade_origin, layer),
             });
         });
     };

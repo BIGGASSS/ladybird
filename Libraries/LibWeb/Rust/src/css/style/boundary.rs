@@ -19,7 +19,7 @@ use super::bridge::{FfiFrameSetBorder, FfiFrameSetDimension};
 use super::engine_calls::EngineWrite;
 use super::engine_calls::with_engine;
 use super::index::StyleAtomID;
-use super::pipeline::rule_store::{CascadeLayerID, SheetID};
+use super::pipeline::rule_store::{CascadeLayerID, CascadeOrigin, SheetID};
 use super::tree::{FrameSetLayout, StyleNodeID, TableSpans, TreeScopeID};
 use crate::abort_on_panic;
 use crate::css::css_string::CssString;
@@ -477,7 +477,11 @@ style_boundary! {
             //     exists, so a move of it is a style input of the element like a container query answer. The type
             //     facts are fixed from the element's arrival on, and whether it has animations is no input of its
             //     style.
-            if moved & super::bridge::element_adjustment_fact::RENDERED_IN_TOP_LAYER != 0 {
+            if moved
+                & (super::bridge::element_adjustment_fact::RENDERED_IN_TOP_LAYER
+                    | super::bridge::element_adjustment_fact::HIDE_AUDIO_WITHOUT_CONTROLS)
+                != 0
+            {
                 host.publish_element_writes();
                 host.queue_change(ArenaChange::Engine(EngineWrite::TopLayerMove { node }));
             }
@@ -517,7 +521,14 @@ style_boundary! {
             let entries = retained.live_counters.trace_entries(&retained.projection, root);
             entries.get(index as usize).copied().unwrap_or(0)
         });
-        layer_index(tree_scope: TreeScopeID, layer: CascadeLayerID) -> u32;
+        layer_index(tree_scope: TreeScopeID, origin: u8, layer: CascadeLayerID) -> u32 => {
+            let origin = match origin {
+                0 => CascadeOrigin::UserAgent,
+                1 => CascadeOrigin::User,
+                _ => CascadeOrigin::Author,
+            };
+            engine.layer_index_for_origin(origin, tree_scope, layer)
+        };
         ensure_random_base_value(node: Option<StyleNodeID>, name: FfiSpan<u16>, element_shared: bool) -> u64 => {
             // SAFETY: The host lends the name for the call.
             let name = unsafe { borrow(name.data, name.size) };

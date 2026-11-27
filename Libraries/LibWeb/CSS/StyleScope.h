@@ -61,17 +61,34 @@ struct CachedFunctionRule {
     CascadeOrigin cascade_origin { CascadeOrigin::Author };
 };
 
+struct CachedKeyframeRule {
+    Utf16FlyString name;
+    Utf16FlyString qualified_layer_name;
+    CascadeOrigin cascade_origin { CascadeOrigin::Author };
+    Animations::KeyframeSetHandle keyframes;
+};
+
+struct CachedPositionTryRule {
+    Utf16FlyString name;
+    Utf16FlyString qualified_layer_name;
+    CascadeOrigin cascade_origin { CascadeOrigin::Author };
+    RustDeclarationBlockSnapshot declarations;
+};
+
 // What one style scope holds that is about the program rather than about any element: the keyframes
 // each `@keyframes` name resolves to, the visible `@function` rules, and whether a size container query
 // is in play. Which rules match and how cascade layers are ordered are StyleEngine's answers and are
-// not filed here. A scope's cache is what each of its sheets defines, taken in sheet order.
+// not filed here. A scope's cache is what each of its sheets defines, resolved by origin, layer, and
+// source order.
 struct StyleRuleCache {
     AK_ALLOC_WITH_KMALLOC;
 
-    // Take in what the effective rules of a later sheet define: its keyframes replace those of the same name.
+    // Take in what the effective rules of a later sheet define.
     void add_rules_from_sheet(StyleSheetState&, CascadeOrigin);
     // Take in what another cache collected, as if from a later sheet.
     void add_rules_from_cache(StyleRuleCache const&);
+    // Resolve the winning `@keyframes` and `@position-try` definitions by origin, layer rank, and source order.
+    void resolve_named_rules(Function<size_t(CascadeOrigin, Utf16FlyString const&)> const& layer_rank_for);
 
     HashMap<Utf16FlyString, Animations::KeyframeSetHandle> rules_by_animation_keyframes;
     // https://drafts.csswg.org/css-anchor-position-1/#fallback-rule
@@ -79,6 +96,8 @@ struct StyleRuleCache {
     // as @keyframes rules do.
     // NB: These are the declarations of the @position-try rule each name resolves to.
     HashMap<Utf16FlyString, RustDeclarationBlockSnapshot> rules_by_position_try;
+    Vector<CachedKeyframeRule> keyframe_rules;
+    Vector<CachedPositionTryRule> position_try_rules;
     Vector<CachedFunctionRule> function_rules;
     bool has_size_container_queries { false };
 };
@@ -177,6 +196,7 @@ public:
     bool m_is_doing_counter_style_cache_update : 1 { false };
     bool m_sheets_define_counter_styles : 1 { false };
     bool m_has_published_named_layer_order : 1 { false };
+    bool m_has_published_user_named_layer_order : 1 { false };
     // Whether the style engine holds this scope's layer order and keyframes as the rule cache resolved them.
     bool m_has_published_rule_cache : 1 { false };
     u64 m_counter_style_environment_identity { 0 };

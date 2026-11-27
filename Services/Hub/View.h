@@ -56,6 +56,9 @@ public:
     using ViewImplementation::rect_fitting_frame;
     using ViewImplementation::set_page_background_color_to_system_canvas;
 
+    // Tells the UI of the views this view opens, as a tab does.
+    void forward_new_views_to_ui();
+
 private:
     // ^WebView::ViewImplementation
     virtual void prepare_page_for_navigable(WebView::WebContentPage&) override;
@@ -64,6 +67,7 @@ private:
     virtual void update_zoom() override;
     virtual void did_change_state() override { push_state_to_ui(); }
     virtual bool supports_discarding() const override { return m_is_tab; }
+    virtual bool is_tab() const override { return m_is_tab; }
     virtual void did_request_discard() override;
     virtual Web::DevicePixelSize viewport_size() const override { return m_viewport_size; }
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override { return widget_position; }

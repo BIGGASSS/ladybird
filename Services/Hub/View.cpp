@@ -182,6 +182,18 @@ void View::did_request_discard()
         ui->async_view_discard(view_id());
 }
 
+void View::forward_new_views_to_ui()
+{
+    on_new_web_view = [this](Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, WebView::CanonicalTraversable& traversable) {
+        auto& view = Application::the().create_view(initial_state_for_related_view(), traversable);
+        if (auto* ui = ConnectionFromUI::the()) {
+            push_state_to_ui();
+            ui->async_view_open_new_view(view_id(), view.view_id(), view.current_state(), activate_tab, hints);
+        }
+        return view.handle();
+    };
+}
+
 void View::forward_callbacks_to_ui(bool is_tab)
 {
     on_favicon_change = [this](Optional<Gfx::Bitmap const&> favicon) {
@@ -256,14 +268,7 @@ void View::forward_callbacks_to_ui(bool is_tab)
             }
         };
 
-        on_new_web_view = [this](Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, WebView::CanonicalTraversable& traversable) {
-            auto& view = Application::the().create_view(initial_state_for_related_view(), traversable);
-            if (auto* ui = ConnectionFromUI::the()) {
-                push_state_to_ui();
-                ui->async_view_open_new_view(view_id(), view.view_id(), view.current_state(), activate_tab, hints);
-            }
-            return view.handle();
-        };
+        forward_new_views_to_ui();
     }
 
     on_finish_handling_key_event = [this](Web::KeyEvent const& event) {
@@ -324,6 +329,8 @@ void View::forward_callbacks_to_ui(bool is_tab)
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
             ui->async_view_close(view_id());
+        } else {
+            did_decline_close();
         }
     };
 

@@ -30,6 +30,8 @@ private:
     HTMLHtmlElement(DOM::Document&, DOM::QualifiedName);
     virtual bool is_html_html_element() const override { return true; }
     virtual void children_changed(ChildrenChangedMetadata const&) override;
+    virtual void post_connection() override;
+    virtual bool has_post_connection_steps() const override { return true; }
 };
 
 }

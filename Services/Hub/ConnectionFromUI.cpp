@@ -167,6 +167,39 @@ void ConnectionFromUI::active_view_changed(Optional<u64> view_id)
     Application::the().set_active_view(view_id);
 }
 
+Messages::HubServer::InstallExtensionResponse ConnectionFromUI::install_extension(ByteString path)
+{
+    auto extension = Application::the().install_extension(path);
+    if (extension.is_error())
+        return { {}, MUST(String::formatted("{}", extension.error())) };
+    return { extension.value().name, {} };
+}
+
+Messages::HubServer::ExtensionActionsResponse ConnectionFromUI::extension_actions()
+{
+    Vector<Hub::ExtensionAction> actions;
+    if (auto const* manager = Application::the().extension_manager()) {
+        for (auto& action : manager->actions())
+            actions.append({ move(action.extension_id), move(action.title), move(action.icon), move(action.popup_url) });
+    }
+    return actions;
+}
+
+void ConnectionFromUI::click_extension_action(String extension_id, u64 tab_view_id)
+{
+    if (auto* host = Application::the().extension_host())
+        host->click_action(extension_id, tab_view_id);
+}
+
+void ConnectionFromUI::set_tab_of_extension_popup(u64 popup_view_id, u64 tab_view_id, String extension_id)
+{
+    if (auto* host = Application::the().extension_host())
+        host->set_tab_of_popup(popup_view_id, tab_view_id, extension_id);
+    // What the popup opens, such as with links that open in a new tab, goes to the UI as a tab's would.
+    if (auto* view = find_view(popup_view_id))
+        view->forward_new_views_to_ui();
+}
+
 void ConnectionFromUI::answer_clipboard_text(u64 request_id, Utf16String text)
 {
     Application::the().did_read_clipboard_text(request_id, move(text));
@@ -894,6 +927,12 @@ void ConnectionFromUI::view_decline_discard(u64 view_id)
 {
     if (auto* view = find_view(view_id))
         view->did_decline_discard();
+}
+
+void ConnectionFromUI::view_decline_close(u64 view_id)
+{
+    if (auto* view = find_view(view_id))
+        view->did_decline_close();
 }
 
 void ConnectionFromUI::forget_state_of_discarded_tab(u64 discarded_tab_state_id)

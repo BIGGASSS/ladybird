@@ -80,6 +80,8 @@ private:
 
     // ^HubClientEndpoint
     virtual void crash_reports_changed() override;
+    virtual void extension_actions_changed() override;
+    virtual void resize_extension_popup(u64 popup_view_id, Gfx::IntSize size) override;
     virtual void request_finished(u64 request_id, bool had_network_error, Optional<u32> response_code, Vector<HTTP::Header> response_headers, ByteString body) override;
     virtual void app_open_new_tab(Vector<URL::URL> urls) override;
     virtual void app_open_new_window(Vector<URL::URL> urls) override;

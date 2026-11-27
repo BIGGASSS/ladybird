@@ -29,10 +29,16 @@ inline constexpr Array HTTP_SCHEMES = {
 // https://fetch.spec.whatwg.org/#fetch-scheme
 // A fetch scheme is "about", "blob", "data", "file", or an HTTP(S) scheme.
 inline constexpr Array FETCH_SCHEMES = {
-    "about"sv, "blob"sv, "data"sv, "file"sv, "http"sv, "https"sv,
+    "about"sv,
+    "blob"sv,
+    "data"sv,
+    "file"sv,
+    "http"sv,
+    "https"sv,
 
     // AD-HOC: Internal fetch schemes:
-    "resource"sv
+    "resource"sv,
+    "chrome-extension"sv,
 };
 
 [[nodiscard]] WEBCOMMON_API bool is_local_url(URL::URL const&);

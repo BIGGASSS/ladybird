@@ -50,6 +50,8 @@
 #include <LibWebView/BrowserProcess.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/DownloadStore.h>
+#include <LibWebView/ExtensionHost.h>
+#include <LibWebView/ExtensionManager.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
@@ -217,6 +219,18 @@ public:
     ErrorOr<void> import_local_content_blocker_list(String name, String contents);
     void remove_content_blocker_list(Badge<SettingsUI>, StringView identifier);
     Optional<UnixDateTime> content_blocker_list_last_updated_at(StringView identifier) const;
+
+    ExtensionManager const* extension_manager() const { return m_extension_manager.ptr(); }
+    // Called when extensions are installed, so that the UI can show their toolbar buttons.
+    virtual void extensions_did_change() { }
+    // The page in an extension's popup would like the popup to be this large.
+    virtual void extension_popup_did_request_size([[maybe_unused]] u64 popup_view_id, [[maybe_unused]] Gfx::IntSize size) { }
+    // Installs the Chrome extension (.crx file) at the given path. Pages that are open get its content scripts once
+    // they are reloaded.
+    ErrorOr<InstalledExtension> install_extension(StringView path);
+    void extension_storage_did_change(Badge<WebContentClient>, WebContentClient const&, String const& extension_id, String const& area, String const& changes);
+    void load_extension_resource(Badge<WebContentClient>, WebContentClient&, u64 request_id, String const& extension_id, String const& path);
+    ExtensionHost* extension_host() { return m_extension_host.ptr(); }
 
     static BrowsingSession& default_session() { return *the().m_default_session; }
 
@@ -514,6 +528,7 @@ private:
     ErrorOr<bool> load_content_blocker_lists();
     void apply_content_blocker_settings();
     void rebuild_content_blocker_list_paths();
+    void send_extensions_to_web_content(WebContentClient&) const;
     ByteString content_blocker_list_path(StringView identifier) const;
     ErrorOr<void> save_content_blocker_list(ByteString const& path, ReadonlyBytes);
     enum class ContentBlockerListUpdateTrigger {
@@ -652,6 +667,8 @@ private:
     OwnPtr<FontServiceHost> m_font_service_host;
     JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
+    OwnPtr<ExtensionManager> m_extension_manager;
+    OwnPtr<ExtensionHost> m_extension_host;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
     ByteString m_instance_data_directory;
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)

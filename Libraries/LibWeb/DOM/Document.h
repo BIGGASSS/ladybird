@@ -1178,6 +1178,10 @@ public:
     bool mute_iframe_load() const { return m_mute_iframe_load; }
     void set_mute_iframe_load(bool value) { m_mute_iframe_load = value; }
 
+    bool was_blocked_by_extension() const { return m_was_blocked_by_extension; }
+    void set_was_blocked_by_extension(bool value) { m_was_blocked_by_extension = value; }
+
+    bool has_id() const { return m_id.has_value(); }
     HTML::CrossProcessId id() const { return m_id.value(); }
     void set_id(HTML::CrossProcessId);
 
@@ -1871,6 +1875,16 @@ public:
     bool content_blocking_enabled() const;
     Utf16String const& content_blocker_style_sheet();
     void invalidate_content_blocker_style_sheet();
+
+    // How many of the stages of content scripts, by Extensions::RunAt, have run in this document.
+    u8 extension_content_script_stage() const { return m_extension_content_script_stage; }
+    void set_extension_content_script_stage(u8 stage) { m_extension_content_script_stage = stage; }
+    Utf16String const& dynamic_extension_style_sheet() const;
+    void snapshot_dynamic_extension_style_sheet();
+    GC::Ptr<Extensions::ExtensionContext> extension_context(StringView extension_id) const;
+    void add_extension_context(GC::Ref<Extensions::ExtensionContext>);
+    bool has_extension_contexts() const { return !m_extension_contexts.is_empty(); }
+    Vector<GC::Ref<Extensions::ExtensionContext>> const& extension_contexts() const { return m_extension_contexts; }
     bool content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names);
 
     void exit_pointer_lock();
@@ -2538,6 +2552,11 @@ private:
     HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_classes;
     HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_ids;
 
+    u8 m_extension_content_script_stage { 0 };
+    Optional<Utf16String> m_dynamic_extension_style_sheet;
+    Vector<GC::Ref<Extensions::ExtensionContext>> m_extension_contexts;
+    GC::Ptr<Platform::Timer> m_extension_idle_timer;
+
     Optional<AK::UnixDateTime> m_last_modified;
 
     u64 m_form_controls_version { 0 };
@@ -2689,6 +2708,8 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-ancestor-origins-list
     GC::Ptr<HTML::DOMStringList> m_ancestor_origins_list;
+
+    bool m_was_blocked_by_extension { false };
 };
 
 template<>

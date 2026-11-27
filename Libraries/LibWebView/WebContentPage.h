@@ -415,6 +415,8 @@ private:
     void register_dedicated_worker(Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport);
     Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::HTML::EnvironmentId environment_id);
     virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message) override;
+    virtual void extension_api_call(Web::HTML::CrossProcessId document_id, u64 context_id, u64 call_id, String extension_id, String method, String arguments) override;
+    virtual void evaluate_extension_network_request(u64 request_id, URL::URL url, String method, String resource_type, Optional<URL::Origin> initiator, Optional<String> initiator_extension_id, Vector<URL::URL> frame_urls, Vector<Optional<URL::Origin>> frame_initiators, Vector<bool> frame_is_top_level) override;
     Messages::WebContentClient::DidRequestCookieResponse did_request_cookie(Optional<Web::HTML::EnvironmentId> const&, URL::URL, HTTP::Cookie::Source);
     Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse did_request_all_cookies_cookiestore(Web::HTML::EnvironmentId const&, URL::URL);
     Messages::WebContentClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry);

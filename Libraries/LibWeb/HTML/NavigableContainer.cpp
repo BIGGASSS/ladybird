@@ -315,6 +315,7 @@ void NavigableContainer::destroy_the_child_navigable()
 
     // 3. Set container's content navigable to null.
     m_content_navigable = nullptr;
+    set_collapsed_by_content_navigable(false);
     m_reported_content_navigable_viewport = {};
     m_reported_stats_displayed = {};
     navigable->set_container({}, nullptr);
@@ -440,6 +441,7 @@ void NavigableContainer::swap_content_navigable_to_remote(Badge<Page>, Replicate
         window_proxy->set_window(remote_navigable->active_window());
     }
     m_content_navigable = remote_navigable;
+    set_collapsed_by_content_navigable(remote_navigable->is_collapsed_by_extension());
     publish_dom_paint_facts();
     set_needs_repaint();
 
@@ -458,10 +460,32 @@ void NavigableContainer::swap_content_navigable_to_local(Badge<Page>, LocalNavig
     VERIFY(remote_navigable.provisional_navigable().ptr() == &navigable);
 
     m_content_navigable = navigable;
+    set_collapsed_by_content_navigable(navigable.is_collapsed_by_extension());
     publish_dom_paint_facts();
     set_needs_repaint();
 
     remote_navigable.set_container({}, nullptr);
+}
+
+void NavigableContainer::set_collapsed_by_own_request(bool collapsed)
+{
+    if (m_collapsed_by_own_request == collapsed)
+        return;
+    m_collapsed_by_own_request = collapsed;
+    update_collapsed_by_extension();
+}
+
+void NavigableContainer::set_collapsed_by_content_navigable(bool collapsed)
+{
+    if (m_collapsed_by_content_navigable == collapsed)
+        return;
+    m_collapsed_by_content_navigable = collapsed;
+    update_collapsed_by_extension();
+}
+
+void NavigableContainer::update_collapsed_by_extension()
+{
+    set_collapsed_by_extension(m_collapsed_by_own_request || m_collapsed_by_content_navigable);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#completely-finish-loading

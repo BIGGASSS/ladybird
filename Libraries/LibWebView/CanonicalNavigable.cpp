@@ -23,6 +23,7 @@
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
+#include <LibWebView/ExtensionHost.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -30,9 +31,23 @@
 
 namespace WebView {
 
+static u64 s_next_extension_frame_id = 0;
+
 CanonicalNavigable::CanonicalNavigable(Web::HTML::CrossProcessId id)
     : m_id(id)
+    , m_extension_frame_id(++s_next_extension_frame_id)
 {
+}
+
+void CanonicalNavigable::set_active_session_history_entry(RefPtr<CanonicalSessionHistoryEntry> entry)
+{
+    m_active_session_history_entry = move(entry);
+    if (m_active_session_history_entry && m_active_session_history_entry->document_state->document) {
+        if (Application::is_initialized()) {
+            if (auto* host = Application::the().extension_host())
+                host->snapshot_content_script_authorization(*this, *m_active_session_history_entry->document_state->document, m_active_session_history_entry->document_state->initiator_origin);
+        }
+    }
 }
 
 RefPtr<WebContentPage> CanonicalNavigable::reporting_page() const
@@ -1095,8 +1110,8 @@ ErrorOr<CanonicalNavigable::PageToPopulateDocument> CanonicalNavigable::obtain_p
     NonnullRefPtr document_state = entry.document_state;
     response_document->document_id = Application::the().allocate_ui_process_cross_process_id();
     auto document = create_and_initialize_a_document(*response_document);
-    loader.set_document(*document, *this);
     populate_document(document_state, document, loader.result().inline_content_origin);
+    loader.set_document(*document, *this);
 
     // A document created for inline content stands in for the resource the process that fetched it could not load; that
     // process hosts it.
@@ -1137,6 +1152,10 @@ void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState>
     document->determine_whether_it_is_local_file_content(blob_url_store());
     if (document->is_local_file_content())
         document_state->held_local_file_content = true;
+    if (Application::is_initialized()) {
+        if (auto* host = Application::the().extension_host())
+            host->snapshot_content_script_authorization(*this, *document, document_state->initiator_origin, ExtensionHost::RetainPendingGeneration::Yes);
+    }
     abandon_populated_document(document_state);
     auto is_for_navigation = any_of(m_navigations, [&](auto const& navigation) {
         return navigation->history_entry && navigation->history_entry->document_state == document_state;
@@ -1220,8 +1239,13 @@ void CanonicalNavigable::abandon_populated_document(NonnullRefPtr<CanonicalDocum
     if (!document_state->populated_document.has_value())
         return;
     NonnullRefPtr document = document_state->populated_document->document;
+    document->release_pending_extension_generation();
     RefPtr<WebContentPage> host = document->host();
     document_state->populated_document.clear();
+    if (Application::is_initialized()) {
+        if (auto* extension_host = Application::the().extension_host())
+            extension_host->on_populated_document_abandoned(document->id());
+    }
     if (!host || top_level_traversable().hosts(*this, *host) || pending_host_matches(*host))
         return;
     host->async_discard_provisional_navigable(id());
@@ -1343,6 +1367,7 @@ void CanonicalNavigable::did_lose_active_document()
         return;
     m_hosted_state->compositor_context_id = {};
     m_hosted_state->delays_the_load_event_of_its_container = false;
+    m_hosted_state->is_collapsed_by_extension = false;
 }
 
 void CanonicalNavigable::update_container_state(Web::HTML::ReplicatedContainerState state)
@@ -1427,6 +1452,7 @@ Optional<Web::HTML::ReplicatedNavigableState> CanonicalNavigable::replicated_sta
         .is_closing = hosted_state.is_closing,
         .container = hosted_state.container,
         .delays_the_load_event_of_its_container = hosted_state.delays_the_load_event_of_its_container,
+        .is_collapsed_by_extension = hosted_state.is_collapsed_by_extension,
         .has_session_history_entry_and_ready_for_navigation = has_session_history_entry_and_ready_for_navigation(),
         .compositor_context_id = hosted_state.compositor_context_id,
     };
@@ -1538,11 +1564,18 @@ bool CanonicalNavigable::is_script_closable() const
 
 void CanonicalNavigable::document_completely_finished_loading(CanonicalDocument& document)
 {
+    bool was_completely_loaded = document.is_completely_loaded();
     document.set_completely_loaded();
     if (&document != &active_document())
         return;
     send_replicated_state();
     send_completely_finished_loading_to_container();
+    if (!was_completely_loaded && Application::is_initialized()) {
+        if (auto view = top_level_traversable().view(); view.has_value()) {
+            if (auto* extension_host = Application::the().extension_host())
+                extension_host->on_frame_completed(*view, *this);
+        }
+    }
 }
 
 void CanonicalNavigable::send_completely_finished_loading_to_container() const
@@ -1626,7 +1659,7 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
     if (m_active_session_history_entry->document_state != entry.document_state)
         m_active_session_history_entry->document_state->document = nullptr;
     entry.document_state->document = document;
-    m_active_session_history_entry = entry;
+    set_active_session_history_entry(entry);
 
     if (document != previous_document) {
         document->make_active();
@@ -1667,6 +1700,24 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
                 page->client().update_audio_capture_permission();
         }
     }
+
+    ScopeGuard notify_extensions_on_commit { [&] {
+        if (document == previous_document)
+            return;
+        if (navigation_id.has_value()) {
+            if (auto committed_navigation = navigation_with_id(*navigation_id))
+                committed_navigation->committed = true;
+        }
+        if (!Application::is_initialized())
+            return;
+        if (auto view = top_level_traversable().view(); view.has_value()) {
+            if (auto* extension_host = Application::the().extension_host()) {
+                extension_host->on_frame_committed(*view, *this);
+                if (document->is_completely_loaded())
+                    extension_host->on_frame_completed(*view, *this);
+            }
+        }
+    } };
 
     // A navigation can commit while a newer navigation is already in flight. In that case update the replicated
     // state for the committed document, and leave the newer navigation alone.
@@ -1743,7 +1794,7 @@ void CanonicalNavigable::set_the_ongoing_navigation(OngoingNavigation value)
     notify_view_of_ongoing_navigation();
 
     if (superseded_navigation && superseded_navigation->ends_when_superseded())
-        end_navigation(*superseded_navigation);
+        end_navigation(*superseded_navigation, NavigationEndReason::Canceled);
 }
 
 void CanonicalNavigable::set_ongoing_navigation(CanonicalNavigation::Start navigation)
@@ -1811,7 +1862,7 @@ void CanonicalNavigable::clear_ongoing_navigation()
     set_the_ongoing_navigation(Empty {});
 }
 
-void CanonicalNavigable::end_navigation(CanonicalNavigation& navigation)
+void CanonicalNavigable::end_navigation(CanonicalNavigation& navigation, NavigationEndReason reason)
 {
     if (auto navigation_id = ongoing_navigation_id(); navigation_id.has_value() && *navigation_id == navigation.navigation_id) {
         m_ongoing_navigation = Empty {};
@@ -1828,6 +1879,13 @@ void CanonicalNavigable::end_navigation(CanonicalNavigation& navigation)
     // The document populated for an ended navigation is not going to be activated.
     if (navigation.history_entry)
         abandon_populated_document(navigation.history_entry->document_state);
+
+    if (reason == NavigationEndReason::Canceled && !exchange(ended_navigation->reported_extension_error, true) && Application::is_initialized()) {
+        if (auto view = top_level_traversable().view(); view.has_value()) {
+            if (auto* extension_host = Application::the().extension_host())
+                extension_host->on_frame_error_occurred(*view, *this, ended_navigation->url, "net::ERR_ABORTED"sv);
+        }
+    }
 }
 
 BlobURLStore* CanonicalNavigable::blob_url_store() const
@@ -1853,7 +1911,7 @@ void CanonicalNavigable::cancel_navigation_for_client(WebContentClient& client)
             canceled_navigations.append(navigation);
     }
     for (auto const& navigation : canceled_navigations)
-        end_navigation(*navigation);
+        end_navigation(*navigation, NavigationEndReason::Canceled);
 }
 
 // The history operation finalizing a navigation is over.
@@ -1862,7 +1920,8 @@ void CanonicalNavigable::did_finish_finalizing_navigation(Utf16String const& nav
     auto navigation = navigation_with_id(navigation_id);
     if (!navigation || !navigation->is_finalizing())
         return;
-    end_navigation(*navigation);
+    auto reason = navigation->committed ? NavigationEndReason::Finished : NavigationEndReason::Canceled;
+    end_navigation(*navigation, reason);
 }
 
 void CanonicalNavigable::did_cancel_navigation(Utf16String navigation_id)
@@ -1870,10 +1929,18 @@ void CanonicalNavigable::did_cancel_navigation(Utf16String navigation_id)
     auto navigation = navigation_with_id(navigation_id);
     auto canceled_uncommitted_navigation = navigation && !navigation->is_finalizing();
     auto is_tracked_load = tracked_load_navigation_id() == navigation_id;
-    if (canceled_uncommitted_navigation)
-        end_navigation(*navigation);
-    else if (is_tracked_load)
-        clear_active_document_load();
+    if (canceled_uncommitted_navigation) {
+        end_navigation(*navigation, NavigationEndReason::Canceled);
+    } else {
+        if (is_tracked_load)
+            clear_active_document_load();
+        if (navigation && !exchange(navigation->reported_extension_error, true) && Application::is_initialized()) {
+            if (auto view = top_level_traversable().view(); view.has_value()) {
+                if (auto* extension_host = Application::the().extension_host())
+                    extension_host->on_frame_error_occurred(*view, *this, navigation->url, "net::ERR_ABORTED"sv);
+            }
+        }
+    }
 
     if (!is_tracked_load || !is_top_level_traversable())
         return;

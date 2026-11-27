@@ -73,6 +73,8 @@ struct NavigationPopulationResult {
     // The origin the UI process gives a document created for inline content in place of the response.
     Optional<URL::Origin> inline_content_origin {};
     Optional<CrossProcessId> document_id {};
+    Optional<u64> extension_generation {};
+    bool blocked_by_extension { false };
 };
 
 struct HistoryNavigationPopulation {

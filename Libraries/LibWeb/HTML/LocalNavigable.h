@@ -111,6 +111,8 @@ public:
 
     bool is_closing() const { return m_closing; }
     void set_closing(bool value);
+    bool is_collapsed_by_extension() const { return m_is_collapsed_by_extension; }
+    void set_collapsed_by_extension(bool value);
     void report_hosted_state();
     void report_opener_browsing_context();
     void report_state_to_remote_container();
@@ -698,6 +700,7 @@ private:
     Compositing::SnapSelectionStrategy::Type m_user_scroll_input_intent { Compositing::SnapSelectionStrategy::Type::EndPosition };
     bool m_user_scroll_gesture_travels_under_momentum { false };
     bool m_is_re_snapping_scroll_containers { false };
+    bool m_is_collapsed_by_extension { false };
 
     struct PendingAsyncScrollOperation {
         Compositing::AsyncScrollOperationID operation_id { 0 };
@@ -813,6 +816,9 @@ public:
 
     bool takes_over_window_of(DOM::Document const&) const;
 
+    bool blocked_by_extension() const { return m_blocked_by_extension; }
+    void set_blocked_by_extension(bool value) { m_blocked_by_extension = value; }
+
     GC::Ref<DOM::Document> create_document();
     void discard();
 
@@ -825,6 +831,7 @@ private:
     GC::Ptr<NavigationParams> m_navigation_params;
     GC::Ptr<LoadSteps> m_load_steps;
     bool m_replaces_response_origin { false };
+    bool m_blocked_by_extension { false };
     // Creating the document moves the id out of the reserved environment.
     EnvironmentId m_environment_id;
 };
@@ -848,6 +855,8 @@ public:
     Optional<HTTP::Cookie::SameSiteStatus> navigation_same_site_status;
     Optional<URL::Origin> inline_content_origin;
     Optional<CrossProcessId> document_id;
+    Optional<u64> extension_generation;
+    bool blocked_by_extension { false };
 
     void apply_to(NonnullRefPtr<SessionHistoryEntry> entry);
 

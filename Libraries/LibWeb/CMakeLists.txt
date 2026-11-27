@@ -271,6 +271,8 @@ set(SOURCES
     Editing/ReplaceSelection.cpp
     EntriesAPI/FileSystemEntry.cpp
     EventTiming/EventTiming.cpp
+    Extensions/ExtensionContext.cpp
+    Extensions/ExtensionRegistry.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
     Fetch/Engine/FetchBodyDeliveryGate.cpp
@@ -963,6 +965,14 @@ generate_html_implementation()
 
 generate_picture_in_picture_implementation()
 
+embed_as_string(
+    "ExtensionAPISource.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Extensions/ExtensionAPI.js"
+    "ExtensionAPISource.cpp"
+    "extension_api_source"
+    NAMESPACE "Web::Extensions"
+)
+
 set(GENERATED_SOURCES
     CSS/DefaultStyleSheetSource.cpp
     CSS/DescriptorID.cpp
@@ -976,6 +986,7 @@ set(GENERATED_SOURCES
     CSS/QuirksModeStyleSheetSource.cpp
     CSS/TransformFunctions.h
     CSS/Units.cpp
+    ExtensionAPISource.cpp
     MathML/MathMLStyleSheetSource.cpp
     SVG/SVGStyleSheetSource.cpp
     HTML/MediaControlsDOM.cpp

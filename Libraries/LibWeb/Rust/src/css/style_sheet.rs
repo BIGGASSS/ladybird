@@ -714,6 +714,7 @@ pub unsafe extern "C" fn rust_style_sheet_publish_layer_order(
     count: usize,
     host: &crate::render_state::DocumentHost,
     tree_scope: u32,
+    is_user_origin: bool,
     previously_had_layers: bool,
     context: *mut c_void,
     prepare: unsafe extern "C" fn(*mut c_void),
@@ -729,9 +730,36 @@ pub unsafe extern "C" fn rust_style_sheet_publish_layer_order(
     // must clear the engine's old ranks.
     if has_layers || previously_had_layers {
         unsafe { prepare(context) };
-        host.write_rules(crate::css::style::rule_writes::RuleWrite::LayerOrder { tree_scope, names });
+        host.write_rules(crate::css::style::rule_writes::RuleWrite::LayerOrder {
+            tree_scope,
+            is_user_origin,
+            names,
+        });
     }
     has_layers
+}
+
+/// Visit the named cascade layers of `sheets` in ascending precedence order.
+///
+/// # Safety
+/// The array and its sheets must be live for this call. The callback must not mutate the sheets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_sheets_visit_layer_order(
+    sheets: *const *const NativeStyleSheet,
+    count: usize,
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize, usize),
+) {
+    if count == 0 {
+        return;
+    }
+    let sheets = unsafe { ak::slice_from_raw_parts(sheets, count) };
+    let names = cascade_layer_order(sheets.iter().map(|&sheet| unsafe { &*sheet }));
+    for (rank, name) in names.iter().enumerate() {
+        if !name.is_empty() {
+            unsafe { visit(context, name.as_ptr(), name.len(), rank) };
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

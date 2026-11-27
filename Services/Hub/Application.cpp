@@ -127,6 +127,18 @@ Optional<WebView::ViewImplementation&> Application::active_web_view() const
     return WebView::ViewImplementation::find_view_by_id(*m_active_view_id);
 }
 
+void Application::extension_popup_did_request_size(u64 popup_view_id, Gfx::IntSize size)
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_resize_extension_popup(popup_view_id, size);
+}
+
+void Application::extensions_did_change()
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_extension_actions_changed();
+}
+
 Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML::ActivateTab activate_tab, WebView::ViewImplementation const* related_view) const
 {
     auto* ui = ConnectionFromUI::the();

@@ -1022,6 +1022,7 @@ void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool 
             register_with_decoded_image_data_if_needed();
 
             retire_lazy_load_continuation();
+            set_collapsed_by_extension(false);
 
             // 5. Prepare the current request for presentation given the img element.
             m_current_request->prepare_for_presentation(*this);
@@ -1118,6 +1119,7 @@ after_step_7:
             self.stop_delaying_the_load_event_for_aborted_requests();
             self.m_pending_request = nullptr;
             self.retire_lazy_load_continuation();
+            self.set_collapsed_by_extension(false);
 
             // AD-HOC: The element may have been rendering as blank space while a load was pending;
             //         now that the current request is broken it renders its alt text instead.
@@ -1166,6 +1168,7 @@ after_step_7:
             // 3. Set the pending request to null.
             self.m_pending_request = nullptr;
             self.retire_lazy_load_continuation();
+            self.set_collapsed_by_extension(false);
 
             // AD-HOC: The element may have been rendering as blank space while a load was pending;
             //         now that the current request is broken it renders its alt text instead.
@@ -1216,6 +1219,7 @@ after_step_7:
             self.register_with_decoded_image_data_if_needed();
             self.retire_lazy_load_continuation();
             self.m_current_request->prepare_for_presentation(self);
+            self.set_collapsed_by_extension(false);
 
             self.set_needs_layout_update_or_repaint_after_image_data_change();
 
@@ -1441,6 +1445,7 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
 
                 // 2. Set image request to the completely available state.
                 image_request->set_state(ImageRequest::State::CompletelyAvailable);
+                self.set_collapsed_by_extension(false);
 
                 // 3. Add the image to the list of available images using the key key, with the ignore higher-layer caching flag set.
                 // NB: An image from a navigation response was not checked against the policies of the document, so other
@@ -1496,6 +1501,9 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
             // upgrade the pending request to the current request if image request is the pending request,
             if (image_request == self.m_pending_request)
                 self.upgrade_pending_request_to_current_request();
+
+            auto should_collapse = image_request->shared_resource_request() && image_request->shared_resource_request()->should_collapse_initiator();
+            self.set_collapsed_by_extension(should_collapse);
 
             // AD-HOC: The element may have been rendering as blank space while the load was pending;
             //         now that the current request is broken it renders its alt text instead.

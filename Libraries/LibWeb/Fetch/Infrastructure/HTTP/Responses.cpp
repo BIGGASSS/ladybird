@@ -203,6 +203,7 @@ NonnullRefPtr<Response> Response::clone() const
     new_response->set_navigation_timing_allow_values_list(m_navigation_timing_allow_values_list);
     new_response->set_body_info(m_body_info);
     new_response->set_redirect_taint(m_redirect_taint);
+    new_response->set_should_collapse_initiator(m_should_collapse_initiator);
     if (m_network_transport.has_value())
         new_response->set_network_transport(*m_network_transport);
     // FIXME: service worker timing info

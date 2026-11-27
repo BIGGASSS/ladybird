@@ -169,6 +169,7 @@ public:
     bool confirm_stop_active_downloads(QWidget* parent = nullptr);
 
     void update_feedback_buttons();
+    void update_extension_actions();
     void report_active_view() const;
 
     BrowserWindow& active_window() const { return *m_active_window; }

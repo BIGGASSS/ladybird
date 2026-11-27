@@ -125,6 +125,9 @@ public:
     [[nodiscard]] virtual RedirectTaint redirect_taint() const { return m_redirect_taint; }
     virtual void set_redirect_taint(RedirectTaint redirect_taint) { m_redirect_taint = redirect_taint; }
 
+    [[nodiscard]] virtual bool should_collapse_initiator() const { return m_should_collapse_initiator; }
+    virtual void set_should_collapse_initiator(bool should_collapse_initiator) { m_should_collapse_initiator = should_collapse_initiator; }
+
     [[nodiscard]] bool is_aborted_network_error() const;
     [[nodiscard]] bool is_network_error() const;
 
@@ -226,6 +229,7 @@ private:
 
     Optional<String> m_network_error_message;
     Optional<NetworkTransport> m_network_transport;
+    bool m_should_collapse_initiator { false };
 
 public:
     [[nodiscard]] ByteString const& method() const { return m_method; }
@@ -282,6 +286,8 @@ public:
 
     [[nodiscard]] virtual RedirectTaint redirect_taint() const override { return m_internal_response->redirect_taint(); }
     virtual void set_redirect_taint(RedirectTaint redirect_taint) override { m_internal_response->set_redirect_taint(redirect_taint); }
+    [[nodiscard]] virtual bool should_collapse_initiator() const override { return m_internal_response->should_collapse_initiator(); }
+    virtual void set_should_collapse_initiator(bool should_collapse_initiator) override { m_internal_response->set_should_collapse_initiator(should_collapse_initiator); }
     [[nodiscard]] virtual Optional<NetworkTransport> const& network_transport() const override { return m_internal_response->network_transport(); }
     virtual void set_network_transport(NetworkTransport network_transport) override { m_internal_response->set_network_transport(move(network_transport)); }
     virtual void release_request_transfer_lease() const override { m_internal_response->release_request_transfer_lease(); }

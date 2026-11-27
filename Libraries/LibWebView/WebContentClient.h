@@ -255,6 +255,17 @@ private:
     virtual Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) override;
     virtual void register_dedicated_worker(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport) override;
     virtual void did_update_cookie(HTTP::Cookie::Cookie) override;
+    virtual void did_change_extension_storage(String extension_id, String area, String changes) override;
+    virtual void request_extension_resource(u64 request_id, String extension_id, String path) override;
+    virtual void did_handle_extension_message(u64 delivery_id, u8 status, String response) override;
+    virtual void connect_extension_port(Web::PageId page_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id, String extension_id, String name, Optional<u64> target_tab_id, Optional<u64> target_frame_id, Optional<String> target_document_id) override;
+    virtual void accept_extension_port(u64 channel_id, Web::HTML::CrossProcessId document_id, u64 context_id, u64 local_port_id) override;
+    virtual void finish_open_extension_port(u64 channel_id) override;
+    virtual void post_extension_port_message(u64 context_id, u64 local_port_id, String message) override;
+    virtual void disconnect_extension_port(u64 context_id, u64 local_port_id) override;
+    virtual void disconnect_extension_context_ports(u64 context_id) override;
+    virtual void did_complete_extension_script_injection(u64 injection_id, u32 target_index, bool succeeded, String result_json, String error) override;
+    virtual void did_complete_extension_css_injection(u64 injection_id, u32 target_index, bool succeeded, String error) override;
     virtual Messages::WebContentClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String) override;
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection(Optional<Utf16String> top_level_site) override;
     virtual Messages::WebContentClient::RequestMediaServerConnectionResponse request_media_server_connection() override;

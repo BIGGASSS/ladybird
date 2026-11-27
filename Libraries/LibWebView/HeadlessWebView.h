@@ -21,7 +21,11 @@ class WEBVIEW_API HeadlessWebView : public WebView::ViewImplementation {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    static NonnullOwnPtr<HeadlessWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate = IsPrivate::No);
+    enum class IsTab : bool {
+        No,
+        Yes,
+    };
+    static NonnullOwnPtr<HeadlessWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate = IsPrivate::No, IsTab = IsTab::Yes);
     enum class IsOwnedByParent : bool {
         No,
         Yes,
@@ -52,7 +56,9 @@ public:
     }
 
 protected:
-    HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, IsPrivate = IsPrivate::No);
+    HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, IsPrivate = IsPrivate::No, IsTab = IsTab::Yes);
+
+    virtual bool is_tab() const override { return m_is_tab == IsTab::Yes; }
 
     void propagate_web_content_crash(WebContentCrashReason);
     HeadlessWebView& adopt_child_web_view(NonnullOwnPtr<HeadlessWebView>);
@@ -69,6 +75,7 @@ protected:
 
     Core::AnonymousBuffer m_theme;
     Web::DevicePixelSize m_viewport_size;
+    IsTab m_is_tab { IsTab::Yes };
 
     Web::PendingDialog m_pending_dialog { Web::PendingDialog::None };
     Optional<Utf16String> m_pending_prompt_text;

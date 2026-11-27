@@ -5,11 +5,13 @@
  */
 
 #include <LibURL/Site.h>
+#include <LibWebView/Application.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
 #include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/CanonicalWindow.h>
+#include <LibWebView/ExtensionHost.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
 #include <LibWebView/WebUI.h>
@@ -49,7 +51,33 @@ CanonicalDocument::CanonicalDocument(Web::HTML::CrossProcessId id, URL::URL crea
     }
 }
 
-CanonicalDocument::~CanonicalDocument() = default;
+CanonicalDocument::~CanonicalDocument()
+{
+    release_pending_extension_generation();
+}
+
+void CanonicalDocument::retain_pending_extension_generation()
+{
+    if (m_retains_pending_extension_generation || !m_extension_generation.has_value())
+        return;
+    if (Application::is_initialized()) {
+        if (auto* host = Application::the().extension_host()) {
+            host->retain_pending_extension_generation(*m_extension_generation);
+            m_retains_pending_extension_generation = true;
+        }
+    }
+}
+
+void CanonicalDocument::release_pending_extension_generation()
+{
+    if (!m_retains_pending_extension_generation)
+        return;
+    m_retains_pending_extension_generation = false;
+    if (Application::is_initialized() && m_extension_generation.has_value()) {
+        if (auto* host = Application::the().extension_host())
+            host->release_pending_extension_generation(*m_extension_generation);
+    }
+}
 
 bool CanonicalDocument::is_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature feature) const
 {
@@ -115,6 +143,8 @@ void CanonicalDocument::determine_whether_it_is_local_file_content(BlobURLStore 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#make-active
 void CanonicalDocument::make_active()
 {
+    release_pending_extension_generation();
+
     // 1. Let window be document's relevant global object.
     auto& window = relevant_global_object();
 
